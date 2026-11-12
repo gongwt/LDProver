@@ -259,40 +259,25 @@ export class TranspositionStore {
       rec.lastTouchSeq = ++this.touchSeq;
       this.patternHits++;
 
-      // Check SSK-sound ProofReusable grade (FR-6.3, FR-6.9):
-      // 1) O(1) Monotonic Stone-Count Certificate: if neither query nor stored position had captures
-      //    and no capture occurs inside the stored proof sub-DAG, SSK can never trigger.
-      // 2) Full HistorySet equality fallback when captures occurred.
-      let reusable = false;
-      if (rec.proofClosureAvailable && !rec.ghiFlag) {
-        if (
-          context.koRule === KoRule.SimpleKoOnly ||
-          (queryMonotonic &&
-            rec.sourceMonotonicHistory &&
-            !rec.hasCaptureInSubtree)
-        ) {
-          reusable = true;
-        } else if (
-          pos.historySnapshots.length === rec.historySnapshots.length
-        ) {
-          let fullHistEqual = true;
-          for (let i = 0; i < pos.historySnapshots.length; i++) {
-            if (
-              !GoPosition.snapshotsMatch(
-                pos.historySnapshots[i],
-                rec.historySnapshots[i],
-                context.koRule
-              )
-            ) {
-              fullHistEqual = false;
-              break;
-            }
+      // Check full HistorySet equality for ProofReusable grade (FR-6.3, FR-6.9)
+      let fullHistEqual =
+        pos.historySnapshots.length === rec.historySnapshots.length;
+      if (fullHistEqual && context.koRule !== KoRule.SimpleKoOnly) {
+        for (let i = 0; i < pos.historySnapshots.length; i++) {
+          if (
+            !GoPosition.snapshotsMatch(
+              pos.historySnapshots[i],
+              rec.historySnapshots[i],
+              context.koRule
+            )
+          ) {
+            fullHistEqual = false;
+            break;
           }
-          reusable = fullHistEqual;
         }
       }
 
-      if (reusable) {
+      if (fullHistEqual && rec.proofClosureAvailable && !rec.ghiFlag) {
         this.patternProofReusableHits++;
         return { grade: 'PROOF_REUSABLE', record: rec };
       }

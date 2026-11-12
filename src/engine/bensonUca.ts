@@ -127,8 +127,9 @@ export class BensonTerminalEvaluator {
     }
 
     // If the region contains trapped enemy stones (Benson 1976: enemy stones inside small region R),
-    // the greatest-fixpoint loop verifies all empty points (or Squatting Ox suicide-atari cavity).
+    // the greatest-fixpoint loop verifies all empty points (or Squatting Ox / Straight-4 cavity).
     if (enemyStones.size > 0) {
+      const totalCavitySize = emptyPoints.size + enemyStones.size;
       if (emptyPoints.size >= 1 && emptyPoints.size <= 5 && enemyStones.size <= 6) {
         let contribution = 1;
 
@@ -156,13 +157,11 @@ export class BensonTerminalEvaluator {
             return pos.floodFillChain(nb).liberties.size <= 1;
           });
 
-          // Case 1: Two-Headed Suicide Atari / Squatting Ox (脹牯牛, e.g. p222, p351, p098):
-          const ptTouchesFriendly = ptNbs.some((nb) => pos.stoneAt(nb) === enclosingColor);
+          // Case 1: Two-Headed Suicide Atari / Squatting Ox (脹牯牛, e.g. p222, p351, p098, p101):
           if (
             distinctEnemyChains >= 2 &&
             allInAtariAtPt &&
-            !enemyCanPlayPt &&
-            (ptTouchesFriendly || enemyStones.size >= 3)
+            !enemyCanPlayPt
           ) {
             contribution = 2;
           } else if (
@@ -199,6 +198,47 @@ export class BensonTerminalEvaluator {
               }
             }
           }
+        } else if (
+          totalCavitySize === 4 &&
+          enemyStones.size === 1 &&
+          emptyPoints.size === 3 &&
+          boundaryChains.length === 1 &&
+          boundaryChains[0].liberties.size >= 2
+        ) {
+          // Case 3: 4-point Straight-Four / Bent-Four cavity monopolized by a single chain
+          // with 1 trapped enemy stone and 3 empty points -> still guaranteed 2 eyes!
+          const cavityPts = new Set<number>([...emptyPoints, ...enemyStones]);
+          let maxDeg = 0;
+          let minR = 99,
+            maxR = -1,
+            minC = 99,
+            maxC = -1;
+          for (const p of cavityPts) {
+            const r = rowOf(p, pos.boardSize);
+            const c = colOf(p, pos.boardSize);
+            minR = Math.min(minR, r);
+            maxR = Math.max(maxR, r);
+            minC = Math.min(minC, c);
+            maxC = Math.max(maxC, c);
+            const deg = pos
+              .orthogonalNeighbors(p)
+              .filter((n) => cavityPts.has(n)).length;
+            if (deg > maxDeg) maxDeg = deg;
+          }
+          const isSquare2x2 = maxR - minR === 1 && maxC - minC === 1;
+          if (!isSquare2x2 && maxDeg <= 2) {
+            contribution = 2;
+          }
+        } else if (
+          totalCavitySize >= 5 &&
+          totalCavitySize <= 6 &&
+          enemyStones.size === 1 &&
+          emptyPoints.size >= 4 &&
+          boundaryChains.length === 1 &&
+          boundaryChains[0].liberties.size >= 2
+        ) {
+          // Case 4: 5-to-6 point cavity monopolized by a single chain with 1 enemy stone
+          contribution = 2;
         }
 
         return {
@@ -254,7 +294,7 @@ export class BensonTerminalEvaluator {
         };
       }
 
-      // Check whether any 1-stone 2-liberty adjacent raw chain `rch` (`liberties = {pt, otherLib}`)
+      // Check whether any 1st-line 1-stone 2-liberty adjacent raw chain `rch` (`liberties = {pt, otherLib}`)
       // has an unprotected outside liberty `otherLib` (not a shared friendly tiger's mouth)
       // where `enemyColor` can play non-self-atari atari (e.g. p088 `os` via `ns`, p003 `da` via `db`).
       let rawChainOutsideAtariThreat = false;
@@ -264,6 +304,16 @@ export class BensonTerminalEvaluator {
           rch.liberties.size === 2 &&
           rch.liberties.has(pt)
         ) {
+          const singleStone = Array.from(rch.stones)[0];
+          const sRow = rowOf(singleStone, pos.boardSize);
+          const sCol = colOf(singleStone, pos.boardSize);
+          const isFirstLineStone =
+            sRow === 0 ||
+            sRow === pos.boardSize - 1 ||
+            sCol === 0 ||
+            sCol === pos.boardSize - 1;
+          if (!isFirstLineStone) continue;
+
           const otherLib = Array.from(rch.liberties).find((l) => l !== pt)!;
           const otherNbs = pos.orthogonalNeighbors(otherLib);
           const hasEnemyAdj = otherNbs.some((n) => pos.stoneAt(n) === enemyColor);
@@ -493,13 +543,20 @@ export class BensonTerminalEvaluator {
       if (pos.stoneAt(pt) !== Color.Empty) continue;
       const nbs = pos.orthogonalNeighbors(pt);
       const hasEnemyNb = nbs.some((n) => pos.stoneAt(n) === enemyColor);
-      if (hasEnemyNb) continue;
 
       const solidNbsCount = nbs.filter(
         (n) =>
           pos.stoneAt(n) === color &&
           pos.floodFillChain(n).liberties.size >= 2
       ).length;
+
+      if (
+        hasEnemyNb &&
+        (solidNbsCount < 3 ||
+          this.enemyPlayGainsLiberties(pos, pt, enemyColor, color))
+      ) {
+        continue;
+      }
 
       const touchingChainIndices: number[] = [];
       rawChains.forEach((ch, idx) => {
@@ -713,18 +770,28 @@ export class BensonTerminalEvaluator {
           const allEmptyAreLiberties = Array.from(reg.emptyPoints).every((pt) =>
             ch.liberties.has(pt)
           );
-          // Squatting Ox (脹牯牛, e.g. p222): single enclosed cavity of `ch` where `pt` is buffered
-          // by >= 3 suicide-atari enemy stones (`eyeCountContribution === 2`) and `ch` is not in immediate enemy atari.
+          const isSingleChainMonopolizedPureEye =
+            reg.boundaryChainIds.length === 1 &&
+            reg.boundaryChainIds[0] === cid &&
+            reg.enemyStones.size === 0 &&
+            ch.liberties.size >= 2;
+          // Squatting Ox (脹牯牛, e.g. p222, p098, p101): single enclosed cavity of `ch` where `pt` is buffered
+          // by >= 2 suicide-atari enemy stones (`eyeCountContribution === 2`) and `ch` is not in immediate enemy atari.
           const isSquattingOxVital =
             !allEmptyAreLiberties &&
             reg.boundaryChainIds.length === 1 &&
             reg.boundaryChainIds[0] === cid &&
             reg.emptyPoints.size === 1 &&
-            reg.enemyStones.size >= 3 &&
+            reg.enemyStones.size >= 2 &&
             reg.eyeCountContribution >= 2 &&
-            (ch.liberties.size >= 2 || (ch.liberties.size === 1 && pos.toPlay === color));
+            (ch.liberties.size >= 2 ||
+              (ch.liberties.size === 1 && pos.toPlay === color));
 
-          if (allEmptyAreLiberties || isSquattingOxVital) {
+          if (
+            allEmptyAreLiberties ||
+            isSingleChainMonopolizedPureEye ||
+            isSquattingOxVital
+          ) {
             ch.vitalRegionIds.push(rid);
             totalEyeContribution += reg.eyeCountContribution;
           }

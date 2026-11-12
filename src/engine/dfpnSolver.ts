@@ -46,6 +46,7 @@ interface SearchChildSlot {
   koDependent: boolean;
   stateId: number;
   hasCapture: boolean;
+  checkedNullMoveDagId: number;
   dagNodeId: number;
   proofRz: ProofCertificateRZ;
   disproofRz: ProofCertificateRZ;
@@ -662,16 +663,7 @@ export class DfpnSolver {
     }
 
     // Step 4 (FR-6.1, FR-6.3, FR-6.9): History-safe BoardTT & PatternTT lookup
-    const revalidateCb = (dagId: number, out: ProofOutcome) =>
-      this.revalidateSourceProofOnQueryState(
-        pos,
-        context,
-        dagId,
-        out,
-        regionCoords
-      );
-
-    const boardHit = this.ttStore.lookupBoardTT(pos, context, revalidateCb);
+    const boardHit = this.ttStore.lookupBoardTT(pos, context);
     if (
       boardHit &&
       boardHit.outcome !== ProofOutcome.Unknown &&
@@ -721,6 +713,7 @@ export class DfpnSolver {
         koDependent: false,
         stateId: -1,
         hasCapture: false,
+        checkedNullMoveDagId: -1,
         dagNodeId: -1,
         proofRz: new ProofCertificateRZ(),
         disproofRz: new ProofCertificateRZ(),
@@ -768,7 +761,14 @@ export class DfpnSolver {
       ) {
         for (let i = 0; i < windowSize; i++) {
           const ch = children[i];
-          if (ch.expanded || ch.outcome !== ProofOutcome.Unknown) continue;
+          if (
+            ch.expanded ||
+            ch.outcome !== ProofOutcome.Unknown ||
+            ch.checkedNullMoveDagId === frontier.representativeDagId
+          ) {
+            continue;
+          }
+          ch.checkedNullMoveDagId = frontier.representativeDagId;
           if (this.rzEngine.isOutsideRZCandidate(ch.move, frontier.activeNullMoveRz)) {
             const nextPos = pos.clone();
             const playRes = nextPos.playMove(ch.move);
@@ -778,8 +778,7 @@ export class DfpnSolver {
                 nextPos,
                 context,
                 frontier.representativeDagId,
-                frontier.representativeOutcome,
-                regionCoords
+                frontier.representativeOutcome
               )
             ) {
               const qStateId =
