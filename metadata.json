@@ -1,0 +1,6 @@
+{
+  "name": "LDProver — C++20 Go Life-and-Death Prover & Verification Workbench",
+  "description": "Google C++ Style modular Tsumego (Life-and-Death) exact solver implementing df-pn, Relevance-Zone (RZ) backpropagation, Benson UCA, Radix-Tree PatternTT, and independent lproof/1 DAG verification.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
