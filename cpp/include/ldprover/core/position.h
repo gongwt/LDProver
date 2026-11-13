@@ -44,6 +44,9 @@ class Position {
 
   void Clear(const ProofContext& context) noexcept;
   void SetupInitialStone(int coord, Color color) noexcept;
+  void SetImmortalWall(const BitBoard<N>& wall) noexcept {
+    immortal_wall_ = wall;
+  }
   void FinalizeInitialPosition(Color first_to_play) noexcept;
 
   Color StoneAt(int coord) const noexcept;
@@ -55,6 +58,7 @@ class Position {
   uint64_t SurvivingTargetTokensMask() const noexcept {
     return surviving_target_tokens_mask_;
   }
+  const BitBoard<N>& ImmortalWall() const noexcept { return immortal_wall_; }
 
   const BitBoard<N>& Stones(Color color) const noexcept {
     return color == Color::kBlack ? black_stones_ : white_stones_;
@@ -93,6 +97,7 @@ class Position {
   ProofContext context_{};
   BitBoard<N> black_stones_{};
   BitBoard<N> white_stones_{};
+  BitBoard<N> immortal_wall_{};
   Color to_play_ = Color::kBlack;
   int16_t ko_point_ = kNullMove;
   uint8_t consecutive_passes_ = 0;

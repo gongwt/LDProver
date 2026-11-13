@@ -90,7 +90,7 @@ export default function App() {
     deterministicMode: true,
     koRule: KoRule.SituationalSuperko,
     attackerAllowKo: false,
-    defenderAllowKo: false,
+    defenderAllowKo: true,
   });
 
   // Board Viewport & Overlay State
@@ -338,7 +338,8 @@ export default function App() {
     const results = allProblems.map((prob) => {
       const cfg: SolverConfig = {
         ...solverConfig,
-        attackerAllowKo: prob.defaultAllowKo,
+        attackerAllowKo: prob.attackerAllowKo ?? prob.defaultAllowKo,
+        defenderAllowKo: prob.defenderAllowKo ?? solverConfig.defenderAllowKo,
       };
       const solver = new DfpnSolver(cfg);
       const rep = solver.solveProblem(prob);
@@ -605,15 +606,15 @@ export default function App() {
             <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-slate-500">
               <span>Google C++ 编码规范</span>
               <span aria-hidden="true">·</span>
-              <span>df-pn 对偶阈值搜索</span>
+              <span>1+ε df-pn 启发式对偶搜索</span>
               <span aria-hidden="true">·</span>
-              <span>Benson UCA + KataGo semeye 眼位拓扑</span>
+              <span>经典 Benson (1976) UCA 零误判算子</span>
               <span aria-hidden="true">·</span>
-              <span>ProofCertificateRZ 空间闭包</span>
+              <span>全覆盖 ProofCertificateRZ 重放剪枝</span>
               <span aria-hidden="true">·</span>
-              <span>RZS-PT 基数树模式表</span>
+              <span>D8 自动对齐真实 study-LD-RZ 题库</span>
               <span aria-hidden="true">·</span>
-              <span>lproof/1 零共享独立校验</span>
+              <span>lproof/1 叶节点独立终局校验</span>
             </div>
           </div>
 
@@ -844,44 +845,62 @@ export default function App() {
               {/* Ground-Truth Comparison Banner for study-LD-RZ problems */}
               {currentProblem.groundTruthFirstMoves &&
                 currentProblem.groundTruthFirstMoves.length > 0 && (
-                  <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-mono tabular-nums">
-                    <div>
-                      <span className="text-slate-500">引擎求解首手：</span>
-                      <strong className="text-slate-900">
-                        {solveReport.bestMoveSgf
-                          ? `${solveReport.bestMoveSgf} (${coordToHumanLabel(
-                              solveReport.bestMove,
-                              19
-                            )})`
-                          : '无 (未定论)'}
-                      </strong>
-                    </div>
-                    <div>
-                      <span className="text-slate-500">
-                        题库 answer_firstmove：
-                      </span>
-                      <strong className="text-slate-900">
-                        {currentProblem.groundTruthFirstMoves.join(', ')}
-                      </strong>
-                    </div>
-                    <div>
-                      {currentProblem.id === 'chao_vol1_p040' ? (
-                        <span className="font-sans font-semibold text-emerald-700">
-                          检出原库标签 Bug（真解 ps 已证）
+                  <div className="mt-3 space-y-1.5 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-mono tabular-nums">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <span className="text-slate-500">引擎首手：</span>
+                        <strong className="text-slate-900">
+                          {solveReport.bestMoveSgf
+                            ? `${solveReport.bestMoveSgf} (${coordToHumanLabel(
+                                solveReport.bestMove,
+                                19
+                              )})`
+                            : '无'}
+                        </strong>
+                      </div>
+                      <div>
+                        <span className="text-slate-500">
+                          JSON answer_firstmove：
                         </span>
-                      ) : solveReport.bestMoveSgf &&
-                        currentProblem.groundTruthFirstMoves.includes(
-                          solveReport.bestMoveSgf
-                        ) ? (
-                        <span className="font-sans font-semibold text-emerald-700">
-                          与题库正解一致
-                        </span>
-                      ) : (
-                        <span className="font-sans font-semibold text-amber-700">
-                          可切换下方「原谱参考正解」回放
-                        </span>
-                      )}
+                        <strong className="text-slate-900">
+                          {currentProblem.groundTruthFirstMoves.join(', ')}
+                        </strong>
+                      </div>
+                      {currentProblem.verifiedGroundTruthFirstMoves &&
+                        currentProblem.verifiedGroundTruthFirstMoves.length >
+                          0 && (
+                          <div>
+                            <span className="text-slate-500">
+                              rawsgf D8 核验真解：
+                            </span>
+                            <strong className="text-emerald-800">
+                              {currentProblem.verifiedGroundTruthFirstMoves.join(
+                                ', '
+                              )}
+                            </strong>
+                          </div>
+                        )}
+                      <div>
+                        {solveReport.rootStatus === ProofOutcome.ProvenWin &&
+                        solveReport.bestMoveSgf &&
+                        (currentProblem.verifiedGroundTruthFirstMoves ??
+                          currentProblem.groundTruthFirstMoves
+                        ).includes(solveReport.bestMoveSgf) ? (
+                          <span className="font-sans font-semibold text-emerald-700">
+                            形式化证明通过 · 与原谱真解一致
+                          </span>
+                        ) : (
+                          <span className="font-sans font-semibold text-amber-700">
+                            可切换下方「原谱参考正解」回放
+                          </span>
+                        )}
+                      </div>
                     </div>
+                    {currentProblem.groundTruthNote && (
+                      <div className="border-t border-slate-200 pt-1 font-sans text-[11px] font-medium text-amber-800">
+                        数据集勘误：{currentProblem.groundTruthNote}
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -1446,6 +1465,28 @@ export default function App() {
                           }))
                         }
                         className="h-4 w-4 rounded border-amber-400 text-slate-900"
+                      />
+                    </label>
+
+                    <label className="flex items-center justify-between gap-2 cursor-pointer rounded-md bg-slate-50 border border-slate-200 px-2.5 py-2">
+                      <div>
+                        <div className="font-semibold text-slate-900">
+                          FR-5.7 允许守方借劫反驳 (defender_allow_ko)
+                        </div>
+                        <div className="text-[11px] text-slate-600">
+                          对齐 study-LD-RZ 题库契约（做活题中杀棋方成劫即破活）
+                        </div>
+                      </div>
+                      <input
+                        type="checkbox"
+                        checked={solverConfig.defenderAllowKo}
+                        onChange={(e) =>
+                          setSolverConfig((c) => ({
+                            ...c,
+                            defenderAllowKo: e.target.checked,
+                          }))
+                        }
+                        className="h-4 w-4 rounded border-slate-300 text-slate-900"
                       />
                     </label>
                   </div>

@@ -116,14 +116,16 @@ class DfpnSolver {
 
   // FR-4.10: Deterministic FastCapture tactical move ordering.
   int32_t ScoreMoveFastCapture(const Position<N>& pos,
-                               const ProofContext& context,
-                               int16_t move) const;
+                               const ProofContext& context, int16_t move,
+                               bool is_or_node) const;
 
-  // FR-5.5: Revalidate source proof under QueryState + HistorySet before
-  // materializing an OutsideRZRevalidated Pruned* conclusion.
+  // FR-5.5: Revalidate source proof under QueryState + HistorySet (both witness
+  // and full-coverage AND/OR nodes) before materializing OutsideRZRevalidated.
   bool RevalidateSourceProofOnQueryState(
       const Position<N>& query_pos, const ProofContext& context,
-      uint32_t source_dag_node_id, ProofOutcome expected_outcome) const;
+      const std::optional<BitBoard<N>>& region_hint,
+      uint32_t source_dag_node_id, ProofOutcome expected_outcome,
+      uint32_t guard_depth = 0) const;
 
   SolverConfig config_;
   BensonTerminalEvaluator<N> terminal_eval_;

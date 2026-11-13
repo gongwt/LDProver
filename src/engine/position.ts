@@ -70,7 +70,7 @@ export function sgfToCoord(
   return coordFromRowCol(r, c, size);
 }
 
-// Deterministic 64-bit FNV-1a / SplitMix style hash for Zobrist keys
+// Deterministic 64-bit SplitMix64 hash for Zobrist keys
 function deterministicKey(seed: number): bigint {
   let z = BigInt(seed) + 0x9e3779b97f4a7c15n;
   z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & 0xffffffffffffffffn;
@@ -88,6 +88,48 @@ for (let i = 0; i < 361; i++) {
 }
 const ZOBRIST_WHITE_TO_PLAY = deterministicKey(9999);
 
+// Precomputed neighbor lookup tables per board size to eliminate hot-loop allocations
+const ORTHO_TABLES = new Map<number, number[][]>();
+const DIAG_TABLES = new Map<number, number[][]>();
+
+function getOrthoTable(size: number): number[][] {
+  let tbl = ORTHO_TABLES.get(size);
+  if (!tbl) {
+    tbl = new Array(size * size);
+    for (let r = 0; r < size; r++) {
+      for (let c = 0; c < size; c++) {
+        const nb: number[] = [];
+        if (r > 0) nb.push((r - 1) * size + c);
+        if (r + 1 < size) nb.push((r + 1) * size + c);
+        if (c > 0) nb.push(r * size + (c - 1));
+        if (c + 1 < size) nb.push(r * size + (c + 1));
+        tbl[r * size + c] = nb;
+      }
+    }
+    ORTHO_TABLES.set(size, tbl);
+  }
+  return tbl;
+}
+
+function getDiagTable(size: number): number[][] {
+  let tbl = DIAG_TABLES.get(size);
+  if (!tbl) {
+    tbl = new Array(size * size);
+    for (let r = 0; r < size; r++) {
+      for (let c = 0; c < size; c++) {
+        const diag: number[] = [];
+        if (r > 0 && c > 0) diag.push((r - 1) * size + (c - 1));
+        if (r > 0 && c + 1 < size) diag.push((r - 1) * size + (c + 1));
+        if (r + 1 < size && c > 0) diag.push((r + 1) * size + (c - 1));
+        if (r + 1 < size && c + 1 < size) diag.push((r + 1) * size + (c + 1));
+        tbl[r * size + c] = diag;
+      }
+    }
+    DIAG_TABLES.set(size, tbl);
+  }
+  return tbl;
+}
+
 export interface ChainFloodResult {
   stones: Set<number>;
   liberties: Set<number>;
@@ -104,6 +146,11 @@ export class GoPosition {
   public historySnapshots: CanonicalSnapshot[];
   public immortalWallSet: Set<number>;
 
+  private readonly orthoTable: number[][];
+  private readonly diagTable: number[][];
+  private boardZobrist: bigint = 0n;
+  private cachedZobristHex: string | null = null;
+
   constructor(
     context: ProofContext,
     boardSize: number = DEFAULT_BOARD_SIZE,
@@ -119,6 +166,8 @@ export class GoPosition {
       (1 << Math.min(context.initialTokens.length, 30)) - 1;
     this.historySnapshots = [];
     this.immortalWallSet = new Set(immortalWallCoords);
+    this.orthoTable = getOrthoTable(boardSize);
+    this.diagTable = getDiagTable(boardSize);
   }
 
   public clone(): GoPosition {
@@ -128,9 +177,10 @@ export class GoPosition {
     copy.koPoint = this.koPoint;
     copy.consecutivePasses = this.consecutivePasses;
     copy.survivingTargetTokensMask = this.survivingTargetTokensMask;
-    // CanonicalSnapshot objects and immortalWallSet are never mutated after creation
     copy.historySnapshots = this.historySnapshots.slice();
     copy.immortalWallSet = this.immortalWallSet;
+    copy.boardZobrist = this.boardZobrist;
+    copy.cachedZobristHex = this.cachedZobristHex;
     return copy;
   }
 
@@ -155,15 +205,26 @@ export class GoPosition {
     firstToPlay: Color
   ): void {
     this.grid.fill(Color.Empty);
+    this.boardZobrist = 0n;
     for (const c of blackCoords) {
-      if (c >= 0 && c < this.grid.length) this.grid[c] = Color.Black;
+      if (c >= 0 && c < this.grid.length && this.grid[c] === Color.Empty) {
+        this.grid[c] = Color.Black;
+        this.boardZobrist ^= ZOBRIST_BLACK[c];
+      }
     }
     for (const c of whiteCoords) {
-      if (c >= 0 && c < this.grid.length) this.grid[c] = Color.White;
+      if (c >= 0 && c < this.grid.length) {
+        if (this.grid[c] === Color.Black) this.boardZobrist ^= ZOBRIST_BLACK[c];
+        if (this.grid[c] !== Color.White) {
+          this.grid[c] = Color.White;
+          this.boardZobrist ^= ZOBRIST_WHITE[c];
+        }
+      }
     }
     this.toPlay = firstToPlay;
     this.koPoint = NULL_MOVE;
     this.consecutivePasses = 0;
+    this.cachedZobristHex = null;
     this.survivingTargetTokensMask = 0;
     this.context.initialTokens.forEach((tok, idx) => {
       if (this.grid[tok.initialCoord] === tok.stoneColor) {
@@ -183,14 +244,12 @@ export class GoPosition {
   }
 
   public computeZobristHex(): string {
-    let h = 0n;
-    for (let i = 0; i < this.grid.length; i++) {
-      if (this.grid[i] === Color.Black) h ^= ZOBRIST_BLACK[i];
-      else if (this.grid[i] === Color.White) h ^= ZOBRIST_WHITE[i];
-    }
+    if (this.cachedZobristHex !== null) return this.cachedZobristHex;
+    let h = this.boardZobrist;
     if (this.toPlay === Color.White) h ^= ZOBRIST_WHITE_TO_PLAY;
     if (this.koPoint >= 0 && this.koPoint < 361) h ^= ZOBRIST_KO[this.koPoint];
-    return h.toString(16).padStart(16, '0');
+    this.cachedZobristHex = h.toString(16).padStart(16, '0');
+    return this.cachedZobristHex;
   }
 
   public getBlackCoords(): number[] {
@@ -223,6 +282,9 @@ export class GoPosition {
     b: CanonicalSnapshot,
     rule: KoRule
   ): boolean {
+    if (rule === KoRule.SituationalSuperko && a.toPlay !== b.toPlay) {
+      return false;
+    }
     if (a.blackCoords.length !== b.blackCoords.length) return false;
     if (a.whiteCoords.length !== b.whiteCoords.length) return false;
     for (let i = 0; i < a.blackCoords.length; i++) {
@@ -230,9 +292,6 @@ export class GoPosition {
     }
     for (let i = 0; i < a.whiteCoords.length; i++) {
       if (a.whiteCoords[i] !== b.whiteCoords[i]) return false;
-    }
-    if (rule === KoRule.SituationalSuperko) {
-      return a.toPlay === b.toPlay;
     }
     return true;
   }
@@ -251,43 +310,29 @@ export class GoPosition {
   }
 
   public orthogonalNeighbors(coord: number): number[] {
-    const r = rowOf(coord, this.boardSize);
-    const c = colOf(coord, this.boardSize);
-    const nb: number[] = [];
-    if (r > 0) nb.push(coordFromRowCol(r - 1, c, this.boardSize));
-    if (r + 1 < this.boardSize) nb.push(coordFromRowCol(r + 1, c, this.boardSize));
-    if (c > 0) nb.push(coordFromRowCol(r, c - 1, this.boardSize));
-    if (c + 1 < this.boardSize) nb.push(coordFromRowCol(r, c + 1, this.boardSize));
-    return nb;
+    return this.orthoTable[coord] ?? [];
   }
 
   public diagonalNeighbors(coord: number): number[] {
-    const r = rowOf(coord, this.boardSize);
-    const c = colOf(coord, this.boardSize);
-    const diag: number[] = [];
-    if (r > 0 && c > 0) diag.push(coordFromRowCol(r - 1, c - 1, this.boardSize));
-    if (r > 0 && c + 1 < this.boardSize)
-      diag.push(coordFromRowCol(r - 1, c + 1, this.boardSize));
-    if (r + 1 < this.boardSize && c > 0)
-      diag.push(coordFromRowCol(r + 1, c - 1, this.boardSize));
-    if (r + 1 < this.boardSize && c + 1 < this.boardSize)
-      diag.push(coordFromRowCol(r + 1, c + 1, this.boardSize));
-    return diag;
+    return this.diagTable[coord] ?? [];
   }
 
   public floodFillChain(startCoord: number): ChainFloodResult {
     const stones = new Set<number>();
     const liberties = new Set<number>();
-    const color = this.stoneAt(startCoord);
-    if (color === Color.Empty) return { stones, liberties };
+    const color = this.grid[startCoord] as Color;
+    if (!color) return { stones, liberties };
 
     const queue: number[] = [startCoord];
     stones.add(startCoord);
+    let head = 0;
 
-    while (queue.length > 0) {
-      const cur = queue.shift()!;
-      for (const nb of this.orthogonalNeighbors(cur)) {
-        const nbColor = this.stoneAt(nb);
+    while (head < queue.length) {
+      const cur = queue[head++];
+      const nbs = this.orthoTable[cur];
+      for (let i = 0; i < nbs.length; i++) {
+        const nb = nbs[i];
+        const nbColor = this.grid[nb];
         if (nbColor === Color.Empty) {
           liberties.add(nb);
         } else if (nbColor === color && !stones.has(nb)) {
@@ -304,7 +349,7 @@ export class GoPosition {
     capturedCoords: number[];
     isKoCapture: boolean;
   } {
-    if (this.isAtDoublePass()) {
+    if (this.consecutivePasses >= 2) {
       return { legal: false, capturedCoords: [], isKoCapture: false };
     }
 
@@ -312,6 +357,7 @@ export class GoPosition {
       this.koPoint = NULL_MOVE;
       this.consecutivePasses += 1;
       this.toPlay = oppositeColor(this.toPlay);
+      this.cachedZobristHex = null;
       this.historySnapshots.push(this.currentCanonicalSnapshot());
       return { legal: true, capturedCoords: [], isKoCapture: false };
     }
@@ -325,49 +371,76 @@ export class GoPosition {
       return { legal: false, capturedCoords: [], isKoCapture: false };
     }
 
-    const prevGrid = new Uint8Array(this.grid);
     const prevKo = this.koPoint;
     const prevPasses = this.consecutivePasses;
     const prevTokens = this.survivingTargetTokensMask;
+    const prevBoardZobrist = this.boardZobrist;
 
     const us = this.toPlay;
     const them = oppositeColor(us);
     this.grid[move] = us;
+    this.boardZobrist ^=
+      us === Color.Black ? ZOBRIST_BLACK[move] : ZOBRIST_WHITE[move];
 
-    const capturedSet = new Set<number>();
-    for (const nb of this.orthogonalNeighbors(move)) {
-      if (this.grid[nb] === them && !capturedSet.has(nb)) {
+    const capturedCoords: number[] = [];
+    const capturedSeen = new Set<number>();
+    const nbs = this.orthoTable[move];
+
+    for (let i = 0; i < nbs.length; i++) {
+      const nb = nbs[i];
+      if (this.grid[nb] === them && !capturedSeen.has(nb)) {
         const enemyChain = this.floodFillChain(nb);
-        // Immortal outer boundary stones cannot be captured in local problem zone
-        const isImmortal = Array.from(enemyChain.stones).some((s) =>
-          this.immortalWallSet.has(s)
-        );
-        if (enemyChain.liberties.size === 0 && !isImmortal) {
-          for (const s of enemyChain.stones) capturedSet.add(s);
+        if (enemyChain.liberties.size === 0) {
+          let isImmortal = false;
+          for (const s of enemyChain.stones) {
+            if (this.immortalWallSet.has(s)) {
+              isImmortal = true;
+              break;
+            }
+          }
+          if (!isImmortal) {
+            for (const s of enemyChain.stones) {
+              capturedSeen.add(s);
+              capturedCoords.push(s);
+            }
+          }
         }
       }
     }
 
-    const capturedCoords = Array.from(capturedSet);
-    for (const cap of capturedCoords) {
-      this.grid[cap] = Color.Empty;
-      // FR-2.6: Permanently remove captured crucial_stone target tokens
-      this.context.initialTokens.forEach((tok, idx) => {
-        if (tok.initialCoord === cap) {
-          this.survivingTargetTokensMask &= ~(1 << idx);
+    if (capturedCoords.length > 0) {
+      const themKeys = them === Color.Black ? ZOBRIST_BLACK : ZOBRIST_WHITE;
+      for (let i = 0; i < capturedCoords.length; i++) {
+        const cap = capturedCoords[i];
+        this.grid[cap] = Color.Empty;
+        this.boardZobrist ^= themKeys[cap];
+        for (let idx = 0; idx < this.context.initialTokens.length; idx++) {
+          if (this.context.initialTokens[idx].initialCoord === cap) {
+            this.survivingTargetTokensMask &= ~(1 << idx);
+          }
         }
-      });
+      }
     }
 
     const ourChain = this.floodFillChain(move);
-    const ourIsImmortal = Array.from(ourChain.stones).some((s) =>
-      this.immortalWallSet.has(s)
-    );
-    if (ourChain.liberties.size === 0 && !ourIsImmortal) {
-      // Suicide is forbidden (FR-2.1, C-2)
-      this.grid.set(prevGrid);
-      this.survivingTargetTokensMask = prevTokens;
-      return { legal: false, capturedCoords: [], isKoCapture: false };
+    if (ourChain.liberties.size === 0) {
+      let ourIsImmortal = false;
+      for (const s of ourChain.stones) {
+        if (this.immortalWallSet.has(s)) {
+          ourIsImmortal = true;
+          break;
+        }
+      }
+      if (!ourIsImmortal) {
+        // Suicide is forbidden (FR-2.1, C-2): restore state
+        this.grid[move] = Color.Empty;
+        for (let i = 0; i < capturedCoords.length; i++) {
+          this.grid[capturedCoords[i]] = them;
+        }
+        this.boardZobrist = prevBoardZobrist;
+        this.survivingTargetTokensMask = prevTokens;
+        return { legal: false, capturedCoords: [], isKoCapture: false };
+      }
     }
 
     let nextKo = NULL_MOVE;
@@ -384,29 +457,46 @@ export class GoPosition {
     this.koPoint = nextKo;
     this.consecutivePasses = 0;
     this.toPlay = them;
+    this.cachedZobristHex = null;
+
+    const nextSnap = this.currentCanonicalSnapshot();
 
     // FR-2.2: Check SSK / PSK against full canonical history snapshots
     if (this.context.koRule !== KoRule.SimpleKoOnly) {
-      const nextSnap = this.currentCanonicalSnapshot();
-      const violatesSuperko = this.historySnapshots.some((past) =>
-        GoPosition.snapshotsMatch(past, nextSnap, this.context.koRule)
-      );
+      let violatesSuperko = false;
+      for (let i = 0; i < this.historySnapshots.length; i++) {
+        if (
+          GoPosition.snapshotsMatch(
+            this.historySnapshots[i],
+            nextSnap,
+            this.context.koRule
+          )
+        ) {
+          violatesSuperko = true;
+          break;
+        }
+      }
       if (violatesSuperko) {
-        this.grid.set(prevGrid);
+        this.grid[move] = Color.Empty;
+        for (let i = 0; i < capturedCoords.length; i++) {
+          this.grid[capturedCoords[i]] = them;
+        }
         this.koPoint = prevKo;
         this.consecutivePasses = prevPasses;
         this.toPlay = us;
+        this.boardZobrist = prevBoardZobrist;
+        this.cachedZobristHex = null;
         this.survivingTargetTokensMask = prevTokens;
         return { legal: false, capturedCoords: [], isKoCapture: false };
       }
     }
 
-    this.historySnapshots.push(this.currentCanonicalSnapshot());
+    this.historySnapshots.push(nextSnap);
     return { legal: true, capturedCoords, isKoCapture };
   }
 
   public isLegalMove(move: number, knownMonotonicHistory?: boolean): boolean {
-    if (this.isAtDoublePass()) return false;
+    if (this.consecutivePasses >= 2) return false;
     if (move === PASS_MOVE) return true;
     if (
       move < 0 ||
@@ -417,26 +507,57 @@ export class GoPosition {
       return false;
     }
 
-    // Fast path: if `move` has an empty orthogonal neighbor (guaranteed >=1 liberty, no suicide),
-    // puts no adjacent enemy stone into 0-liberty capture, and history is strictly monotonic,
-    // then neither suicide nor Superko can trigger.
+    const nbs = this.orthoTable[move];
+    let hasEmptyNb = false;
+    for (let i = 0; i < nbs.length; i++) {
+      if (this.grid[nbs[i]] === Color.Empty) {
+        hasEmptyNb = true;
+        break;
+      }
+    }
+
     const monotonic =
       knownMonotonicHistory ?? this.isCaptureFreeMonotonicHistory();
-    if (monotonic) {
-      const nbs = this.orthogonalNeighbors(move);
-      const hasEmptyNb = nbs.some((n) => this.grid[n] === Color.Empty);
-      if (hasEmptyNb) {
-        const them = oppositeColor(this.toPlay);
-        let mightCapture = false;
-        for (const n of nbs) {
-          if (this.grid[n] === them && !this.immortalWallSet.has(n)) {
-            if (this.floodFillChain(n).liberties.size <= 1) {
-              mightCapture = true;
-              break;
-            }
+    if (monotonic && hasEmptyNb) {
+      const them = oppositeColor(this.toPlay);
+      let mightCapture = false;
+      for (let i = 0; i < nbs.length; i++) {
+        const n = nbs[i];
+        if (this.grid[n] === them && !this.immortalWallSet.has(n)) {
+          if (this.floodFillChain(n).liberties.size <= 1) {
+            mightCapture = true;
+            break;
           }
         }
-        if (!mightCapture) return true;
+      }
+      if (!mightCapture) return true;
+    }
+
+    // Fast non-suicide check before cloning for SSK
+    if (!hasEmptyNb) {
+      const us = this.toPlay;
+      const them = oppositeColor(us);
+      let connectsAliveFriendly = false;
+      let capturesEnemy = false;
+      for (let i = 0; i < nbs.length; i++) {
+        const n = nbs[i];
+        if (this.grid[n] === us) {
+          if (this.floodFillChain(n).liberties.size >= 2) {
+            connectsAliveFriendly = true;
+            break;
+          }
+        } else if (this.grid[n] === them && !this.immortalWallSet.has(n)) {
+          if (this.floodFillChain(n).liberties.size === 1) {
+            capturesEnemy = true;
+            break;
+          }
+        }
+      }
+      if (!connectsAliveFriendly && !capturesEnemy) {
+        return false;
+      }
+      if (monotonic && connectsAliveFriendly && !capturesEnemy) {
+        return true;
       }
     }
 
@@ -445,17 +566,22 @@ export class GoPosition {
   }
 
   public generateLegalMoves(regionCoords?: number[]): number[] {
-    if (this.isAtDoublePass()) return [];
-    const candidates =
-      regionCoords && regionCoords.length > 0
-        ? regionCoords
-        : Array.from({ length: this.grid.length }, (_, i) => i);
-
+    if (this.consecutivePasses >= 2) return [];
     const monotonic = this.isCaptureFreeMonotonicHistory();
     const legal: number[] = [];
-    for (const c of candidates) {
-      if (this.grid[c] === Color.Empty && c !== this.koPoint) {
-        if (this.isLegalMove(c, monotonic)) legal.push(c);
+
+    if (regionCoords && regionCoords.length > 0) {
+      for (let i = 0; i < regionCoords.length; i++) {
+        const c = regionCoords[i];
+        if (this.grid[c] === Color.Empty && c !== this.koPoint) {
+          if (this.isLegalMove(c, monotonic)) legal.push(c);
+        }
+      }
+    } else {
+      for (let c = 0; c < this.grid.length; c++) {
+        if (this.grid[c] === Color.Empty && c !== this.koPoint) {
+          if (this.isLegalMove(c, monotonic)) legal.push(c);
+        }
       }
     }
     legal.push(PASS_MOVE);

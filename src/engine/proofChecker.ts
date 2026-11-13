@@ -283,32 +283,112 @@ export class ProofArtifactManager {
           : `节点 #${failedNode} 违反 LP-N15 或后序拓扑约束`,
     });
 
-    // Check 4: Benson UCA & Token Capture terminal leaf verification (FR-3.1..FR-3.3)
+    // Check 4: Independent Benson UCA & Token Capture leaf verification + internal AND/OR invariants (FR-3.1..FR-3.3, FR-9.2)
     const leafNodes = report.proofDagNodes.filter(
       (n) => n.childNodeIds.length === 0 && !n.isPrunedOutsideRz
     );
+    let leafEvalPassed = leafNodes.length > 0;
+    let leafEvalDetail = '';
+    const immortalWalls = Array.from(initialPos.immortalWallSet);
+
+    for (const leaf of leafNodes) {
+      const st = report.stateTable[leaf.stateId];
+      if (!st) {
+        leafEvalPassed = false;
+        failedNode = leaf.nodeId;
+        leafEvalDetail = `叶节点 #${leaf.nodeId} 缺失 StateTable 记录 stateId=${leaf.stateId}`;
+        break;
+      }
+      const leafPos = new GoPosition(context, initialPos.boardSize, immortalWalls);
+      leafPos.setupInitialStones(st.blackCoords, st.whiteCoords, st.toPlay);
+      leafPos.koPoint = st.koPoint;
+      leafPos.consecutivePasses = st.consecutivePasses;
+      leafPos.survivingTargetTokensMask = st.survivingTokensMask;
+      if (report.historyTable[leaf.historyId]) {
+        leafPos.historySnapshots = report.historyTable[leaf.historyId].slice();
+      }
+      const termRes = independentTerminal.evaluateTerminal(leafPos, context);
+      const expectedStatus =
+        leaf.outcome === ProofOutcome.ProvenWin
+          ? TerminalStatus.Win
+          : TerminalStatus.Loss;
+      if (termRes.status !== expectedStatus) {
+        leafEvalPassed = false;
+        failedNode = leaf.nodeId;
+        leafEvalDetail = `叶节点 #${leaf.nodeId} 独立终局复验失败：声称 ${leaf.outcome}，实测 ${termRes.status} (${termRes.evidenceKind})`;
+        break;
+      }
+    }
+
+    if (leafEvalPassed) {
+      for (const node of report.proofDagNodes) {
+        if (node.childNodeIds.length === 0) continue;
+        const singleWitnessMode =
+          (node.isOrNode && node.outcome === ProofOutcome.ProvenWin) ||
+          (!node.isOrNode && node.outcome === ProofOutcome.ProvenLoss);
+        if (singleWitnessMode) {
+          const hasWitness = node.childNodeIds.some(
+            (cid) =>
+              report.proofDagNodes[cid] &&
+              report.proofDagNodes[cid].outcome === node.outcome
+          );
+          if (!hasWitness) {
+            leafEvalPassed = false;
+            failedNode = node.nodeId;
+            leafEvalDetail = `内部节点 #${node.nodeId} 缺少同结论单见证子节点`;
+            break;
+          }
+        } else {
+          const allMatch = node.childNodeIds.every(
+            (cid) =>
+              report.proofDagNodes[cid] &&
+              report.proofDagNodes[cid].outcome === node.outcome
+          );
+          if (!allMatch) {
+            leafEvalPassed = false;
+            failedNode = node.nodeId;
+            leafEvalDetail = `全覆盖节点 #${node.nodeId} 存在未收敛子节点`;
+            break;
+          }
+        }
+      }
+    }
+
+    if (leafEvalPassed) {
+      leafEvalDetail = `独立复验 ${leafNodes.length} 个终局叶节点 Benson UCA / 令牌提除与全图 AND/OR 归约一致`;
+    }
+
     auditChecks.push({
       checkId: 'CHK-04',
-      requirementRef: 'FR-3.1..FR-3.3',
+      requirementRef: 'FR-3.1..FR-3.3 / FR-9.2',
       title: '终局叶子节点 Benson UCA / 目标令牌提除独立复验',
-      passed: leafNodes.length > 0,
-      detail: `独立复验 ${leafNodes.length} 个终局叶节点证据 (BENSON_UCA / TOKENS_CAPTURED / DOUBLE_PASS)`,
+      passed: leafEvalPassed,
+      detail: leafEvalDetail,
     });
 
     // Check 5: OutsideRZRevalidated null-move certificate replay (FR-5.5, FR-5.6)
     const prunedNodes = report.proofDagNodes.filter((n) => n.isPrunedOutsideRz);
-    const allPrunedHaveCert = prunedNodes.every(
-      (n) =>
-        n.prunedCertificate &&
-        n.prunedCertificate.reason === 'OutsideRZRevalidated' &&
-        n.prunedCertificate.sourceProofNodeId >= 0
-    );
+    const allPrunedHaveCert = prunedNodes.every((n) => {
+      if (
+        !n.prunedCertificate ||
+        n.prunedCertificate.reason !== 'OutsideRZRevalidated' ||
+        n.prunedCertificate.sourceProofNodeId < 0 ||
+        n.prunedCertificate.sourceProofNodeId >= n.nodeId
+      ) {
+        return false;
+      }
+      const srcNode =
+        report.proofDagNodes[n.prunedCertificate.sourceProofNodeId];
+      return Boolean(srcNode && srcNode.outcome === n.outcome);
+    });
     auditChecks.push({
       checkId: 'CHK-05',
       requirementRef: 'FR-5.5 / FR-5.6',
       title: 'OutsideRZRevalidated 证书剪枝 QueryState+HistorySet 重放',
       passed: allPrunedHaveCert,
-      detail: `共复验 ${prunedNodes.length} 个 RZ 外剪枝证书节点，全部包含自包含闭包证据`,
+      detail: allPrunedHaveCert
+        ? `共复验 ${prunedNodes.length} 个 RZ 外剪枝证书节点，全部包含自包含闭包证据`
+        : '存在缺失或源节点不匹配的 OutsideRZRevalidated 剪枝记录',
     });
 
     const allPassed =
@@ -316,8 +396,8 @@ export class ProofArtifactManager {
       stateReplayOk &&
       lpN15Passed &&
       postOrderPassed &&
-      allPrunedHaveCert &&
-      leafNodes.length > 0;
+      leafEvalPassed &&
+      allPrunedHaveCert;
 
     return {
       passed: allPassed,

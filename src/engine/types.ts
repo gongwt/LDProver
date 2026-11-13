@@ -264,7 +264,10 @@ export interface TsumegoProblemSpec {
   blackCrucialStone: string;
   whiteCrucialStone: string;
   defaultAllowKo: boolean;
+  attackerAllowKo?: boolean;
+  defenderAllowKo?: boolean;
   regionCoords: number[];
+  attentionCoords?: number[];
   blackInitialCoords: number[];
   whiteInitialCoords: number[];
   immortalWallCoords: number[];
@@ -274,6 +277,9 @@ export interface TsumegoProblemSpec {
   datasetGroup?: 'study-ld-rz' | 'srs-benchmark';
   rawJsonFilename?: string;
   groundTruthFirstMoves?: string[];
+  verifiedGroundTruthFirstMoves?: string[];
+  refutationFirstMoves?: string[];
+  groundTruthNote?: string;
   referencePv?: {
     move: number;
     sgf: string;

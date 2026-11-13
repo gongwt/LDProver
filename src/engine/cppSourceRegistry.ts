@@ -89,9 +89,9 @@ export const CPP_SOURCE_FILES: CppSourceFileItem[] = [
   {
     path: 'cpp/src/terminal/benson_uca.cc',
     moduleName: 'ldprover_terminal (Impl)',
-    srsTracing: 'FR-3.1..3.9',
+    srsTracing: 'FR-3.1..3.9 / NFR-1',
     googleStyleNotes:
-      'Benson greatest-fixpoint elimination loop, vital eye region verification, double-pass priority over InPath (FR-3.8), and leaf ProofCertificateRZ generation.',
+      'Pure Classic Benson (1976) greatest-fixpoint loop (1 vital contribution per region, immortal outer wall exclusion), UCA-strict double-pass priority over InPath (FR-3.8), and leaf ProofCertificateRZ.',
     content: bensonCcRaw,
   },
   {
@@ -139,7 +139,7 @@ export const CPP_SOURCE_FILES: CppSourceFileItem[] = [
     moduleName: 'ldprover_dfpn (Impl)',
     srsTracing: 'FR-4.1..4.10 / FR-5.5 / FR-5.7',
     googleStyleNotes:
-      'AND/OR df-pn frontier aggregation (min-PN / sum-DN + U), implicit child cost 1, progressive widening K*2^l, FastCapture ordering, OutsideRZRevalidated replay, and KoDependent barrier.',
+      '1+epsilon AND/OR df-pn with heuristic (pn_0, dn_0), progressive widening, Null-Move RZ seeding, full-coverage RevalidateSourceProofOnQueryState, OR-pass guard, and KoDependent barrier.',
     content: dfpnCcRaw,
   },
   {
@@ -155,7 +155,7 @@ export const CPP_SOURCE_FILES: CppSourceFileItem[] = [
     moduleName: 'ldprover_proof (Impl)',
     srsTracing: 'FR-8.1..8.4 / FR-9.1..9.3',
     googleStyleNotes:
-      'lproof/1 JSON DAG serializer, uct_tree_<problem>.sgf exporter, and independent ProofChecker enforcing LP-N15 (0, SAT)/(SAT, 0) and post-order topology.',
+      'lproof/1 JSON DAG serializer, SGF exporter, and independent ProofChecker enforcing LP-N15, LP-T02, full-coverage/witness invariants, and Classic Benson leaf EvaluateTerminal.',
     content: checkerCcRaw,
   },
   {

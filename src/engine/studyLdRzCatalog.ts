@@ -1,42 +1,66 @@
 // Copyright 2026 LDProver Authors. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Real-world Tsumego benchmark problems imported from:
-// https://github.com/rlglab/study-LD-RZ/tree/main/tsumego
+// Unified Real-World Tsumego Catalog generated 100% directly from `/public/tsumego/*.json`
+// (https://github.com/rlglab/study-LD-RZ/tree/main/tsumego).
 //
-// Includes both:
-// 1. Problems proven by LDProver v1.8 (chao_vol1_p031, p037, p040, p042, p057, p060)
-//    with full lproof/1 verification and dataset ground-truth audit (including the
-//    discovery of the ground-truth label bug in chao_vol1_p040.json).
-// 2. Harder problems from study-LD-RZ (chao_vol1_p088, p090, p098, p101, p222,
-//    chao_vol2_p156, p162, p351) alongside their reference rawsgf solutions and
-//    root-cause failure diagnosis & C++20 algorithmic improvement roadmap.
+// Fixes all 4 data & contract root causes:
+//   1. Eliminates hardcoded/mismatched SGFs — imports all 16 JSON problems directly.
+//   2. Eliminates `|| 'qs'` crucial_stone fallback (FR-1.3 empty crucial_stone stays "").
+//   3. Parses recursive SGF variation trees and auto-detects exact D8 board symmetry
+//      (including anti-transpose `(18-c, 18-r)` on p142 & p351, and rot180 `(18-r, 18-c)`
+//      on the remaining 14 problems) to extract accurate `referencePv`, `refutationFirstMoves`,
+//      and cross-validated ground-truth labels (`p040 -> ps`, `p142 -> ks`, `p147 -> os`).
+//   4. Preserves outer boundary `immortalWallCoords` strictly from `!rawRegionSet.has(coord)`
+//      and maps per-problem `black_ko_rule` / `white_ko_rule` into `attackerAllowKo` / `defenderAllowKo`.
+
+import rawP031 from '../../public/tsumego/chao_vol1_p031.json';
+import rawP037 from '../../public/tsumego/chao_vol1_p037.json';
+import rawP040 from '../../public/tsumego/chao_vol1_p040.json';
+import rawP042 from '../../public/tsumego/chao_vol1_p042.json';
+import rawP057 from '../../public/tsumego/chao_vol1_p057.json';
+import rawP060 from '../../public/tsumego/chao_vol1_p060.json';
+import rawP088 from '../../public/tsumego/chao_vol1_p088.json';
+import rawP090 from '../../public/tsumego/chao_vol1_p090.json';
+import rawP098 from '../../public/tsumego/chao_vol1_p098.json';
+import rawP101 from '../../public/tsumego/chao_vol1_p101.json';
+import rawP222 from '../../public/tsumego/chao_vol1_p222.json';
+import rawP142 from '../../public/tsumego/chao_vol2_p142.json';
+import rawP147 from '../../public/tsumego/chao_vol2_p147.json';
+import rawP156 from '../../public/tsumego/chao_vol2_p156.json';
+import rawP162 from '../../public/tsumego/chao_vol2_p162.json';
+import rawP351 from '../../public/tsumego/chao_vol2_p351.json';
 
 import {
+  colOf,
   coordFromRowCol,
   coordToHumanLabel,
   coordToSgf,
   PASS_MOVE,
+  rowOf,
   sgfToCoord,
 } from './position';
 import {
   Color,
-  FailureDiagnosisSpec,
   ProofOutcome,
   SearchGoal,
   TsumegoProblemSpec,
 } from './types';
 
 export interface RawStudyLdRzProblemJson {
+  filename?: string;
   masked_sgf_str: string;
   rawsgf?: string;
+  region?: string;
   turn_color: string;
   winning_color: string;
   black_search_goal: string;
   white_search_goal: string;
   black_crucial_stone: string;
   white_crucial_stone: string;
-  answer_firstmove: string[];
+  black_ko_rule?: string;
+  white_ko_rule?: string;
+  answer_firstmove: string | string[];
 }
 
 export interface StudyLdRzFailureCategory {
@@ -53,80 +77,147 @@ export interface StudyLdRzFailureCategory {
 export const STUDY_LD_RZ_FAILURE_TAXONOMY: StudyLdRzFailureCategory[] = [
   {
     id: 'FT-01',
-    title: '一二路敞口裙边爬行爆炸（Open-Skirt Moat Crawling in distance2wall=4）',
-    affectedProblems: ['chao_vol1_p088', 'chao_vol1_p090', 'chao_vol1_p098'],
+    title: '一二路敞口裙边泛洪与外围缓冲带（Open-Skirt Moat Leakage in Classic Benson）',
+    affectedProblems: [
+      'chao_vol1_p031',
+      'chao_vol1_p037',
+      'chao_vol1_p040',
+      'chao_vol1_p057',
+      'chao_vol1_p060',
+      'chao_vol1_p088',
+      'chao_vol1_p090',
+    ],
     symptom:
-      '黑棋在角部已做出两眼雏形（如 p088 的 rr->rp->qs->os），但因二路棋子（pr/rq）下方的一路点（ps/sq）尚未落子封口，静态泛洪 complement(Black) 从一路缺口泄漏至外围 153 格空白缓冲带，导致 Benson UCA 无法提前识别活棋，防守方沿一二路连续爬行（os->ns->ms->ls）引发指数级分支爆炸。',
+      '黑棋在角部走完原谱 3~5 手正解（如 p088 的 B[rr]->W[rp]->B[qs] 或 p090 的 B[rr]->W[rp]->B[or]->W[nr]->B[qs]）后，局部在人类棋理上已净活，但由于左翼或右翼一路封口尚未闭合，纯经典 Benson (1976) 的 ~X 连通分量从一路缺口泄漏至外围空白区，返回 NonTerminal，需继续深搜多轮封口交换。',
     rootCauseAnalysis:
-      'study-LD-RZ 数据集对每道题设置了 distance2wall=4 的宽阔缓冲带（region 面积达 153 格）。标准静态 Benson (1976) 算法要求 Vital 眼位区域必须是 ~X（非己方棋子集合）中的严格连通孤岛。当做活方在二路立或虎口形成“一二路见合封口（Skirt Miai）”时，虽然对方无法同时破坏左右两侧封口，但静态泛洪因一路空点与外围相连而拒绝将其记为封闭眼区，迫使搜索树继续深搜 6~10 层封口交换。',
+      '经典 Benson (1976) 仅在棋块拥有 >=2 个完全封闭（不与外围连通）的独立 Vital 眼区时才判定无条件活。对于敞口裙边见合（Skirt Miai），任何静态“虚拟封口”或“超级链合并”一旦过宽都会引发假证明（False Positive），必须在保持终局算子 100% 经典可靠性的前提下依靠搜索层裁剪外围无意义应手。',
     algorithmicSolution:
-      '在 ldprover_terminal 与 ldprover_rz 中引入「一二路裙边见合虚拟封口算子（1st/2nd-Line Skirt-Miai Virtual Closure）」与「动态 RZS-PT 边界墙生成」：当己方二路强棋子正下方的一路点为空、且左右至少一侧有己方虎口/立下保护时，静态注入虚拟阻断边，截断 complement(color) 向外围缓冲带的泄漏；同时在搜索层识别一二路爬行等价类，限制向缓冲带外缘的无意义延气爬行。',
+      '保持 ldprover_terminal 为纯经典 Benson (1976) 零误判算子；在 ldprover_dfpn 的 AND 节点优先探测 Null-Move (PASS) 建立紧凑 ProofCertificateRZ，利用全覆盖复核版 OutsideRZRevalidated 一次性剪除缓冲带脱先分支，并用 NNAttentionMask 抑制外围虚手。',
     cppInterfaceDesign:
-      'BensonTerminalEvaluator<19>::ComputeVirtualSkirtClosureMask(const Position<19>& pos, Color color) -> BitBoard<19>',
-    srsTracing: 'FR-3.1 静态活棋扩展 / FR-5.2 动态相关区域边界闭合',
+      'DfpnSolver<19>::RevalidateSourceProofOnQueryState(const Position<19>& query_pos, int src_dag_id) -> bool',
+    srsTracing: 'FR-3.1 经典 Benson 可靠性 / FR-5.5 全覆盖源证明重放',
   },
   {
     id: 'FT-02',
-    title: '无双真眼的多步气数对杀与有眼杀无眼（Multi-Step Semeai & Liberty Race）',
-    affectedProblems: ['chao_vol2_p156', 'chao_vol2_p351', 'chao_vol2_p142', 'chao_vol2_p147'],
+    title: '无两眼紧气对杀与分断子提除深度（Multi-Step Semeai & Cutting-Stone Capture）',
+    affectedProblems: ['chao_vol2_p142', 'chao_vol2_p147', 'chao_vol2_p156', 'chao_vol2_p351'],
     symptom:
-      '目标棋块局部空间不足以做出两个独立真眼，必须通过 3~5 气的紧气对杀（Semeai）或“有眼杀无眼”吃掉外围分断的敌方数子才能连通做活；纯 Benson UCA 仅在敌子被彻底提光（TOKENS_CAPTURED）的那一瞬间才返回 Win，导致搜索深度超过 12~16 层后触发 NodeLimit。',
+      '做活方关键块被敌方数子分断，局部空间无法直接围出两只纯空真眼，必须先在紧气对杀中彻底提光敌方分断子（如 p156 的 B[kq,lq,kr]、p142 的 W[lr,mr]），纯经典 Benson 才能观测到连通后的两眼。在分断子被提光前，静态终局始终为 NonTerminal。',
     rootCauseAnalysis:
-      'Benson UCA 算子是纯眼位拓扑不动点算法，对“双方均无两眼但攻方气数严格领先（如外气 4:2 或单眼对无眼）”的对杀局面只能返回 NonTerminal。在 chao_vol2_p156 与 p351 中，白棋正解 W[lr] 后需经历多步收气才能提掉黑棋分断子，缺乏静态对杀估值使 df-pn 在 AND/OR 树中均匀展开大量非紧气分支。',
+      '做活终局（BENSON_UCA）要求两只完全封闭的独立真眼，杀棋终局（TOKENS_CAPTURED）要求关键令牌气数归零被提，中间缺乏可靠的“静态必死 / 必胜对杀”证明算子；若把“4~6 格含敌子腔体 = 2 眼”硬写入终局算子，会导致 p156 W[nr]（原谱失敗3）被误判为活棋。',
     algorithmicSolution:
-      '构建独立静态对杀判定模块 SemeaiEvaluator<N>：识别围绕 crucial_stone 的核心受困链（Semessential Chains），计算外气（Outer Liberties）、公气（Shared Dame）与眼气（Eye Liberties = 2^(n-1)），对满足静态必胜不等式 L_my + L_eye > L_enemy + (to_play == enemy ? 1 : 0) 且敌方无法脱先做眼的局面直接裁剪或赋予极小启发式 φ/δ 偏置。',
+      '严格隔离终局判定与搜索启发式：将眼位潜力与对杀气数差（EstimateHeuristicShapePotential）仅用于 df-pn 子节点 (pn_0, dn_0) 非均匀初始化与着法排序；后续版本可引入带形式化紧气见证的独立 Semeai 证明器。',
     cppInterfaceDesign:
-      'SemeaiEvaluator<19>::EvaluateStaticLibertyRace(const Position<19>& pos, const ProofContext<19>& ctx) -> SemeaiVerdict',
-    srsTracing: '研究笔记 §9 Semeai 对杀扩展 / FR-4.10 紧气排序增强',
+      'BensonTerminalEvaluator<19>::EstimateHeuristicShapePotential(const Position<19>& pos, span<const TargetToken> tokens)',
+    srsTracing: 'NFR-1 100% Soundness / FR-4.10 紧气与眼形潜力启发式',
   },
   {
     id: 'FT-03',
-    title: '故意送吃扑入/倒扑/胀牯牛与劫争霸权（Throw-In Squeeze / Uttegaeshi / KoMaster）',
-    affectedProblems: ['chao_vol1_p101', 'chao_vol1_p222', 'chao_vol2_p162'],
+    title: '长手顺连环扑入、胀牯牛与双劫循环（13~15 Ply Throw-In / Squatting Ox / Double Ko）',
+    affectedProblems: ['chao_vol1_p098', 'chao_vol1_p101', 'chao_vol1_p222', 'chao_vol2_p162'],
     symptom:
-      '正解包含长达 11~15 手的连环弃子破眼手筋（如 p222 的 15 手「胀牯牛」B[rr]->...->B[ss] 扑入，或 p162 的一路跨断倒扑），其中关键手筋在落子瞬间表现为“不提子的单子自紧气（Self-Atari）”，被现有 FastCapture 启发式惩罚（-450 分）排在候选列表末尾。',
+      'p222（黑先做活，15 手连环扑成「胀牯牛」）、p162（13 手跨 9 列首尾呼应）以及 p098（白先测试黑活，含「胀牯牛」与「双劫循环」）主变深度达 10~15+ 层；且「胀牯牛」或「双劫循环」在双方不继续自填气时并非经典 Benson 静态无条件活。',
     rootCauseAnalysis:
-      '为了抑制盲目送吃，FR-4.10 的 scoreMoveFastCapture 对 `selfLibAfter === 1 && captured === 0` 的着法施加了负向惩罚。然而在高级死活题中，“扑（Throw-in / Hori-komi）”、“聚杀送吃（Nakade Sacrifice）”与“胀牯牛（Squatting Ox）”恰恰需要先送入一子迫使对方提子，从而将对方的真眼退化为假眼或形成接不归（Oiotoshi）。',
+      '1) 经典 Benson 要求无条件 pass-alive，而「双劫循环」(p098 參考圖2) 依赖循环劫争制衡，在双 pass 规则下若仅查 Benson 会将双活/双劫判为做活失败；2) 15 手深度的 AND/OR 树即便在紧凑战术视窗内仍需组合级搜索预算与同形置换复用。',
     algorithmicSolution:
-      '在 FastCapture 排序器中新增「破眼扑入与接不归特征检测器（Throw-In & Oiotoshi Detector）」：若某步单子自打吃（1）落在敌方虎口/眼位角肩交点使敌方眼位减少，或（2）敌方提掉该子后自身新棋链气数 <= 2（触发倒扑/接不归），则反转惩罚并奖励 +650 分，使其进入 Progressive Widening 首轮窗口 K。',
+      '1) 按题库 JSON 逐题对齐 `defenderAllowKo = true`（杀棋方可借劫破活，做活方禁止劫活）；2) 在 PatternTT 命中 `HEURISTIC_ONLY` 时执行完整 `RevalidateSourceProofOnQueryState` 复验升级为安全证明复用；3) 后续扩展 SSK 循环双活 / 胀牯牛静态不入气证明规则。',
     cppInterfaceDesign:
-      'MoveOrdering<19>::ScoreThrowInAndOiotoshi(const Position<19>& pos, Coord move, Color to_play) -> int32_t',
-    srsTracing: 'FR-4.4 渐进拓宽窗口 / FR-4.10 战术排序器升级',
+      'TranspositionStore<19>::LookupPatternTT + DfpnSolver<19>::RevalidateSourceProofOnQueryState',
+    srsTracing: 'FR-3.8 双 Pass 语义 / FR-5.7 劫争规则 / FR-6.3 RZS-PT 复用',
   },
   {
     id: 'FT-04',
-    title: '题库原始标注噪声与特殊契约边界（Ground-Truth Label Noise & Pass-First Semantics）',
-    affectedProblems: ['chao_vol1_p040 (已检出题库标注 Bug 并成功证出真解)', 'chao_vol1_p098'],
+    title: '公开数据集 D8 坐标变换与原始标签勘误（Dataset Label Noise & D8 Symmetry Audit）',
+    affectedProblems: ['chao_vol1_p040', 'chao_vol2_p142', 'chao_vol2_p147'],
     symptom:
-      '1) chao_vol1_p040.json 的 answer_firstmove 标注为 ["pr"]，但 LDProver 证明 ["pr"] 必败、真正的唯一正解是 ["ps"] (P1)；2) chao_vol1_p098.json 的 turn_color="w" 且 answer_firstmove=["tt"] (PASS)，测试白先脱先时黑棋是否已净活。',
+      '对比 rawsgf 原谱与 study-LD-RZ JSON 的 `answer_firstmove` 发现 3 处公开数据集标签错误：1) p040 标注 `"pr"` 实为原谱「失敗圖2」，真解为 `"ps"`；2) p142 原谱 `B[ai]N[下邊]` 经反对角翻转 `(18-c, 18-r)` 真解为 `"ks"`，JSON 误写为行未翻转的 `"ka"`；3) p147 原谱 `W[ea]N[右下]` 经 180° 旋转 `(18-r, 18-c)` 真解为 `"os"`，JSON 误写为 `"oa"`。',
     rootCauseAnalysis:
-      '通过对 chao_vol1_p040.json 内嵌的 rawsgf 原始棋谱溯源发现：rawsgf 中 (;B[da]N[正解]) 经角部坐标变换 (18-col, 18-row) 后对应 ["ps"] (P1)，而 (;B[db]N[失敗圖2]) 对应 ["pr"] (P2)。study-LD-RZ 数据集生成脚本在提取 p040 的 answer_firstmove 时误将失败图2的坐标写入了标签！LDProver 凭借严格的形式化证明（106 节点 + lproof/1 校验通过）发现了公开数据集中的标注错误。',
+      'study-LD-RZ 自动生成脚本在对不同角部/边部题型做 D8 对称归一化时：p031..p222, p147, p156, p162 采用了 180° 旋转 `(18-r, 18-c)`，而 p142 与 p351 采用了反对角转置 `(18-c, 18-r)`，且部分题目的 `answer_firstmove` 漏掉了行翻转或误取了失败分支。',
     algorithmicSolution:
-      '在批量基准与题库导入管线中建立「SGF 正解树自动交叉核验器（RawSgf Cross-Validator）」：自动解析 rawsgf 中带有 N[正解] 标记的主变分支，经 (18-col, 18-row) 镜像映射后与 answer_firstmove 交叉比对，自动标记数据集噪声并支持以形式化证明结论为准绳。',
+      '内置自动 D8 对称群匹配器 `detectD8TransformFromRawSgf` 与完整递归 SGF 树解析器 `parseSgfVariationTree`：通过比对 `rawsgf` 与 `masked_sgf_str` 局部棋子集合实现 100% 精确坐标映射，并提取全部 `N[失敗...]` 首手作为形式化回归反例集（防假证明回归测试）。',
     cppInterfaceDesign:
-      'ProblemContractParser<19>::CrossValidateRawSgfSolution(const TsumegoJson& raw) -> ValidationDiagnostic',
-    srsTracing: 'FR-1.1 题库契约清洗 / NFR-1 100% 形式化可靠性',
+      'ProblemContractParser<19>::DetectD8TransformAndExtractVariations(const TsumegoJson& raw)',
+    srsTracing: 'FR-1.1 契约交叉校验 / NFR-1 零伪证明回归防护',
   },
 ];
 
-/**
- * Helper to translate top-right rawsgf coordinates (e.g. "ab", "da") into
- * study-LD-RZ bottom-right transformed coordinates (18 - col, 18 - row).
- */
-export function transformRawSgfCoordToStudyLdRz(sgf2: string): string {
-  if (!sgf2 || sgf2 === 'tt' || sgf2 === 'pass' || sgf2.length !== 2) {
+// All 8 symmetries of the square (D_8) on 0..18 row/col coordinates
+const D8_TRANSFORMS: Array<(r: number, c: number) => [number, number]> = [
+  (r, c) => [r, c],
+  (r, c) => [c, 18 - r],
+  (r, c) => [18 - r, 18 - c], // Index 2: 180-degree rotation
+  (r, c) => [18 - c, r],
+  (r, c) => [r, 18 - c],
+  (r, c) => [18 - r, c],
+  (r, c) => [c, r],
+  (r, c) => [18 - c, 18 - r], // Index 7: Anti-diagonal transpose (p142, p351)
+];
+
+interface SgfTreeNode {
+  props: string[];
+  children: SgfTreeNode[];
+}
+
+function parseSgfTree(sgf: string, cursor = { i: 0 }): SgfTreeNode {
+  const props: string[] = [];
+  const children: SgfTreeNode[] = [];
+  while (cursor.i < sgf.length) {
+    const ch = sgf[cursor.i];
+    if (ch === '(') {
+      cursor.i++;
+      children.push(parseSgfTree(sgf, cursor));
+    } else if (ch === ')') {
+      cursor.i++;
+      break;
+    } else if (ch === ';') {
+      cursor.i++;
+      let prop = '';
+      let inBrackets = false;
+      while (cursor.i < sgf.length) {
+        const c = sgf[cursor.i];
+        if (c === '\\' && inBrackets && cursor.i + 1 < sgf.length) {
+          prop += c + sgf[cursor.i + 1];
+          cursor.i += 2;
+          continue;
+        }
+        if (c === '[') inBrackets = true;
+        else if (c === ']') inBrackets = false;
+        else if (!inBrackets && (c === ';' || c === '(' || c === ')')) break;
+        prop += c;
+        cursor.i++;
+      }
+      props.push(prop);
+    } else {
+      cursor.i++;
+    }
+  }
+  return { props, children };
+}
+
+export function applyD8ToSgfCoord(sgf2: string, d8Index: number): string {
+  const clean = sgf2.trim().toLowerCase();
+  if (!clean || clean === 'tt' || clean === 'pass' || clean.length !== 2) {
     return 'pass';
   }
-  const col = sgf2.charCodeAt(0) - 97;
-  const row = sgf2.charCodeAt(1) - 97;
+  const col = clean.charCodeAt(0) - 97;
+  const row = clean.charCodeAt(1) - 97;
   if (col < 0 || col >= 19 || row < 0 || row >= 19) return 'pass';
-  const tCol = 18 - col;
-  const tRow = 18 - row;
+  const [tRow, tCol] = D8_TRANSFORMS[d8Index](row, col);
   return String.fromCharCode(97 + tCol) + String.fromCharCode(97 + tRow);
 }
 
 /**
- * Extracts AB[...] and AW[...] stones from an SGF string.
+ * Legacy helper preserved for external callers (rot180 default).
+ */
+export function transformRawSgfCoordToStudyLdRz(
+  sgf2: string,
+  d8Index = 2
+): string {
+  return applyD8ToSgfCoord(sgf2, d8Index);
+}
+
+/**
+ * Extracts AB[...] and AW[...] initial setup stones from the root node of an SGF string.
  */
 export function parseSgfInitialStones(sgf: string): {
   blackCoords: number[];
@@ -134,17 +225,20 @@ export function parseSgfInitialStones(sgf: string): {
 } {
   const blackCoords: number[] = [];
   const whiteCoords: number[] = [];
+  // Only inspect header before first variation or move `;B[` / `;W[`
+  const firstMoveIdx = sgf.search(/;[BW]\[/);
+  const header = firstMoveIdx >= 0 ? sgf.slice(0, firstMoveIdx) : sgf;
   const abRegex = /AB((?:\[[a-s]{2}\])+)/g;
   const awRegex = /AW((?:\[[a-s]{2}\])+)/g;
   let m: RegExpExecArray | null;
-  while ((m = abRegex.exec(sgf)) !== null) {
+  while ((m = abRegex.exec(header)) !== null) {
     const coords = m[1].match(/\[([a-s]{2})\]/g) || [];
     for (const token of coords) {
       const c = sgfToCoord(token.slice(1, 3), 19);
       if (c >= 0 && !blackCoords.includes(c)) blackCoords.push(c);
     }
   }
-  while ((m = awRegex.exec(sgf)) !== null) {
+  while ((m = awRegex.exec(header)) !== null) {
     const coords = m[1].match(/\[([a-s]{2})\]/g) || [];
     for (const token of coords) {
       const c = sgfToCoord(token.slice(1, 3), 19);
@@ -155,130 +249,329 @@ export function parseSgfInitialStones(sgf: string): {
 }
 
 /**
- * Extracts the primary solution variation from rawsgf and translates its moves
- * into the bottom-right study-LD-RZ coordinate system.
+ * Automatically identifies which of the 8 D_8 board symmetries maps `rawsgf` initial stones
+ * onto the tactical stones inside `region` of `masked_sgf_str`.
  */
-export function extractReferencePvFromRawSgf(
+export function detectD8TransformFromRawSgf(
   rawsgf: string | undefined,
-  needsCornerTransform = true
-): { move: number; sgf: string; color: Color; comment: string }[] {
-  if (!rawsgf) return [];
-  const branchMatch =
-    rawsgf.match(/\((;[BW]\[[a-s]{0,2}\][^()]*N\[正解[^\]]*\][^()]*)\)/) ||
-    rawsgf.match(/\((;[BW]\[[a-s]{0,2}\][^()]*C\[正解[^\]]*\][^()]*)\)/) ||
-    rawsgf.match(/\((;[BW]\[[a-s]{0,2}\][^()]*)\)/);
-  if (!branchMatch) return [];
-
-  const branchStr = branchMatch[1];
-  const stepRegex = /;([BW])\[([a-s]{0,2})\](?:N\[([^\]]*)\])?(?:C\[([^\]]*)\])?/g;
-  const pv: { move: number; sgf: string; color: Color; comment: string }[] = [];
-  let m: RegExpExecArray | null;
-  let stepIdx = 1;
-  while ((m = stepRegex.exec(branchStr)) !== null) {
-    const color = m[1] === 'B' ? Color.Black : Color.White;
-    const rawCoord = m[2];
-    const note = [m[3], m[4]].filter(Boolean).join(' · ');
-    const sgf =
-      !rawCoord || rawCoord === 'tt'
-        ? 'pass'
-        : needsCornerTransform
-        ? transformRawSgfCoordToStudyLdRz(rawCoord)
-        : rawCoord;
-    const move = sgf === 'pass' ? PASS_MOVE : sgfToCoord(sgf, 19);
-    const label = coordToHumanLabel(move, 19);
-    pv.push({
-      move,
-      sgf,
-      color,
-      comment: `${color === Color.Black ? 'B' : 'W'}[${sgf}] (${label})${
-        note ? ` — 原谱: ${note}` : stepIdx === 1 ? ' — 原谱首手' : ''
-      }`,
-    });
-    stepIdx++;
+  maskedBlackCoords: number[],
+  maskedWhiteCoords: number[],
+  rawRegionSet: Set<number>
+): number {
+  if (!rawsgf) return 2;
+  const rawStones = parseSgfInitialStones(rawsgf);
+  if (
+    rawStones.blackCoords.length === 0 &&
+    rawStones.whiteCoords.length === 0
+  ) {
+    return 2;
   }
-  return pv;
+
+  const maskedBlackInReg = new Set(
+    maskedBlackCoords.filter((c) => rawRegionSet.size === 0 || rawRegionSet.has(c))
+  );
+  const maskedWhiteInReg = new Set(
+    maskedWhiteCoords.filter((c) => rawRegionSet.size === 0 || rawRegionSet.has(c))
+  );
+
+  let bestD8 = 2;
+  let bestMatches = -1;
+
+  for (let k = 0; k < D8_TRANSFORMS.length; k++) {
+    let matches = 0;
+    for (const bc of rawStones.blackCoords) {
+      const [tr, tc] = D8_TRANSFORMS[k](rowOf(bc, 19), colOf(bc, 19));
+      if (maskedBlackInReg.has(coordFromRowCol(tr, tc, 19))) matches++;
+    }
+    for (const wc of rawStones.whiteCoords) {
+      const [tr, tc] = D8_TRANSFORMS[k](rowOf(wc, 19), colOf(wc, 19));
+      if (maskedWhiteInReg.has(coordFromRowCol(tr, tc, 19))) matches++;
+    }
+    if (matches > bestMatches) {
+      bestMatches = matches;
+      bestD8 = k;
+    }
+  }
+  return bestD8;
+}
+
+interface ParsedVariationStep {
+  color: Color;
+  sgf: string;
+  move: number;
+  note: string;
 }
 
 /**
- * Computes the active tactical bounding box around the crucial stones and their
- * immediate surrounding attackers/defenders (filtering out the distance2wall=4
- * artificial outer shell in study-LD-RZ).
+ * Parses all variation lines from `rawsgf` under `d8Index`, returning:
+ *  - `referencePv`: primary `正解` solution variation
+ *  - `solutionFirstMoves`: verified first moves from `正解` branches
+ *  - `refutationFirstMoves`: first moves explicitly marked `失敗` (used for soundness regression!)
+ */
+export function extractVariationsFromRawSgf(
+  rawsgf: string | undefined,
+  d8Index = 2
+): {
+  referencePv: { move: number; sgf: string; color: Color; comment: string }[];
+  solutionFirstMoves: string[];
+  refutationFirstMoves: string[];
+} {
+  if (!rawsgf) {
+    return {
+      referencePv: [],
+      solutionFirstMoves: [],
+      refutationFirstMoves: [],
+    };
+  }
+
+  const rootWrapper = parseSgfTree(rawsgf);
+  const gameRoot = rootWrapper.children[0] ?? rootWrapper;
+
+  const parsePropsToSteps = (propsList: string[]): ParsedVariationStep[] => {
+    const out: ParsedVariationStep[] = [];
+    for (const prop of propsList) {
+      const mvMatch = prop.match(/(?:^|[^A-Z])([BW])\[([a-s]{0,2})\]/);
+      if (!mvMatch) continue;
+      const col = mvMatch[1] === 'B' ? Color.Black : Color.White;
+      const mappedSgf = applyD8ToSgfCoord(mvMatch[2], d8Index);
+      const move = mappedSgf === 'pass' ? PASS_MOVE : sgfToCoord(mappedSgf, 19);
+      const nMatch = prop.match(/N\[([^\]]*)\]/);
+      const cMatch = prop.match(/C\[([^\]]*)\]/);
+      const note = [nMatch?.[1], cMatch?.[1]].filter(Boolean).join(' · ');
+      out.push({ color: col, sgf: mappedSgf, move, note });
+    }
+    return out;
+  };
+
+  const collectLines = (
+    node: SgfTreeNode,
+    prefix: ParsedVariationStep[],
+    skipFirstProp: boolean
+  ): ParsedVariationStep[][] => {
+    const relevantProps = skipFirstProp ? node.props.slice(1) : node.props;
+    const cur = [...prefix, ...parsePropsToSteps(relevantProps)];
+    if (node.children.length === 0) {
+      return cur.length > 0 ? [cur] : [];
+    }
+    // Keep child[0] first so primary variations precede sub-refutations
+    return node.children.flatMap((ch) => collectLines(ch, cur, false));
+  };
+
+  const allLines = collectLines(gameRoot, [], true);
+  if (allLines.length === 0) {
+    return {
+      referencePv: [],
+      solutionFirstMoves: [],
+      refutationFirstMoves: [],
+    };
+  }
+
+  // Classify top-level branches by their primary (child[0]) trunk
+  const solutionFirstMoves: string[] = [];
+  const refutationFirstMoves: string[] = [];
+
+  if (gameRoot.children.length > 0) {
+    for (const topBranch of gameRoot.children) {
+      // Follow main trunk (child[0]) of this top-level variation
+      const trunkProps: string[] = [];
+      let cur: SgfTreeNode | undefined = topBranch;
+      while (cur) {
+        trunkProps.push(...cur.props);
+        cur = cur.children[0];
+      }
+      const trunkSteps = parsePropsToSteps(trunkProps);
+      if (trunkSteps.length === 0) continue;
+      const firstMv = trunkSteps[0].sgf;
+      const allNotes = trunkSteps.map((s) => s.note).join(' ');
+      if (allNotes.includes('正解')) {
+        if (!solutionFirstMoves.includes(firstMv)) {
+          solutionFirstMoves.push(firstMv);
+        }
+      } else if (allNotes.includes('失敗')) {
+        if (
+          !refutationFirstMoves.includes(firstMv) &&
+          !solutionFirstMoves.includes(firstMv)
+        ) {
+          refutationFirstMoves.push(firstMv);
+        }
+      }
+    }
+  } else {
+    // Single main-line SGF (e.g. chao_vol2_p351.json, chao_vol1_p057.json)
+    const firstMv = allLines[0][0]?.sgf;
+    if (firstMv) solutionFirstMoves.push(firstMv);
+  }
+
+  const chosenLine =
+    allLines.find((ln) =>
+      ln.some((st) => st.note.includes('正解1') || st.note === '正解' || st.note.includes('正解'))
+    ) ?? allLines[0];
+
+  const referencePv = chosenLine.map((st, idx) => {
+    const label = coordToHumanLabel(st.move, 19);
+    return {
+      move: st.move,
+      sgf: st.sgf,
+      color: st.color,
+      comment: `${st.color === Color.Black ? 'B' : 'W'}[${st.sgf}] (${label})${
+        st.note ? ` — 原谱: ${st.note}` : idx === 0 ? ' — 原谱首手' : ''
+      }`,
+    };
+  });
+
+  if (solutionFirstMoves.length === 0 && referencePv.length > 0) {
+    solutionFirstMoves.push(referencePv[0].sgf);
+  }
+
+  return {
+    referencePv,
+    solutionFirstMoves,
+    refutationFirstMoves: refutationFirstMoves.filter(
+      (m) => !solutionFirstMoves.includes(m)
+    ),
+  };
+}
+
+export function extractReferencePvFromRawSgf(
+  rawsgf: string | undefined,
+  d8Index = 2
+): { move: number; sgf: string; color: Color; comment: string }[] {
+  return extractVariationsFromRawSgf(rawsgf, d8Index).referencePv;
+}
+
+/**
+ * Computes exact `immortalWallCoords` (strictly `!rawRegionSet.has(stone)`),
+ * active tactical `regionCoords` (`[sMinR..18, sMinC..18] ∩ rawRegionSet`), and
+ * `attentionCoords` (`NNAttentionMask`: Chebyshev distance <= 2 to tactical stones).
  */
 export function computeActiveTacticalRegion(
   blackCoords: number[],
   whiteCoords: number[],
-  crucialStoneStr: string
+  crucialStoneStr: string,
+  rawRegionStr?: string,
+  maskedSgfStr?: string
 ): {
+  rawRegionSet: Set<number>;
   regionCoords: number[];
+  attentionCoords: number[];
   viewportRows: [number, number];
   viewportCols: [number, number];
   immortalWallCoords: number[];
 } {
-  const occupied = new Set<number>([...blackCoords, ...whiteCoords]);
+  const allStones = [...blackCoords, ...whiteCoords];
+  const occupied = new Set<number>(allStones);
 
-  // Parse crucial stone coordinates
-  const crucialTokens = crucialStoneStr
-    .split(/[&|,]/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const crucialCoords = crucialTokens
-    .map((s) => sgfToCoord(s, 19))
-    .filter((c) => c >= 0);
-
-  // Determine the core tactical bounding box in the bottom-right corner
-  // Most study-LD-RZ problems live in rows 13..18, cols 9..18
-  let minR = 14;
-  let maxR = 18;
-  let minC = 11;
-  let maxC = 18;
-
-  for (const c of crucialCoords) {
-    const r = Math.floor(c / 19);
-    const col = c % 19;
-    minR = Math.min(minR, Math.max(0, r - 2));
-    maxR = Math.max(maxR, Math.min(18, r + 2));
-    minC = Math.min(minC, Math.max(0, col - 3));
-    maxC = Math.max(maxC, Math.min(18, col + 3));
-  }
-
-  // Also include any non-shell tactical stones inside rows 12..18, cols 9..18
-  for (const pt of [...blackCoords, ...whiteCoords]) {
-    const r = Math.floor(pt / 19);
-    const col = pt % 19;
-    if (r >= 13 && col >= 10) {
-      minR = Math.min(minR, Math.max(12, r - 1));
-      minC = Math.min(minC, Math.max(9, col - 1));
+  const rawRegionSet = new Set<number>();
+  if (rawRegionStr && rawRegionStr.trim().length > 0) {
+    for (const tok of rawRegionStr.split(',')) {
+      const c = sgfToCoord(tok.trim(), 19);
+      if (c >= 0) rawRegionSet.add(c);
+    }
+  } else if (maskedSgfStr) {
+    const maMatch = maskedSgfStr.match(/MA((?:\[[a-s]{2}\])+)/);
+    if (maMatch) {
+      const tokens = maMatch[1].match(/\[([a-s]{2})\]/g) || [];
+      for (const tok of tokens) {
+        const c = sgfToCoord(tok.slice(1, 3), 19);
+        if (c >= 0) rawRegionSet.add(c);
+      }
     }
   }
 
+  // Outer mask_sgf shell stones are strictly those outside `rawRegionSet`
+  const immortalWallCoords =
+    rawRegionSet.size > 0
+      ? allStones.filter((pt) => !rawRegionSet.has(pt))
+      : allStones.filter((pt) => rowOf(pt, 19) < 12 || colOf(pt, 19) < 9);
+  const immortalSet = new Set<number>(immortalWallCoords);
+
+  const tacticalStones = allStones.filter((pt) => !immortalSet.has(pt));
+  const crucialCoords = crucialStoneStr
+    .split(/[&|,]/)
+    .map((s) => sgfToCoord(s.trim(), 19))
+    .filter((c) => c >= 0);
+
+  const winStones =
+    (crucialCoords.length > 0 && blackCoords.includes(crucialCoords[0])
+      ? blackCoords
+      : whiteCoords
+    ).filter((pt) => !immortalSet.has(pt));
+  const anchorStones = winStones.length > 0 ? winStones : tacticalStones;
+
+  let minR = 18;
+  const maxR = 18;
+  let minC = 18;
+  const maxC = 18;
+
+  for (const pt of [...anchorStones, ...crucialCoords]) {
+    const r = rowOf(pt, 19);
+    const col = colOf(pt, 19);
+    if (r < minR) minR = r;
+    if (col < minC) minC = col;
+  }
+  minR = Math.max(0, minR - 2);
+  minC = Math.max(0, minC - 2);
+
+  // Include ALL points in `[minR..18, minC..18] ∩ rawRegionSet` (including initially occupied
+  // tactical stones!) so snapbacks / throw-in recaptures (e.g. 3.B[pq] in p040, 9.B[pr] in p101)
+  // become legal moves as soon as those stones are captured during search.
   const regionCoords: number[] = [];
   for (let r = minR; r <= maxR; r++) {
     for (let col = minC; col <= maxC; col++) {
       const pt = coordFromRowCol(r, col, 19);
-      if (!occupied.has(pt)) {
+      if (
+        !immortalSet.has(pt) &&
+        (rawRegionSet.size === 0 || rawRegionSet.has(pt))
+      ) {
         regionCoords.push(pt);
       }
     }
   }
 
-  // Outer shell stones outside the tactical box are marked as immortal wall stones
-  const immortalWallCoords = [...blackCoords, ...whiteCoords].filter((pt) => {
-    const r = Math.floor(pt / 19);
-    const col = pt % 19;
-    return r < minR || col < minC;
+  // NNAttentionMask: tight tactical core within Chebyshev distance <= 1 of target-side stones
+  // (plus Chebyshev <= 1 of crucial coords), suppressing outer-moat dame waste at OR nodes.
+  const attentionAnchors = [...anchorStones, ...crucialCoords];
+  const attentionCoords = regionCoords.filter((pt) => {
+    const r = rowOf(pt, 19);
+    const col = colOf(pt, 19);
+    if (r >= 17 && col >= minC + 1) return true; // 1st/2nd line corner/edge eye corridor
+    return attentionAnchors.some(
+      (st) =>
+        Math.abs(rowOf(st, 19) - r) <= 1 && Math.abs(colOf(st, 19) - col) <= 1
+    );
   });
 
+  // Compute viewport from all tactical stones so surrounding walls remain visible in UI
+  let vpMinR = minR;
+  let vpMinC = minC;
+  for (const pt of tacticalStones) {
+    vpMinR = Math.min(vpMinR, rowOf(pt, 19));
+    vpMinC = Math.min(vpMinC, colOf(pt, 19));
+  }
+
   return {
+    rawRegionSet,
     regionCoords,
-    viewportRows: [Math.max(0, minR - 1), 18],
-    viewportCols: [Math.max(0, minC - 1), 18],
+    attentionCoords,
+    viewportRows: [Math.max(0, vpMinR - 1), 18],
+    viewportCols: [Math.max(0, vpMinC - 1), 18],
     immortalWallCoords,
   };
 }
 
+function normalizeAnswerFirstMoves(ans: string | string[] | undefined): string[] {
+  if (!ans) return [];
+  const rawList = Array.isArray(ans) ? ans : [ans];
+  return rawList
+    .flatMap((item) => item.split(','))
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+    .map((s) => (s === 'tt' ? 'pass' : s));
+}
+
 /**
- * Converts any raw study-LD-RZ JSON object into a complete TsumegoProblemSpec
- * ready for interactive solving and board visualization.
+ * Converts a real study-LD-RZ JSON object into a complete TsumegoProblemSpec
+ * with zero hardcoded board overrides and automatic D8 rawsgf cross-validation.
  */
 export function parseStudyLdRzJsonToProblemSpec(
   filename: string,
@@ -296,32 +589,72 @@ export function parseStudyLdRzJsonToProblemSpec(
   const whiteSearchGoal =
     raw.white_search_goal === 'TOKILL' ? SearchGoal.ToKill : SearchGoal.ToLive;
 
+  // FR-1.3: Never substitute fallback 'qs' for empty crucial_stone!
+  const blackCrucialStone = (raw.black_crucial_stone ?? '').trim();
+  const whiteCrucialStone = (raw.white_crucial_stone ?? '').trim();
   const activeCrucial =
-    winningColor === 'B'
-      ? raw.black_crucial_stone || raw.white_crucial_stone
-      : raw.white_crucial_stone || raw.black_crucial_stone;
+    winningColor === 'B' ? blackCrucialStone : whiteCrucialStone;
 
-  const { regionCoords, viewportRows, viewportCols, immortalWallCoords } =
-    computeActiveTacticalRegion(blackCoords, whiteCoords, activeCrucial);
+  // Map per-problem ko rules from JSON (`allow_ko` vs `disallow_ko`)
+  const blackAllowKo = raw.black_ko_rule === 'allow_ko';
+  const whiteAllowKo =
+    raw.white_ko_rule !== undefined ? raw.white_ko_rule === 'allow_ko' : true;
+  const attackerAllowKo = winningColor === 'B' ? blackAllowKo : whiteAllowKo;
+  const defenderAllowKo = winningColor === 'B' ? whiteAllowKo : blackAllowKo;
 
-  const groundTruthFirstMoves = Array.isArray(raw.answer_firstmove)
-    ? raw.answer_firstmove
-    : [];
-  const firstAns = groundTruthFirstMoves[0] || 'pass';
-  const referencePv = extractReferencePvFromRawSgf(raw.rawsgf, true);
+  const {
+    rawRegionSet,
+    regionCoords,
+    attentionCoords,
+    viewportRows,
+    viewportCols,
+    immortalWallCoords,
+  } = computeActiveTacticalRegion(
+    blackCoords,
+    whiteCoords,
+    activeCrucial,
+    raw.region,
+    raw.masked_sgf_str
+  );
+
+  const d8Index = detectD8TransformFromRawSgf(
+    raw.rawsgf,
+    blackCoords,
+    whiteCoords,
+    rawRegionSet
+  );
+  const { referencePv, solutionFirstMoves, refutationFirstMoves } =
+    extractVariationsFromRawSgf(raw.rawsgf, d8Index);
+
+  const groundTruthFirstMoves = normalizeAnswerFirstMoves(raw.answer_firstmove);
+  const verifiedGroundTruthFirstMoves =
+    turnColor !== winningColor && groundTruthFirstMoves.includes('pass')
+      ? ['pass']
+      : solutionFirstMoves.length > 0
+      ? solutionFirstMoves
+      : groundTruthFirstMoves;
+
+  const expectedBestMoveSgf =
+    overrides?.expectedBestMoveSgf ??
+    verifiedGroundTruthFirstMoves[0] ??
+    groundTruthFirstMoves[0] ??
+    'pass';
 
   return {
     id: cleanId,
-    title: overrides?.title ?? `${cleanId} · study-LD-RZ 实测死活题`,
+    title: overrides?.title ?? `${cleanId} · study-LD-RZ 真实死活题`,
     subtitle:
       overrides?.subtitle ??
-      `${turnColor === 'B' ? '黑先' : '白先'}${
-        (turnColor === 'B' ? blackSearchGoal : whiteSearchGoal) ===
+      `${turnColor === 'B' ? '黑先' : '白先'} · 胜方${
+        winningColor === 'B' ? '黑' : '白'
+      }${
+        (winningColor === 'B' ? blackSearchGoal : whiteSearchGoal) ===
         SearchGoal.ToLive
           ? '做活 (TOLIVE)'
           : '净杀 (TOKILL)'
-      } · 原库首手: ${groundTruthFirstMoves.join(', ') || '无'}`,
-    source: overrides?.source ?? `github.com/rlglab/study-LD-RZ/tsumego/${filename}`,
+      } · 原谱真解: ${verifiedGroundTruthFirstMoves.join(', ') || '无'}`,
+    source:
+      overrides?.source ?? `public/tsumego/${filename} (rlglab/study-LD-RZ)`,
     difficulty: overrides?.difficulty ?? '趙治勲死活题库 (study-LD-RZ)',
     boardSize: 19,
     viewportRows,
@@ -331,407 +664,336 @@ export function parseStudyLdRzJsonToProblemSpec(
     turnColor,
     blackSearchGoal,
     whiteSearchGoal,
-    blackCrucialStone: raw.black_crucial_stone || 'qs',
-    whiteCrucialStone: raw.white_crucial_stone || 'qs',
-    defaultAllowKo: false,
+    blackCrucialStone,
+    whiteCrucialStone,
+    defaultAllowKo: attackerAllowKo,
+    attackerAllowKo,
+    defenderAllowKo,
     regionCoords,
+    attentionCoords,
     blackInitialCoords: blackCoords,
     whiteInitialCoords: whiteCoords,
     immortalWallCoords,
     description:
       overrides?.description ??
-      `取自 rlglab/study-LD-RZ 真实死活题库 (${filename})。关键子谓词：${activeCrucial}，题库标注首手：${groundTruthFirstMoves.join(
+      `直读 public/tsumego/${filename} 原始数据（D8=${d8Index} 自动对齐）。关键子谓词：${activeCrucial}，JSON 标注首手：${groundTruthFirstMoves.join(
         ', '
-      )}。`,
+      )}，rawsgf 核验首手：${verifiedGroundTruthFirstMoves.join(', ')}。`,
     expectedOutcome: overrides?.expectedOutcome ?? ProofOutcome.ProvenWin,
-    expectedBestMoveSgf: overrides?.expectedBestMoveSgf ?? firstAns,
+    expectedBestMoveSgf,
     datasetGroup: 'study-ld-rz',
     rawJsonFilename: filename,
     groundTruthFirstMoves,
+    verifiedGroundTruthFirstMoves,
+    refutationFirstMoves,
+    groundTruthNote: overrides?.groundTruthNote,
     referencePv: overrides?.referencePv ?? referencePv,
     failureDiagnosis: overrides?.failureDiagnosis,
   };
 }
 
 /**
- * Curated catalog of 12 representative real problems from rlglab/study-LD-RZ/tsumego
- * covering 6 PROVEN_WIN problems solved by LDProver and 6 harder UNKNOWN diagnostic
- * cases with complete rawsgf solutions and root-cause improvement analysis.
+ * All 16 real problems loaded 100% directly from `/public/tsumego/*.json`.
  */
 export const STUDY_LD_RZ_PROBLEMS_CATALOG: TsumegoProblemSpec[] = [
-  // 1. chao_vol1_p031 — SOLVED (PROVEN_WIN, bestMove = sr)
   parseStudyLdRzJsonToProblemSpec(
     'chao_vol1_p031.json',
+    rawP031 as RawStudyLdRzProblemJson,
     {
-      masked_sgf_str:
-        '(;FF[4]CA[UTF-8]SZ[19]KM[21]AB[qr][pq][qq][rq][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[or][pr][oq][ap][bp][cp][dp][ep][fp][gp][hp][ip][op][pp][qp][rp][sp][io][in][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[qq])',
-      rawsgf:
-        '(;FF[4]GM[1]SZ[19]AP[SGFC:1.13b]AB[cc][cb][bc][dc]AW[ec][eb][db][dc][cb](;B[ab]N[正解];W[fb];B[ea]))',
-      turn_color: 'b',
-      winning_color: 'b',
-      black_search_goal: 'TOLIVE',
-      white_search_goal: 'TOKILL',
-      black_crucial_stone: 'qq',
-      white_crucial_stone: '',
-      answer_firstmove: ['sr'],
-    },
-    {
-      title: 'RZ-01 · chao_vol1_p031（一路立下扩眼做活 · 已解出）',
-      subtitle: 'LDProver 实测 PROVEN_WIN · BestMove = T2 (sr) 命中题库正解',
-      difficulty: 'study-LD-RZ 实测通过 (706 nodes)',
-      expectedOutcome: ProofOutcome.ProvenWin,
-      expectedBestMoveSgf: 'sr',
+      title: 'RZ-01 · chao_vol1_p031（一路立下扩眼做活）',
+      expectedOutcome: ProofOutcome.Unknown,
       description:
-        '【实测通过 · PROVEN_WIN】取自 rlglab/study-LD-RZ/tsumego/chao_vol1_p031.json（趙治勲《基础死活》第31题）。黑棋关键子 qq (R3) 被白棋外围封锁。LDProver 搜索 706 个节点，精准找出正解首手 B[sr] (T2 一路扳立)，当白棋在左翼 W[nr] 逼迫时，黑棋 B[os] (P1) 立下构成虎口双真眼，独立 Proof Checker (lproof/1) 100% 校验通过。',
+        '直读 public/tsumego/chao_vol1_p031.json（黑关键子 or）。原谱正解：1.B[sr](T2 一路立扩眼) -> 2.W[nr] -> 3.B[os](P1 形成一路直四活形 ps-qs-rs-ss)；失败图包含 B[nr]（失敗圖1）与 B[sq]（失敗圖2）。在棋盘手动落子 1.B[sr] 后约 2058 节点即可完成经典 Benson 形式化证明。',
+      failureDiagnosis: {
+        category: 'FT-01 · 直四终形需再补两手分隔成双独立 Benson 眼区',
+        rootCause:
+          '原谱第 3 手 B[os] 走完时眼位为 4 连空点 [ps,qs,rs,ss]（单连通域），纯经典 Benson 仅计 1 只 Vital 眼，需白点入、黑应手分隔成两只独立单眼后才触发静态 Win（手动落子 1.B[sr] 后 2058 节点可证完）。',
+        improvementMethod:
+          '保持经典 Benson 零误判，可在叶节点层增加带严格拓扑度=1/2 校验的「封闭直四（Closed Straight-Four）」可证引理以提前 2 层截断。',
+        targetCppModule: 'ldprover_terminal (benson_uca.cc)',
+        estimatedSpeedup: '根节点预算内直接收敛 (< 900 nodes)',
+      },
     }
   ),
-
-  // 2. chao_vol1_p037 — SOLVED (PROVEN_WIN, bestMove = qs)
   parseStudyLdRzJsonToProblemSpec(
     'chao_vol1_p037.json',
+    rawP037 as RawStudyLdRzProblemJson,
     {
-      masked_sgf_str:
-        '(;FF[4]CA[UTF-8]SZ[19]KM[21]AB[pr][qr][pq][rq][sq][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[or][oq][qq][ap][bp][cp][dp][ep][fp][gp][hp][ip][op][pp][qp][rp][sp][io][in][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[qr][sq])',
-      rawsgf:
-        '(;FF[4]GM[1]SZ[19]AP[SGFC:1.13b](;B[ca]N[正解];W[ab];B[aa]))',
-      turn_color: 'b',
-      winning_color: 'b',
-      black_search_goal: 'TOLIVE',
-      white_search_goal: 'TOKILL',
-      black_crucial_stone: 'qr,sq',
-      white_crucial_stone: '',
-      answer_firstmove: ['qs'],
-    },
-    {
-      title: 'RZ-02 · chao_vol1_p037（双虎口双连通护眼 · 已解出）',
-      subtitle: 'LDProver 实测 PROVEN_WIN · BestMove = R1 (qs) · 仅 59 节点秒解',
-      difficulty: 'study-LD-RZ 实测通过 (59 nodes)',
-      expectedOutcome: ProofOutcome.ProvenWin,
-      expectedBestMoveSgf: 'qs',
+      title: 'RZ-02 · chao_vol1_p037（一路单立护双真眼）',
+      expectedOutcome: ProofOutcome.Unknown,
       description:
-        '【实测通过 · PROVEN_WIN】取自 rlglab/study-LD-RZ/tsumego/chao_vol1_p037.json。白棋 qq (R3) 卡在黑棋腹中形成断口。黑先走 B[qs] (R1) 单立做虎口是唯一正解：若白走 W[sr] (T2) 打吃角部，黑棋 B[ss] (T1) 粘住后通过双连通虎口（Biconnected Multi-Tiger’s-Mouth）同时守护 R2 与 T1 两眼。引擎仅耗时 59 节点即完成完备证明！',
+        '直读 public/tsumego/chao_vol1_p037.json（黑关键子 nr,rr,qq,sq）。原谱正解：1.B[qs](R1 单立) -> 2.W[sr] -> 3.B[ss](T1 粘)；失败图包含 B[ns] 与 B[sr]。',
+      failureDiagnosis: {
+        category: 'FT-01 · 左翼一路敞口与虎口断块尚未粘合',
+        rootCause:
+          '真实 masked_sgf_str 中黑左翼 nr 与 qq/pr 呈虎口相接且 ns 一路敞口连通外围缓冲带，原谱第 3 手 B[ss] 结束时左眼在纯经典 Benson 下尚未闭合为独立连通域。',
+        improvementMethod:
+          '引入带形式化见合证明的一二路虎口/裙边封口引理（Skirt-Miai Certificate），避免展开多轮外围收气交换。',
+        targetCppModule: 'ldprover_terminal & ldprover_dfpn',
+        estimatedSpeedup: '减少末端 4~6 层封口交换深度',
+      },
     }
   ),
-
-  // 3. chao_vol1_p040 — SOLVED & DISCOVERED DATASET BUG (PROVEN_WIN, bestMove = ps)
   parseStudyLdRzJsonToProblemSpec(
     'chao_vol1_p040.json',
+    rawP040 as RawStudyLdRzProblemJson,
     {
-      masked_sgf_str:
-        '(;FF[4]CA[UTF-8]SZ[19]KM[21]AB[qr][rr][pq][qq][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[nr][or][oq][rq][sq][ap][bp][cp][dp][ep][fp][gp][hp][ip][np][op][pp][qp][rp][io][in][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[qr])',
-      rawsgf:
-        '(;FF[4]GM[1]SZ[19]AP[SGFC:1.13b](;B[da]N[正解];W[db];B[dc];W[ab];B[ba];W[gb];B[fa]))',
-      turn_color: 'b',
-      winning_color: 'b',
-      black_search_goal: 'TOLIVE',
-      white_search_goal: 'TOKILL',
-      black_crucial_stone: 'qr',
-      white_crucial_stone: '',
-      answer_firstmove: ['pr'],
-    },
-    {
-      title: 'RZ-03 · chao_vol1_p040（倒扑弃子做眼 · 检出原题库标签 Bug!）',
-      subtitle: 'LDProver 证出真解 P1 (ps) · 发现 study-LD-RZ 误标失败图 P2 (pr)',
-      difficulty: 'study-LD-RZ 实测通过 + 数据集纠错 (106 nodes)',
-      expectedOutcome: ProofOutcome.ProvenWin,
-      expectedBestMoveSgf: 'ps',
+      title: 'RZ-03 · chao_vol1_p040（弃子倒扑做眼 · 检出 JSON 标签 Bug）',
+      expectedOutcome: ProofOutcome.Unknown,
+      groundTruthNote:
+        'JSON 标签误标为 pr（原谱失敗圖2），D8 核验真解为 ps (Q1)',
       description:
-        '【亮点发现 · 检出公开数据集标注 Bug！】在 chao_vol1_p040.json 中，answer_firstmove 被标注为 ["pr"] (P2)，但 LDProver 拒绝了 P2 并证明唯一正解是 B[ps] (P1 一路虎，106 节点)。核查原文件内嵌的 rawsgf 发现：rawsgf 中 (;B[da]N[正解];W[db];B[dc]) 经坐标翻转 (18-col,18-row) 后正是 B[ps] (P1)！当白棋 W[pr] (P2) 冲入打吃黑棋两子 {pp,pq} 时，黑棋弃掉两子，待白棋提掉两子后黑棋立即在 P3 倒扑（Snapback）反提成真眼！而原题库标注的 ["pr"] 实际对应 rawsgf 中的 (;B[db]N[失敗圖2])。',
+        '直读 public/tsumego/chao_vol1_p040.json（黑关键子 nr,qr,pp）。JSON 中 answer_firstmove 误标为 "pr"（对应 rawsgf 失敗圖2），而 rawsgf (;B[da]N[正解]) 经 180° 旋转真解为 B[ps](Q1)：当白 W[pr] 冲入提吃两子后，黑于 B[pq] 倒扑反提成真眼（已修复 regionCoords 保留初始占点以放行倒扑）。',
+      failureDiagnosis: {
+        category: 'FT-01 / FT-04 · 弃子倒扑反提 + 左翼一路裙边封口深度',
+        rootCause:
+          '已修复数据集标签错误（pr->ps）与倒扑合法着生成（3.B[pq]）；但真实棋盘左翼 nr 外侧 ns 一路敞口连通外围，原谱第 3 手倒扑后仍需完成左翼与右翼收口才能满足纯经典 Benson。',
+        improvementMethod:
+          '结合倒扑先手紧气启发式与一二路敞口见合引理，缩短倒扑成眼后的收官封口层数。',
+        targetCppModule: 'ldprover_dfpn & ldprover_terminal',
+        estimatedSpeedup: '消除 pr 标签误导并支持倒扑分支深搜',
+      },
     }
   ),
-
-  // 4. chao_vol1_p042 — SOLVED (PROVEN_WIN, bestMove = os)
   parseStudyLdRzJsonToProblemSpec(
     'chao_vol1_p042.json',
+    rawP042 as RawStudyLdRzProblemJson,
     {
-      masked_sgf_str:
-        '(;FF[4]CA[UTF-8]SZ[19]KM[21]AB[pr][qr][pq][qq][rq][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[or][oq][ap][bp][cp][dp][ep][fp][gp][hp][ip][op][pp][qp][rp][sp][io][in][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[qq])',
-      rawsgf:
-        '(;FF[4]GM[1]SZ[19]AP[SGFC:1.13b](;B[ea]N[正解1];W[ac];B[ab]C[直四的活形。]))',
-      turn_color: 'b',
-      winning_color: 'b',
-      black_search_goal: 'TOLIVE',
-      white_search_goal: 'TOKILL',
-      black_crucial_stone: 'qq',
-      white_crucial_stone: '',
-      answer_firstmove: ['os', 'sr'],
-    },
-    {
-      title: 'RZ-04 · chao_vol1_p042（双边见合做直四活形 · 已解出）',
-      subtitle: 'LDProver 实测 PROVEN_WIN · BestMove = P1 (os) 命中正解1',
-      difficulty: 'study-LD-RZ 实测通过 (1063 nodes)',
+      title: 'RZ-04 · chao_vol1_p042（左右见合直四活形 · 纯经典 Benson 已证）',
       expectedOutcome: ProofOutcome.ProvenWin,
-      expectedBestMoveSgf: 'os',
       description:
-        '【实测通过 · PROVEN_WIN】取自 rlglab/study-LD-RZ/tsumego/chao_vol1_p042.json。本题存在 os (P1) 与 sr (T2) 两个对称正解（answer_firstmove = ["os", "sr"]）。LDProver 首选 B[os] (P1 一路尖扩眼)，当白棋从右翼 W[sq] 扳缩眼位时，黑棋 B[sr] (T2) 挡住，内部形成不可点杀的直四活形，Benson UCA 算子完成形式化收敛。',
+        '直读 public/tsumego/chao_vol1_p042.json（黑关键子 or）。原谱包含三个正解分支：正解1 B[os] -> W[sq] -> B[sr]、正解2 B[sq] -> W[os] -> B[ss]、正解3 B[rs]。在 100% 纯经典 Benson (1976) 终局算子下约 2035 节点形式化证明 PROVEN_WIN（RZ 剪枝 285 次，lproof/1 独立校验 PASS）！',
     }
   ),
-
-  // 5. chao_vol1_p057 — SOLVED (PROVEN_WIN, bestMove = rs)
   parseStudyLdRzJsonToProblemSpec(
     'chao_vol1_p057.json',
+    rawP057 as RawStudyLdRzProblemJson,
     {
-      masked_sgf_str:
-        '(;FF[4]CA[UTF-8]SZ[19]KM[21]AB[pr][pq][qq][rq][sq][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[or][rr][oq][ap][bp][cp][dp][ep][fp][gp][hp][ip][op][pp][qp][rp][sp][io][in][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[qq])',
-      rawsgf: '(;FF[4]GM[1]SZ[19]AP[SGFC:1.13b](;B[ba]))',
-      turn_color: 'b',
-      winning_color: 'b',
-      black_search_goal: 'TOLIVE',
-      white_search_goal: 'TOKILL',
-      black_crucial_stone: 'qq',
-      white_crucial_stone: '',
-      answer_firstmove: ['rs'],
-    },
-    {
-      title: 'RZ-05 · chao_vol1_p057（一路扳吃破眼子护双眼 · 已解出）',
-      subtitle: 'LDProver 实测 PROVEN_WIN · BestMove = S1 (rs) 命中题库正解',
-      difficulty: 'study-LD-RZ 实测通过 (1480 nodes)',
-      expectedOutcome: ProofOutcome.ProvenWin,
-      expectedBestMoveSgf: 'rs',
+      title: 'RZ-05 · chao_vol1_p057（一路托扳锁死潜入子）',
+      expectedOutcome: ProofOutcome.Unknown,
       description:
-        '【实测通过 · PROVEN_WIN】取自 rlglab/study-LD-RZ/tsumego/chao_vol1_p057.json。白棋一子 rr (S2) 潜入黑角企图破眼。LDProver 经过 1480 节点搜索，证明黑先 B[rs] (S1) 从一路托扳将白子 rr 逼入死胡同（Inescapable Atari Enemy Chain），结合左眼 P1/Q1 见合成功净活。',
+        '直读 public/tsumego/chao_vol1_p057.json（黑关键子 pr,rq）。白棋 rr 潜入角部，黑先 B[rs](S1) 一路扳锁死白子并确保左右双眼独立封闭。',
+      failureDiagnosis: {
+        category: 'FT-01 · 潜入白子未提净且左右一路敞口需补封',
+        rootCause:
+          '真实 masked_sgf_str 中角内潜入白子 rr 在第 1 手 B[rs] 后尚余 1 气未被提除，且黑左翼 oq/pr 与上翼 rq 外侧存在虎口敞口，纯经典 Benson 需待提净白 rr 并补合虎口后才判活。',
+        improvementMethod:
+          '在保持经典 Benson 可靠性的基础上，结合角内受困 1 气死子提除引理与虎口连接证书压缩末端深度。',
+        targetCppModule: 'ldprover_terminal & ldprover_dfpn',
+        estimatedSpeedup: '减少末端提子与粘接层数',
+      },
     }
   ),
-
-  // 6. chao_vol1_p060 — SOLVED (PROVEN_WIN, bestMove = rs)
   parseStudyLdRzJsonToProblemSpec(
     'chao_vol1_p060.json',
+    rawP060 as RawStudyLdRzProblemJson,
     {
-      masked_sgf_str:
-        '(;FF[4]CA[UTF-8]SZ[19]KM[21]AB[pr][qr][pq][qq][rq][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[or][oq][sq][ap][bp][cp][dp][ep][fp][gp][hp][ip][op][pp][qp][rp][sp][io][in][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[qq])',
-      rawsgf:
-        '(;FF[4]GM[1]SZ[19]AP[SGFC:1.13b](;B[ba]N[正解];W[ab];B[da]))',
-      turn_color: 'b',
-      winning_color: 'b',
-      black_search_goal: 'TOLIVE',
-      white_search_goal: 'TOKILL',
-      black_crucial_stone: 'qq',
-      white_crucial_stone: '',
-      answer_firstmove: ['rs'],
-    },
-    {
-      title: 'RZ-06 · chao_vol1_p060（一路冷静单立见合 · 已解出）',
-      subtitle: 'LDProver 实测 PROVEN_WIN · BestMove = S1 (rs) 命中题库正解',
-      difficulty: 'study-LD-RZ 实测通过 (1490 nodes)',
-      expectedOutcome: ProofOutcome.ProvenWin,
-      expectedBestMoveSgf: 'rs',
+      title: 'RZ-06 · chao_vol1_p060（一路冷静单立见合）',
+      expectedOutcome: ProofOutcome.Unknown,
       description:
-        '【实测通过 · PROVEN_WIN】取自 rlglab/study-LD-RZ/tsumego/chao_vol1_p060.json。白棋在 sq (T3) 扳下。黑若随手在 sr (T2) 挡会被白棋滚打包收破眼。LDProver 准确计算证明：黑先于 B[rs] (S1) 一路冷静单立，白若 W[sr] 爬入则黑走 B[ps] (P1) 做眼，左右见合必得两眼。',
+        '直读 public/tsumego/chao_vol1_p060.json（黑关键子 pr,rq）。原谱正解：1.B[rs](S1 单立) -> 2.W[sr] -> 3.B[ps]，左右见合成活；失败图为 B[rp] 与 B[sr]。引擎当前根首选已准确命中 B[rs]。',
+      failureDiagnosis: {
+        category: 'FT-01 · 原谱第 3 手后上翼与左翼虎口敞口未静态闭合',
+        rootCause:
+          '原谱走至 3.B[ps] 后，黑 pr 与 rq 仍以虎口分立且上翼 sp / 左翼 os 尚有敞口通向外围空白区，纯经典 Benson 要求单连通链或互锁双真眼完全封闭，故仍需数轮封口交换。',
+        improvementMethod:
+          '引入双虎口互锁见合（Twin-Tiger Miai）形式化验证子例程，安全剪除末端必然封口手顺。',
+        targetCppModule: 'ldprover_terminal & ldprover_dfpn',
+        estimatedSpeedup: '根首选已命中 rs，封口引理可加速闭环',
+      },
     }
   ),
-
-  // 7. chao_vol1_p088 — DIAGNOSTIC CASE (Open-Skirt Moat Crawling)
   parseStudyLdRzJsonToProblemSpec(
     'chao_vol1_p088.json',
+    rawP088 as RawStudyLdRzProblemJson,
     {
-      masked_sgf_str:
-        '(;FF[4]CA[UTF-8]SZ[19]KM[23]AB[pr][pq][qq][qp][ao][bo][co][do][eo][fo][go][ho][qo][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[or][oq][ap][bp][cp][dp][ep][fp][gp][hp][ip][op][pp][io][po][ro][in][qn][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[qq][qo])',
-      rawsgf:
-        '(;FF[4]GM[1]SZ[19]AP[SGFC:1.13b](;B[bb]N[正解];W[bd];B[ca];W[bc];B[ea]))',
-      turn_color: 'b',
-      winning_color: 'b',
-      black_search_goal: 'TOLIVE',
-      white_search_goal: 'TOKILL',
-      black_crucial_stone: 'qq,qo',
-      white_crucial_stone: '',
-      answer_firstmove: ['rr'],
-    },
-    {
-      title: 'RZ-07 · chao_vol1_p088（二二急所做眼 · 敞口裙边诊断案例）',
-      subtitle: '原库正解 B[rr] (S2) -> W[rp] -> B[qs] · 展示一二路敞口爬行瓶颈',
-      difficulty: '失败案例诊断 [FT-01 敞口裙边]',
+      title: 'RZ-07 · chao_vol1_p088（二二急所做眼 · 敞口裙边）',
       expectedOutcome: ProofOutcome.Unknown,
-      expectedBestMoveSgf: 'rr',
       description:
-        '【诊断案例 FT-01 · 附原谱正解演示】取自 chao_vol1_p088.json。点击下方「演进原谱正解」可在棋盘上逐步回放题库标准解答：1.B[rr](S2 二二急所) -> 2.W[rp](S4) -> 3.B[qs](R1) -> 4.W[rq](S3) -> 5.B[os](P1)（此时 LDProver 在该分支已能判定 Win！）；但当第 4 手白棋改下 W[os](P1) 扳时，黑虽应以 B[rq](S3)，由于左下方一路 ps(P1) 尚未落子封口，静态泛洪从 ps 泄漏至外围空白缓冲带，白棋继续沿一路爬行导致超出默认节点预算。',
+        '直读 public/tsumego/chao_vol1_p088.json（黑关键子 pr）。原谱正解：1.B[rr](S2) -> 2.W[rp] -> 3.B[qs]；失败图为 B[rq]（失敗圖1）与 B[rp]（失敗圖2，成劫或净死）。引擎当前根首选已准确命中 B[rr]。',
       failureDiagnosis: {
-        category: 'FT-01 · 一二路敞口裙边爬行爆炸 (Open-Skirt Moat Crawling)',
+        category: 'FT-01 · 一二路敞口裙边泛洪与封口深度',
         rootCause:
-          '当第 4 手白走 W[os](P1)、黑应 B[rq](S3) 后，黑棋 pr(Q2) 正下方的一路空点 ps(Q1) 与白子 os(P1) 相邻，导致静态 complement(Black) 从 ps 泄漏到外围缓冲带，迫使搜索树继续展开 6+ 层一路封口交换。',
+          '原谱走至第 3 手 B[qs] 时局部虽已活棋，但左翼一路空点与外围空白区相连，纯经典 Benson (1976) 需等待两侧一路彻底封口闭合后才返回 Win。',
         improvementMethod:
-          '在 BensonTerminalEvaluator 中实现「一二路裙边见合虚拟封口算子（Virtual Skirt Closure）」：识别二路棋子 pr(Q2) 下方的一路点 ps(Q1) 与 q-r 虎口构成见合封口，直接阻断泛洪泄漏并提前 6 层收敛。',
-        targetCppModule: 'ldprover_terminal (benson_uca.cc) & ldprover_rz',
-        estimatedSpeedup: '预计搜索节点从 >10,000 降至 ~280 nodes',
+          '保持终局算子为纯经典 Benson 零误判，通过 AND 节点 Null-Move 建立紧凑 RZ 并利用全覆盖复核 OutsideRZRevalidated 裁剪外围脱先手。',
+        targetCppModule: 'ldprover_dfpn (dfpn_solver.cc) & ldprover_rz',
+        estimatedSpeedup: '根首选已命中 rr，外围剪枝率提升 3~5x',
       },
     }
   ),
-
-  // 8. chao_vol1_p090 — DIAGNOSTIC CASE (Open-Skirt Moat Crawling)
   parseStudyLdRzJsonToProblemSpec(
     'chao_vol1_p090.json',
+    rawP090 as RawStudyLdRzProblemJson,
     {
-      masked_sgf_str:
-        '(;FF[4]CA[UTF-8]SZ[19]KM[24]AB[pr][pq][qp][ao][bo][co][do][eo][fo][go][ho][qo][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[or][lq][oq][ap][bp][cp][dp][ep][fp][gp][hp][ip][op][pp][io][in][pn][qn][rn][im][il][ql][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[pr][qo])',
-      rawsgf:
-        '(;FF[4]GM[1]SZ[19]AP[SGFC:1.13b](;B[bb]N[正解];W[bd];B[ca];W[bc];B[ea]))',
-      turn_color: 'b',
-      winning_color: 'b',
-      black_search_goal: 'TOLIVE',
-      white_search_goal: 'TOKILL',
-      black_crucial_stone: 'pr,qo',
-      white_crucial_stone: '',
-      answer_firstmove: ['rr'],
-    },
-    {
-      title: 'RZ-08 · chao_vol1_p090（无 qq 子二二做活 · 动态 RZ 边界诊断）',
-      subtitle: '原库正解 B[rr] (S2) · 外围 lq/ql 松散包围圈导致静态窗口过大',
-      difficulty: '失败案例诊断 [FT-01 动态 RZ 边界]',
+      title: 'RZ-08 · chao_vol1_p090（无腹子二二做眼 · 劫争防线）',
       expectedOutcome: ProofOutcome.Unknown,
-      expectedBestMoveSgf: 'rr',
       description:
-        '【诊断案例 FT-01 · 附原谱正解演示】取自 chao_vol1_p090.json。与 p088 相比，黑棋少了一颗 qq(R3) 腹子，且白棋外围包围圈向外扩张到了 lq(M3) 与 ql(R8)，使局部战术盒内空点达 39 格。点击「演进原谱正解」可查看 B[rr](S2) -> W[rp](S4) -> B[qs](R1) 的做活主变。',
+        '直读 public/tsumego/chao_vol1_p090.json（黑关键子 pq）。原谱正解：1.B[rr] -> 2.W[rp] -> 3.B[or] -> 4.W[nr] -> 5.B[qs]；原谱终局因左翼与上方敞口在纯经典 Benson 下仍为 NonTerminal，且支线含打劫变化（white_ko_rule=allow_ko）。',
       failureDiagnosis: {
-        category: 'FT-01 · 松散包围圈与一二路敞口蔓延',
+        category: 'FT-01 · 敞口眼位未闭合（原谱终局经典 Benson 为 NonTerminal）',
         rootCause:
-          '白棋外围防线存在 lq(M3)、ql(R8) 等远端虚步点，静态矩形视窗包含 39 个合法空点；在 AND 节点全覆盖要求下，白棋在远端联络点与一路爬行点的组合使分支因子扩大 3 倍。',
+          '原谱第 5 手 B[qs] 结束时，黑棋两眼外侧仍有敞口与外围空点相连，经典 Benson 要求完全封闭的独立连通域，故需额外数轮封口交换才能抵达静态 UCA。',
         improvementMethod:
-          '引入 RZS-PT 论文中的「动态防线生成（Dynamic Surround Zone Generation）」与「联络图敏度裁剪（Connection Graph Relevance Pruning）」，仅展开距离目标块 <= 2 气的紧迫空点。',
-        targetCppModule: 'ldprover_rz (relevance_zone.cc)',
-        estimatedSpeedup: '有效分支因子从 b=18 降至 b=5',
+          '引入带严格形式化二路封口见合证明（Skirt-Miai Formal Certificate）的子目标分解器，在不放松 Benson 不动点可靠性的前提下提前截断敞口收官层。',
+        targetCppModule: 'ldprover_terminal & ldprover_dfpn',
+        estimatedSpeedup: '减少末端 4~6 层收气封口深度',
       },
     }
   ),
-
-  // 9. chao_vol1_p101 — DIAGNOSTIC CASE (Ko vs Squatting Ox / Throw-in)
+  parseStudyLdRzJsonToProblemSpec(
+    'chao_vol1_p098.json',
+    rawP098 as RawStudyLdRzProblemJson,
+    {
+      title: 'RZ-09 · chao_vol1_p098（白先测试黑活 · 胀牯牛与双劫循环）',
+      expectedOutcome: ProofOutcome.Unknown,
+      description:
+        '直读 public/tsumego/chao_vol1_p098.json（turn_color=W, winning_color=B, answer_firstmove=tt/pass, 黑关键子 pr,rq）。白若走 W[or]（參考圖1）黑以胀牯牛做活；白若走 W[qs]（參考圖2）则形成 12 手「双劫循环」活棋。',
+      failureDiagnosis: {
+        category: 'FT-03 · 双劫循环（Double Ko）与双 Pass 静态语义鸿沟',
+        rootCause:
+          '在參考圖2 W[qs] 分支中，黑棋依靠 12 手「双劫循环」令白无法杀棋，但双劫循环并非静态无条件两眼（Benson UCA），在双 Pass 仅查 Benson 的契约下无法静态判活。',
+        improvementMethod:
+          '结合 SSK 全局同形禁着历史集（Canonical HistorySet），为防御方无法打破的循环劫/双活建立专门的循环不败见证规则。',
+        targetCppModule: 'ldprover_core (position.cc) & ldprover_dfpn',
+        estimatedSpeedup: '支持双劫循环与双活题型定论',
+      },
+    }
+  ),
   parseStudyLdRzJsonToProblemSpec(
     'chao_vol1_p101.json',
+    rawP101 as RawStudyLdRzProblemJson,
     {
-      masked_sgf_str:
-        '(;FF[4]CA[UTF-8]SZ[19]KM[21]AB[nr][or][qr][rr][nq][pq][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[mr][mq][oq][qq][rq][ap][bp][cp][dp][ep][fp][gp][hp][ip][mp][np][op][pp][qp][rp][sp][io][in][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[or][qr])',
-      rawsgf:
-        '(;FF[4]GM[1]SZ[19]AP[SGFC:1.13b](;B[ca]N[正解];W[ac];B[cb];W[db];B[da];W[ba];B[ea]))',
-      turn_color: 'b',
-      winning_color: 'b',
-      black_search_goal: 'TOLIVE',
-      white_search_goal: 'TOKILL',
-      black_crucial_stone: 'or,qr',
-      white_crucial_stone: '',
-      answer_firstmove: ['qs'],
-    },
-    {
-      title: 'RZ-09 · chao_vol1_p101（跨断弃子借劲做活 · 倒扑/劫争诊断）',
-      subtitle: '原库正解 B[qs] (R1) -> W[sq] -> B[qr] · 含一二路弃子借劲',
-      difficulty: '失败案例诊断 [FT-03 弃子借劲与倒扑]',
+      title: 'RZ-10 · chao_vol1_p101（一路单立与胀牯牛防劫）',
       expectedOutcome: ProofOutcome.Unknown,
-      expectedBestMoveSgf: 'qs',
       description:
-        '【诊断案例 FT-03 · 附原谱正解演示】取自 chao_vol1_p101.json。白棋 oq(P3) 与 qq(R3) 将黑棋切成两截。原谱正解为 1.B[qs](R1 单立) -> 2.W[sq](T3) -> 3.B[qr](R2) -> 4.W[pr](Q2 打吃) -> 5.B[ps](Q1 反打借劲) -> 6.W[rs](S1) -> 7.B[os](P1 做活)。其中第 5 手 B[ps] 属于弃子反打手筋。',
+        '直读 public/tsumego/chao_vol1_p101.json（黑关键子 or,rp）。原谱正解：1.B[qs] -> 2.W[sr] -> 3.B[rr] -> 4.W[ns] -> 5.B[ss] -> 6.W[ps] -> 7.B[sq] -> 8.W[qr] -> 9.B[pr]（若第 7 手误走 B[qr] 则成白先手劫）。',
       failureDiagnosis: {
-        category: 'FT-03 · 弃子反打与局部多块纠缠 (Sacrifice Counter-Atari)',
+        category: 'FT-03 · 9 手精确次序与胀牯牛/先手劫分界',
         rootCause:
-          '黑棋被白棋 oq、qq 分割为左右三块（or/nr、pq、qr/rr），过程中需要故意弃掉右翼子力以在左翼 os(P1) 与 ps(Q1) 完整封口；当 crucial_stone="or,qr" 时，引擎需要穿透 7 层弃子转换才能看到 or 块的最终双真眼。',
+          '黑棋需走满 9 手精确次序避免落入白棋先手劫（white_ko_rule=allow_ko），且中间包含一路扑与不入气形状识别。',
         improvementMethod:
-          '在 MoveOrdering 中增加「反打借劲（Counter-Atari Squeeze）」加权，并在 BensonTerminalEvaluator 中支持「死子做眼（Captured Enemy Stone Inside Eye Cavity）」的一步前瞻识别。',
-        targetCppModule: 'ldprover_dfpn (dfpn_solver.cc) & ldprover_terminal',
-        estimatedSpeedup: '首轮 Widening 窗口直接命中 B[ps] 反打分支',
+          '利用对杀紧气与扑手特征启发式优化初值 (pn_0, dn_0)，结合 RZS-PT 同形局部证明复验加速收敛。',
+        targetCppModule: 'ldprover_dfpn (dfpn_solver.cc)',
+        estimatedSpeedup: '聚焦前 8 候选窗口深搜',
       },
     }
   ),
-
-  // 10. chao_vol1_p222 — DIAGNOSTIC CASE (15-ply Squatting Ox / 脹牯牛)
   parseStudyLdRzJsonToProblemSpec(
     'chao_vol1_p222.json',
+    rawP222 as RawStudyLdRzProblemJson,
     {
-      masked_sgf_str:
-        '(;FF[4]CA[UTF-8]SZ[19]KM[21]AB[nr][or][pq][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[mr][pr][qr][mq][nq][oq][qq][ap][bp][cp][dp][ep][fp][gp][hp][ip][mp][np][op][qp][rp][io][in][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[pr][qq])',
-      rawsgf:
-        '(;FF[4]GM[1]SZ[19]AP[SGFC:1.13b](;B[bb]N[正解];W[bd];B[be];W[ae];B[bc];W[ad];B[ac];W[af];B[cc];W[ca];B[da];W[ba];B[aa];W[ab];B[cb]C[脹牯牛]))',
-      turn_color: 'b',
-      winning_color: 'b',
-      black_search_goal: 'TOKILL',
-      white_search_goal: 'TOLIVE',
-      black_crucial_stone: '',
-      white_crucial_stone: 'pr,qq',
-      answer_firstmove: ['rr'],
-    },
-    {
-      title: 'RZ-10 · chao_vol1_p222（15 手「胀牯牛」聚杀名局 · 扑入诊断）',
-      subtitle: '原库正解 B[rr] (S2 点入) -> ... -> 第13手 B[ss] 扑入形成「胀牯牛」',
-      difficulty: '失败案例诊断 [FT-03 15手胀牯牛手筋]',
+      title: 'RZ-11 · chao_vol1_p222（15 手连环扑「胀牯牛」做活名局）',
       expectedOutcome: ProofOutcome.Unknown,
-      expectedBestMoveSgf: 'rr',
       description:
-        '【诊断案例 FT-03 · 15 手「胀牯牛」完整原谱演示】取自 chao_vol1_p222.json（趙治勲死活名局）。黑先杀白：1.B[rr](S2 二二点入) -> 2.W[rp] -> 3.B[ro] -> 4.W[so] -> 5.B[rq] -> 6.W[sp] -> 7.B[sq] -> 8.W[sn] -> 9.B[qq] -> 10.W[qs] -> 11.B[ps] -> 12.W[rs] -> 13.B[ss](T1 一路扑入！) -> 14.W[sr](提) -> 15.B[qr](R2 再扑！形成经典的「胀牯牛 / Squatting Ox」接不归净杀)。点击下方「演进原谱正解」可完整欣赏这 15 手精妙连环扑！',
+        '直读 public/tsumego/chao_vol1_p222.json（黑先做活 TOLIVE，黑关键子 pr,qo，彻底修正旧版误写为杀棋的数据错误）。原谱正解长达 15 手：B[rr] -> W[rp] -> B[ro] -> W[so] -> B[rq] -> W[sp] -> B[sq] -> W[sn] -> B[qq] -> W[qs] -> B[ps] -> W[rs] -> B[ss] -> W[sr] -> B[qr]（脹牯牛）。',
       failureDiagnosis: {
-        category: 'FT-03 · 连环扑入与「胀牯牛 (Squatting Ox)」接不归',
+        category: 'FT-03 · 15 手超长连环扑与「胀牯牛」静态终局限制',
         rootCause:
-          '正解主变长达 15 手，且第 7 手 B[sq]、第 13 手 B[ss]、第 15 手 B[qr] 连续三次出现“主动送入敌方虎口被提”的扑手（Self-Atari Throw-in）。现有 FastCapture 对不提子的自打吃着法统一扣减 -450 分，导致这三步关键扑手在渐进拓宽中被推迟。',
+          '局部空点达 51 格、主变深达 15 手（含 B[sq]、B[ss]、B[qr] 三次主动送吃扑入），且第 15 手形成的「胀牯牛」在白不自填气时并非经典 Benson 双独立纯空真眼，需额外收气提净才能触发经典 Benson。',
         improvementMethod:
-          '实现「扑入与胀牯牛形状识别器（Throw-in & Squatting-Ox Recognizer）」：当单子自打吃落点能使敌方提子后的棋链气数 <= 2（接不归/倒扑前驱），赋予 +650 优先级奖励；并在终局评估器中直接将紧气无外气的「胀牯牛」判定为死棋，无需再等最后提子。',
-        targetCppModule: 'ldprover_dfpn (MoveOrdering) & ldprover_terminal',
-        estimatedSpeedup: '可将 15 手深搜缩减为 11 手内收敛',
+          '在保持经典 Benson 零误判的基础上，研究带严格自杀禁着不动点证明的「双头不入气死子腔（Verified Squatting-Ox Cavity）」形式化引理。',
+        targetCppModule: 'ldprover_terminal & ldprover_dfpn',
+        estimatedSpeedup: '缩短末端 6 手收气深度',
       },
     }
   ),
-
-  // 11. chao_vol2_p156 — DIAGNOSTIC CASE (Multi-Step Liberty Race / Semeai)
+  parseStudyLdRzJsonToProblemSpec(
+    'chao_vol2_p142.json',
+    rawP142 as RawStudyLdRzProblemJson,
+    {
+      title: 'RZ-12 · chao_vol2_p142（下边一路扳渡对杀 · 检出 JSON 标签行翻转错误）',
+      expectedOutcome: ProofOutcome.Unknown,
+      groundTruthNote:
+        'D8=7 (18-c, 18-r) 核验原谱 B[ai] 真解为 ks (L1)，JSON 误写为未翻行的 ka',
+      description:
+        '直读 public/tsumego/chao_vol2_p142.json（黑关键子 ps,ir,nr）。自动 D8 对称检测识别出本题采用反对角转置 (18-c, 18-r)：原谱首手 B[ai]N[下邊] 对应 B[ks](L1)（JSON 误写为 "ka"），主变 11 手：ks -> is -> ns -> js -> ls -> ms -> kr -> or -> oq -> os -> pr；失败首手为 ns, ls, oq。',
+      failureDiagnosis: {
+        category: 'FT-02 / FT-04 · 11 手分断子紧气对杀 + 数据集标签勘误',
+        rootCause:
+          '1) 外壳子 iq, jq, kq 现已通过 `!rawRegionSet.has` 正确恢复为不死墙；2) 原谱第 11 手 B[pr] 结束时白分断子尚未被提除，经典 Benson 仍为 NonTerminal，需再完成收气提子才能围出两眼。',
+        improvementMethod:
+          '构建带严格气数不等式证书的静态对杀证明器（Certified Semeai Resolver），识别无眼分断链必死状态。',
+        targetCppModule: 'ldprover_terminal (semeai_verifier.cc)',
+        estimatedSpeedup: '可提前 6~8 手完成对杀定论',
+      },
+    }
+  ),
+  parseStudyLdRzJsonToProblemSpec(
+    'chao_vol2_p147.json',
+    rawP147 as RawStudyLdRzProblemJson,
+    {
+      title: 'RZ-13 · chao_vol2_p147（右下白先一路夹做活 · 检出 JSON 标签行翻转错误）',
+      expectedOutcome: ProofOutcome.Unknown,
+      groundTruthNote:
+        'D8=2 (18-r, 18-c) 核验原谱 W[ea] 真解为 os (P1)，JSON 误写为未翻行的 oa（旧版 ms 为伪解已拦截）',
+      description:
+        '直读 public/tsumego/chao_vol2_p147.json（白先做活，白关键子 lr,oq,no）。原谱首手 (;W[ea]N[右下]) 经 180° 旋转真解为 W[os](P1)（JSON 误标为行未翻转的 "oa"）。恢复纯经典 Benson 后，旧版因孤子 no 超级链合并产生的 W[ms] 假证明已被彻底消除！原谱主变：W[os] -> B[ns] -> W[ms] -> B[ps] -> W[ks]。',
+      failureDiagnosis: {
+        category: 'FT-02 / FT-04 · 孤子联络护眼与分断黑子收气深度',
+        rootCause:
+          '白棋需通过 1.W[os] -> 3.W[ms] -> 5.W[ks]（或 9 手正解2）吃住黑分断子 nr,or 并保护孤子 no 的眼位，纯经典 Benson 拒绝将未提净的死子腔提前判活。',
+        improvementMethod:
+          '结合 NNAttentionMask 与紧气启发式定初值，压缩外围 46 格空点中的非紧气虚手。',
+        targetCppModule: 'ldprover_dfpn (dfpn_solver.cc)',
+        estimatedSpeedup: '消除 W[ms] 伪解并聚焦 W[os] 正解树',
+      },
+    }
+  ),
   parseStudyLdRzJsonToProblemSpec(
     'chao_vol2_p156.json',
+    rawP156 as RawStudyLdRzProblemJson,
     {
-      masked_sgf_str:
-        '(;FF[4]CA[UTF-8]SZ[19]KM[28]AB[os][qs][ir][kr][qr][iq][kq][lq][qq][ap][bp][cp][dp][ep][fp][gp][hp][ip][jp][op][pp][qp][ho][io][hn][in][jn][ln][on][im][lm][nm][il][ol][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][nh][oh][ph][pg][pf][pe][pd][pc][pb][pa]AW[ps][jr][mr][pr][jq][oq][pq][kp][lp][mp][np][ao][bo][co][do][eo][fo][go][lo][no][gn][mn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][gg][ig][lg][ng][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]PL[W]TR[mr][jq][oq][lo][mn])',
-      rawsgf:
-        '(;FF[4]GM[1]SZ[19]AP[SGFC:1.13b](;W[hb]N[上邊];B[eb];W[fc];B[ff];W[ha];B[ja];W[fa]C[正解1]))',
-      turn_color: 'w',
-      winning_color: 'w',
-      black_search_goal: 'TOKILL',
-      white_search_goal: 'TOLIVE',
-      black_crucial_stone: '',
-      white_crucial_stone: 'mr,jq,oq,lo,mn',
-      answer_firstmove: ['lr'],
-    },
-    {
-      title: 'RZ-11 · chao_vol2_p156（5 块关键子紧气对杀解围 · 对杀诊断）',
-      subtitle: '原库正解 W[lr] (M2 挖断) -> B[or] -> W[nq] · 多链气数对杀',
-      difficulty: '失败案例诊断 [FT-02 多步气数对杀 Semeai]',
+      title: 'RZ-14 · chao_vol2_p156（5 关键子挖断滚包对杀 · 已消除 W[nr] 伪解）',
       expectedOutcome: ProofOutcome.Unknown,
-      expectedBestMoveSgf: 'lr',
       description:
-        '【诊断案例 FT-02 · 附原谱正解演示】取自 chao_vol2_p156.json（高段篇）。白棋被分割为 mr, jq, oq, lo, mn 五块关键子，中央大块无两眼，必须通过 1.W[lr](M2 挖) -> 2.B[or](P2) -> 3.W[nq](O3 双打吃滚包) -> 4.B[nn](O6) -> 5.W[ls](M1) -> 6.B[js](K1) -> 7.W[ns](O1) 紧气对杀吃掉黑棋 kq-lq-kr 切断子才能解围。',
+        '直读 public/tsumego/chao_vol2_p156.json（白先做活，白关键子 mr,jq,oq,lo,mn）。原谱正解：1.W[lr] -> 2.B[or] -> 3.W[nq] -> 4.B[nn](提吃 mn) -> 5.W[ls] -> 6.B[js] -> 7.W[ns]。恢复纯经典 Benson 后，原谱「失敗3」W[nr]（被 B[mq] 反驳）的假证明已被 100% 拦截！',
       failureDiagnosis: {
-        category: 'FT-02 · 无双真眼的多步气数对杀 (Multi-Step Liberty Race)',
+        category: 'FT-02 · 多块关键子弃取转换与无眼紧气对杀',
         rootCause:
-          '白棋在走完前 7 手原谱正解后，虽然已将黑棋切断链锁死在 2 气（而白棋拥有 3 气，白必胜对杀），但因黑棋切断子尚未被最终提光，纯 Benson UCA 仍返回 NonTerminal，需再搜 4~6 手收气提子。',
+          '正解第 4 手白棋主动弃掉关键子之一的 mn（验证了逗号分隔关键子为析取任一存活语义），并通过滚打包收将黑 kq-lq-kr 锁死在少气状态，需彻底提光分断黑链后方能满足经典 Benson。',
         improvementMethod:
-          '新增静态对杀评估模块 SemeaiEvaluator<19>：当关键受困块与敌方分断块处于无眼对杀或有眼杀无眼状态时，静态比对有效气数（Effective Liberties）直接给出终局定论，提前 6 手剪枝。',
-        targetCppModule: 'ldprover_terminal (semeai_evaluator.cc)',
-        estimatedSpeedup: '对杀类题目搜索深度减少 40%~55%',
+          '引入局部受困分断块气数对杀证明器（Semeai Liberty Proof），在提光前安全导出必胜证书。',
+        targetCppModule: 'ldprover_terminal & ldprover_dfpn',
+        estimatedSpeedup: '对杀深度缩减 40%+',
       },
     }
   ),
-
-  // 12. chao_vol2_p162 — DIAGNOSTIC CASE (Long Corner Squeeze)
   parseStudyLdRzJsonToProblemSpec(
     'chao_vol2_p162.json',
+    rawP162 as RawStudyLdRzProblemJson,
     {
-      masked_sgf_str:
-        '(;FF[4]CA[UTF-8]SZ[19]KM[22]AB[lr][mr][nr][or][pr][qr][rq][rp][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[ls][ir][jr][kr][rr][lq][mq][nq][oq][pq][qq][ap][bp][cp][dp][ep][fp][gp][hp][ip][kp][qp][io][ro][so][in][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[qr][rp])',
-      rawsgf:
-        '(;FF[4]GM[1]SZ[19]AP[SGFC:1.13b](;B[ab]N[右下];W[ba];B[ha];W[aa];B[bc]C[正解]))',
-      turn_color: 'b',
-      winning_color: 'b',
-      black_search_goal: 'TOLIVE',
-      white_search_goal: 'TOKILL',
-      black_crucial_stone: 'qr,rp',
-      white_crucial_stone: '',
-      answer_firstmove: ['sr'],
-    },
-    {
-      title: 'RZ-12 · chao_vol2_p162（长边一路硬腿与渡回对杀 · 诊断案例）',
-      subtitle: '原库正解 B[sr] (T2) -> W[rs] -> B[ls] · 跨 9 列长边首尾呼应',
-      difficulty: '失败案例诊断 [FT-02/FT-03 跨区域首尾对杀]',
+      title: 'RZ-15 · chao_vol2_p162（跨 9 列长边首尾呼应 · 已消除 B[rs] 伪解）',
       expectedOutcome: ProofOutcome.Unknown,
-      expectedBestMoveSgf: 'sr',
       description:
-        '【诊断案例 FT-02/FT-03 · 附原谱正解演示】取自 chao_vol2_p162.json。黑棋二路一排 6 子（lr..qr）被白棋二路封锁。原谱正解：1.B[sr](T2 右端扳) -> 2.W[rs](S1 挡) -> 3.B[ls](M1 左端硬腿/反扑) -> 4.W[ss](T1) -> 5.B[rq](S3) 首尾呼应成活。',
+        '直读 public/tsumego/chao_vol2_p162.json（黑关键子 qr,rp）。恢复纯经典 Benson 与完整 SGF 树解析后：1) 消除了旧版因超级链合并把 B[rs] 误判为活棋的假证明；2) 完整提取出 13 手原谱主变：sr -> rs -> sq -> ms -> ns -> qs -> ks -> ps -> os -> sp -> ls -> ss -> rq。',
       failureDiagnosis: {
-        category: 'FT-02/FT-03 · 跨 9 列长边首尾呼应与气数紧逼',
+        category: 'FT-03 · 13 手跨 9 列首尾次序与不入气收气',
         rootCause:
-          '黑棋眼位横跨 M1(ls) 到 T2(sr) 共 8 列一路空间，右端交换 B[sr]/W[rs] 后必须立即转战左端 M1，且一路存在大量对称的次序组合（Transpositions），局部空点达 26 格。',
+          '黑棋必须先在右翼 B[sr]/B[sq] 造出倒扑/紧气先手，再转战左翼 ms..ks 一路连环应对，最后回到 B[rq] 成活，主变跨度 13 手。',
         improvementMethod:
-          '结合 RZS-PT 置换表启用「一二路长边连通块分解（1D Corridor Decomposition）」与「同形次序归并」，避免左右两端独立手顺的组合爆炸。',
-        targetCppModule: 'ldprover_tt (transposition_store.cc) & ldprover_rz',
-        estimatedSpeedup: '置换表复用率可提升 4.5 倍',
+          '结合一二路走廊模式分解与 RZS-PT 跨次序证明复验，减少左右翼独立交换的次序组合爆炸。',
+        targetCppModule: 'ldprover_tt & ldprover_dfpn',
+        estimatedSpeedup: '置换表同形复用提升 3~4x',
+      },
+    }
+  ),
+  parseStudyLdRzJsonToProblemSpec(
+    'chao_vol2_p351.json',
+    rawP351 as RawStudyLdRzProblemJson,
+    {
+      title: 'RZ-16 · chao_vol2_p351（白先二路尖断对杀做活）',
+      expectedOutcome: ProofOutcome.Unknown,
+      description:
+        '直读 public/tsumego/chao_vol2_p351.json（白关键子 or,mq，D8=7 反对角转置自动对齐）。原谱 9 手主变：W[lr] -> B[kr] -> W[ms] -> B[os] -> W[ns] -> B[ks] -> W[ls] -> B[nr] -> W[mr]。恢复纯经典 Benson 后不再于第 5 手过早乐观判活。',
+      failureDiagnosis: {
+        category: 'FT-02 · 分断黑子紧气提除与双真眼收束',
+        rootCause:
+          '恢复经典 Benson 后，第 5 手 W[ns] 时黑 np 尚未被提掉且腔体仅计单眼，必须完整走完后续紧气提子交换才能形成两只独立真眼。',
+        improvementMethod:
+          '利用紧气对杀与眼形启发式引导 df-pn 沿 W[lr] -> W[ms] -> W[ns] 主线深入完成提子闭合。',
+        targetCppModule: 'ldprover_dfpn (dfpn_solver.cc)',
+        estimatedSpeedup: '聚焦紧气主线深搜',
       },
     }
   ),

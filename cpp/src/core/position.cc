@@ -61,6 +61,7 @@ void Position<N>::Clear(const ProofContext& context) noexcept {
   context_ = context;
   black_stones_.Clear();
   white_stones_.Clear();
+  immortal_wall_.Clear();
   to_play_ = Color::kBlack;
   ko_point_ = kNullMove;
   consecutive_passes_ = 0;
@@ -227,7 +228,7 @@ bool Position<N>::PlayMove(int16_t move, bool* out_is_ko_capture) noexcept {
     if (StoneAt(nb) == them && !captured_stones.Get(nb)) {
       BitBoard<N> liberties;
       BitBoard<N> enemy_chain = FloodFillChain(nb, &liberties);
-      if (liberties.None()) {
+      if (liberties.None() && !(enemy_chain & immortal_wall_).Any()) {
         captured_stones |= enemy_chain;
       }
     }

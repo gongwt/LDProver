@@ -38,6 +38,11 @@ BitBoard<N> BensonTerminalEvaluator<N>::ComputeUnconditionalAlive(
     }
   }
 
+  std::vector<bool> is_immortal_chain(chains.size(), false);
+  for (size_t i = 0; i < chains.size(); ++i) {
+    is_immortal_chain[i] = (chains[i].stones & pos.ImmortalWall()).Any();
+  }
+
   // Step 2: Partition complement of `color` stones into connected regions.
   BitBoard<N> visited_complement = pos.Stones(color);
   for (int coord = 0; coord < N * N; ++coord) {
@@ -77,16 +82,27 @@ BitBoard<N> BensonTerminalEvaluator<N>::ComputeUnconditionalAlive(
 
     reg.boundary_chain_ids.assign(boundary_chains.begin(),
                                   boundary_chains.end());
-    // A region is enclosed and healthy if it has at least 1 empty point,
-    // touches at least 1 chain of `color`, and all empty points inside it
-    // are adjacent only to `color` stones or other points in the region.
-    reg.is_small_enclosed = reg.empty_points.Any() &&
+    const bool touches_immortal_enemy =
+        (reg.enemy_stones & pos.ImmortalWall()).Any();
+    bool touches_tactical_chain = false;
+    for (uint16_t cid : reg.boundary_chain_ids) {
+      if (!is_immortal_chain[cid]) {
+        touches_tactical_chain = true;
+        break;
+      }
+    }
+
+    // Pure Classic Benson (1976): region cannot contain immortal outer wall
+    // enemy stones and contributes at most 1 vital region when enclosed.
+    reg.is_small_enclosed = !touches_immortal_enemy &&
+                            touches_tactical_chain &&
+                            reg.empty_points.Any() &&
                             !reg.boundary_chain_ids.empty() &&
-                            reg.empty_points.Count() <= 6;
+                            reg.empty_points.Count() <= 15;
     regions.push_back(reg);
   }
 
-  // Step 3: Benson greatest-fixpoint elimination loop.
+  // Step 3: Classic Benson (1976) greatest-fixpoint elimination loop.
   std::set<uint16_t> active_chains;
   std::set<uint16_t> active_regions;
   for (const auto& ch : chains) active_chains.insert(ch.chain_id);
@@ -114,15 +130,16 @@ BitBoard<N> BensonTerminalEvaluator<N>::ComputeUnconditionalAlive(
       changed = true;
     }
 
-    // 3b. Recompute vital regions for each active chain; drop if < 2 vital eyes.
+    // 3b. Recompute vital regions for each non-immortal active chain; drop if < 2.
     std::vector<uint16_t> chains_to_drop;
     for (uint16_t cid : active_chains) {
+      if (is_immortal_chain[cid]) continue;
       auto& ch = chains[cid];
       ch.vital_eye_region_ids.clear();
       for (uint16_t rid : active_regions) {
         const auto& reg = regions[rid];
-        // A region R is vital to chain X iff every empty point in R is a
-        // liberty of X.
+        // A region R is vital to chain X iff every empty point in R is an
+        // orthogonal liberty of X (strictly 1 vital eye contribution per region).
         if (reg.empty_points.IsSubsetOf(ch.liberties)) {
           ch.vital_eye_region_ids.push_back(rid);
         }
@@ -146,6 +163,9 @@ BitBoard<N> BensonTerminalEvaluator<N>::ComputeUnconditionalAlive(
     for (uint16_t rid : chains[cid].vital_eye_region_ids) {
       vital_rz |= regions[rid].empty_points;
       vital_rz |= regions[rid].enemy_stones;
+      for (uint16_t bcid : regions[rid].boundary_chain_ids) {
+        vital_rz |= chains[bcid].stones;
+      }
     }
   }
 
@@ -191,7 +211,8 @@ TerminalEvaluationResult<N> BensonTerminalEvaluator<N>::EvaluateTerminal(
 
   for (size_t i = 0; i < context.initial_tokens.size() && i < 64; ++i) {
     const auto& tok = context.initial_tokens[i];
-    if ((surviving_mask & (1ULL << i)) != 0) {
+    if ((surviving_mask & (1ULL << i)) != 0 &&
+        pos.StoneAt(tok.initial_coord) == tok.stone_color) {
       group_has_surviving_token[tok.group_index] = true;
       BitBoard<N> libs;
       BitBoard<N> ch = pos.FloodFillChain(tok.initial_coord, &libs);
@@ -206,34 +227,25 @@ TerminalEvaluationResult<N> BensonTerminalEvaluator<N>::EvaluateTerminal(
 
   bool target_uca_satisfied = false;
   bool target_all_captured = false;
-  bool target_survives_at_double_pass = false;
 
   if (context.crucial_stone_op == LogicalOp::kConjunction) {
     target_uca_satisfied = true;
-    target_survives_at_double_pass = true;
     target_all_captured = false;
     for (uint8_t g = 0; g <= max_group; ++g) {
       if (!group_has_uca_token[g]) target_uca_satisfied = false;
-      if (!group_has_surviving_token[g]) {
-        target_survives_at_double_pass = false;
-        target_all_captured = true;
-      }
+      if (!group_has_surviving_token[g]) target_all_captured = true;
     }
   } else {
-    // kSingle or kDisjunction ('|')
+    // kSingle or kDisjunction ('|' / ',')
     target_uca_satisfied = false;
-    target_survives_at_double_pass = false;
     target_all_captured = true;
     for (uint8_t g = 0; g <= max_group; ++g) {
       if (group_has_uca_token[g]) target_uca_satisfied = true;
-      if (group_has_surviving_token[g]) {
-        target_survives_at_double_pass = true;
-        target_all_captured = false;
-      }
+      if (group_has_surviving_token[g]) target_all_captured = false;
     }
   }
 
-  // Case 1: Target stones achieved Benson UCA.
+  // Case 1: Target stones achieved Classic Benson UCA.
   if (target_uca_satisfied) {
     res.status = (context.attacker_goal == SearchGoal::kToLive)
                      ? TerminalStatus::kWin
@@ -243,7 +255,7 @@ TerminalEvaluationResult<N> BensonTerminalEvaluator<N>::EvaluateTerminal(
     for (const auto& ch : chains) {
       if (ch.is_uca_alive) res.proven_uca_chain_ids.push_back(ch.chain_id);
     }
-    res.diagnostic_note = "Benson UCA greatest-fixpoint satisfied";
+    res.diagnostic_note = "Classic Benson (1976) UCA greatest-fixpoint satisfied";
     return res;
   }
 
@@ -258,9 +270,9 @@ TerminalEvaluationResult<N> BensonTerminalEvaluator<N>::EvaluateTerminal(
     return res;
   }
 
-  // Case 3: FR-3.8 Double-pass terminal resolution (evaluated prior to InPath).
+  // Case 3: FR-3.8 Double-pass terminal resolution (strictly checks UCA!).
   if (pos.IsAtDoublePass()) {
-    const bool live_holds = target_survives_at_double_pass;
+    const bool live_holds = target_uca_satisfied;
     if (context.attacker_goal == SearchGoal::kToLive) {
       res.status = live_holds ? TerminalStatus::kWin : TerminalStatus::kLoss;
     } else {

@@ -51,8 +51,11 @@ SolveReport<N> DfpnSolver<N>::Solve(
 template <int N>
 int32_t DfpnSolver<N>::ScoreMoveFastCapture(const Position<N>& pos,
                                             const ProofContext& context,
-                                            int16_t move) const {
-  if (move == kPassMove) return -1000;
+                                            int16_t move,
+                                            bool is_or_node) const {
+  if (move == kPassMove) {
+    return (!is_or_node && pos.ConsecutivePasses() == 0) ? 450 : -2000;
+  }
   int32_t score = 0;
 
   // Prioritize moves adjacent to crucial stones or their liberties.
@@ -62,8 +65,9 @@ int32_t DfpnSolver<N>::ScoreMoveFastCapture(const Position<N>& pos,
     BitBoard<N> libs;
     BitBoard<N> ch = pos.FloodFillChain(t_coord, &libs);
     if (libs.Get(move)) {
-      score += 400;
-      if (libs.Count() <= 2) score += 600;
+      score += 550;
+      if (libs.Count() == 1) score += 1350;
+      else if (libs.Count() == 2) score += 720;
     }
   }
 
@@ -77,12 +81,33 @@ int32_t DfpnSolver<N>::ScoreMoveFastCapture(const Position<N>& pos,
                                                   : Color::kBlack)
             .Count();
     const int captured = prev_enemy_count - new_enemy_count;
-    if (captured > 0) score += 1000 + captured * 250;
+    if (captured > 0) score += 1250 + captured * 300;
 
     BitBoard<N> our_libs;
     next.FloodFillChain(move, &our_libs);
-    if (our_libs.Count() == 1) score -= 350;  // Self-atari penalty
-    if (our_libs.Count() >= 3) score += 120;
+    if (our_libs.Count() == 1) score -= 350;
+    if (our_libs.Count() >= 3) score += 200;
+  }
+
+  // Distinguish border-expanding blocks from pure internal eye-space self-fills.
+  const Color enemy = OppositeColor(pos.ToPlay());
+  int friendly_ortho = 0;
+  int enemy_ortho = 0;
+  for (int nb : pos.OrthogonalNeighbors(move)) {
+    if (pos.StoneAt(nb) == pos.ToPlay()) ++friendly_ortho;
+    else if (pos.StoneAt(nb) == enemy) ++enemy_ortho;
+  }
+  int friendly_diag = 0;
+  int enemy_diag = 0;
+  for (int d : pos.DiagonalNeighbors(move)) {
+    if (pos.StoneAt(d) == pos.ToPlay()) ++friendly_diag;
+    else if (pos.StoneAt(d) == enemy) ++enemy_diag;
+  }
+  if (friendly_ortho >= 1 && enemy_ortho >= 1) score += 380;
+  if (friendly_ortho >= 1 && enemy_diag >= 1) score += 320;
+  if (friendly_ortho >= 1 && friendly_diag >= 2 && enemy_ortho == 0 &&
+      enemy_diag == 0) {
+    score -= 240;
   }
   return score;
 }
@@ -90,9 +115,22 @@ int32_t DfpnSolver<N>::ScoreMoveFastCapture(const Position<N>& pos,
 template <int N>
 bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
     const Position<N>& query_pos, const ProofContext& context,
-    uint32_t source_dag_node_id, ProofOutcome expected_outcome) const {
-  if (source_dag_node_id >= report_.proof_dag_nodes.size()) return false;
-  const auto& node = report_.proof_dag_nodes[source_dag_node_id];
+    const std::optional<BitBoard<N>>& region_hint,
+    uint32_t source_dag_node_id, ProofOutcome expected_outcome,
+    uint32_t guard_depth) const {
+  if (guard_depth > 48 || source_dag_node_id >= report_.proof_dag_nodes.size()) {
+    return false;
+  }
+
+  uint32_t resolved_id = source_dag_node_id;
+  for (int hop = 0; hop < 16 && resolved_id < report_.proof_dag_nodes.size();
+       ++hop) {
+    const auto& cur = report_.proof_dag_nodes[resolved_id];
+    if (!cur.is_pruned_outside_rz) break;
+    resolved_id = cur.source_proof_node_id;
+  }
+  if (resolved_id >= report_.proof_dag_nodes.size()) return false;
+  const auto& node = report_.proof_dag_nodes[resolved_id];
   if (node.outcome != expected_outcome) return false;
 
   const auto term = terminal_eval_.EvaluateTerminal(query_pos, context);
@@ -105,20 +143,52 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
 
   if (node.child_node_ids.empty()) return false;
   const bool is_or = (query_pos.ToPlay() == context.root_attacker);
+  const bool restricted_side =
+      (query_pos.ToPlay() == context.root_attacker && !context.attacker_allow_ko) ||
+      (query_pos.ToPlay() != context.root_attacker && !context.defender_allow_ko);
 
+  // Case 1: Single-witness node (OR -> ProvenWin, or AND -> ProvenLoss)
   if ((is_or && expected_outcome == ProofOutcome::kProvenWin) ||
       (!is_or && expected_outcome == ProofOutcome::kProvenLoss)) {
-    // Witness replay: at least one recorded child witness must be legal and
-    // replay cleanly on query_pos + HistorySet.
     for (size_t i = 0; i < node.child_node_ids.size(); ++i) {
+      if (report_.proof_dag_nodes[node.child_node_ids[i]].outcome !=
+          expected_outcome) {
+        continue;
+      }
       Position<N> next = query_pos;
-      if (!next.PlayMove(node.child_moves[i])) continue;
+      bool is_ko_cap = false;
+      if (!next.PlayMove(node.child_moves[i], &is_ko_cap)) continue;
+      if (is_ko_cap && restricted_side) continue;
       if (RevalidateSourceProofOnQueryState(
-              next, context, node.child_node_ids[i], expected_outcome)) {
+              next, context, region_hint, node.child_node_ids[i],
+              expected_outcome, guard_depth + 1)) {
         return true;
       }
     }
     return false;
+  }
+
+  // Case 2: Full-coverage node (AND -> ProvenWin, or OR -> ProvenLoss).
+  // Every legal move on `query_pos` must exist in `node` and replay cleanly!
+  const auto query_legal = query_pos.GenerateLegalMoves(region_hint);
+  for (int16_t mv : query_legal) {
+    int found_idx = -1;
+    for (size_t i = 0; i < node.child_moves.size(); ++i) {
+      if (node.child_moves[i] == mv) {
+        found_idx = static_cast<int>(i);
+        break;
+      }
+    }
+    if (found_idx < 0) return false;
+    Position<N> next = query_pos;
+    bool is_ko_cap = false;
+    if (!next.PlayMove(mv, &is_ko_cap)) continue;
+    if (is_ko_cap && restricted_side) return false;
+    if (!RevalidateSourceProofOnQueryState(
+            next, context, region_hint, node.child_node_ids[found_idx],
+            expected_outcome, guard_depth + 1)) {
+      return false;
+    }
   }
   return true;
 }
@@ -219,7 +289,7 @@ void DfpnSolver<N>::MidSearch(
     ch.move = mv;
     ch.tactical_score =
         config_.enable_fast_capture_ordering
-            ? ScoreMoveFastCapture(pos, context, mv)
+            ? ScoreMoveFastCapture(pos, context, mv, is_or_node)
             : 0;
     children.push_back(ch);
   }
@@ -229,6 +299,19 @@ void DfpnSolver<N>::MidSearch(
         [](const SearchChild& a, const SearchChild& b) {
           return a.tactical_score > b.tactical_score;
         });
+    for (size_t idx = 0; idx < children.size(); ++idx) {
+      const uint32_t rank_metric =
+          (idx == 0) ? 1U : (idx <= 2 ? 2U : static_cast<uint32_t>(idx + 1));
+      if (is_or_node) {
+        children[idx].pn =
+            (children[idx].move == kPassMove) ? 120U : rank_metric;
+        children[idx].dn = 1U;
+      } else {
+        children[idx].pn = 1U;
+        children[idx].dn =
+            (children[idx].move == kPassMove) ? 2U : rank_metric;
+      }
+    }
   }
 
   in_path_hashes.insert(pos.ZobristHash());
@@ -251,14 +334,19 @@ void DfpnSolver<N>::MidSearch(
     // FR-5.5: Try Outside-RZ null-move certificate pruning on unexpanded moves
     // when an active sibling certificate RZ exists.
     if (config_.enable_rz_pruning && has_null_move_rz) {
+      const bool restricted_side =
+          (pos.ToPlay() == context.root_attacker && !context.attacker_allow_ko) ||
+          (pos.ToPlay() != context.root_attacker && !context.defender_allow_ko);
       for (size_t i = 0; i < window_size; ++i) {
         auto& ch = children[i];
         if (ch.expanded || ch.outcome != ProofOutcome::kUnknown) continue;
         if (rz_engine_.IsOutsideRZCandidate(ch.move, active_null_move_rz)) {
           Position<N> next_pos = pos;
-          if (next_pos.PlayMove(ch.move) &&
+          bool is_ko_cap = false;
+          if (next_pos.PlayMove(ch.move, &is_ko_cap) &&
+              !(is_ko_cap && restricted_side) &&
               RevalidateSourceProofOnQueryState(
-                  next_pos, context, representative_dag_id,
+                  next_pos, context, region_hint, representative_dag_id,
                   representative_outcome)) {
             ch.expanded = true;
             ch.pruned_outside_rz = true;
@@ -278,31 +366,45 @@ void DfpnSolver<N>::MidSearch(
       }
     }
 
-    // FR-4.1: Frontier PN/DN aggregation with implicit unexpanded cost U.
+    // FR-4.1: Frontier PN/DN aggregation without breadth-exploding sum inflation.
     const size_t unexpanded_u =
         (total_legal > window_size) ? (total_legal - window_size) : 0;
     uint32_t cur_pn = 1;
     uint32_t cur_dn = 1;
 
     if (is_or_node) {
-      uint32_t min_pn =
-          (unexpanded_u > 0) ? 1U : kPnDnSaturation;  // Implicit child = 1
-      uint64_t sum_dn = unexpanded_u;
+      uint32_t min_pn = kPnDnSaturation;
+      uint64_t sum_dn = 0;
       for (size_t i = 0; i < window_size; ++i) {
         min_pn = std::min(min_pn, children[i].pn);
         sum_dn += children[i].dn;
       }
+      if (unexpanded_u > 0) {
+        min_pn = std::min(min_pn, children[window_size].pn);
+      }
+      if (sum_dn == 0 && window_size < total_legal) {
+        ++widening_level;
+        ++report_.widening_upgrades;
+        continue;
+      }
       cur_pn = min_pn;
-      cur_dn = ClampSat(sum_dn);
+      cur_dn = ClampSat(sum_dn + (unexpanded_u > 0 ? 1ULL : 0ULL));
     } else {
-      uint64_t sum_pn = unexpanded_u;
-      uint32_t min_dn =
-          (unexpanded_u > 0) ? 1U : kPnDnSaturation;  // Implicit child = 1
+      uint64_t sum_pn = 0;
+      uint32_t min_dn = kPnDnSaturation;
       for (size_t i = 0; i < window_size; ++i) {
         sum_pn += children[i].pn;
         min_dn = std::min(min_dn, children[i].dn);
       }
-      cur_pn = ClampSat(sum_pn);
+      if (unexpanded_u > 0) {
+        min_dn = std::min(min_dn, children[window_size].dn);
+      }
+      if (sum_pn == 0 && window_size < total_legal) {
+        ++widening_level;
+        ++report_.widening_upgrades;
+        continue;
+      }
+      cur_pn = ClampSat(sum_pn + (unexpanded_u > 0 ? 1ULL : 0ULL));
       cur_dn = min_dn;
     }
 
@@ -401,11 +503,18 @@ void DfpnSolver<N>::MidSearch(
       }
     }
 
-    // If implicit unexpanded child has smaller metric (1), widen window (FR-4.4).
-    if (unexpanded_u > 0 && best_metric > 1) {
-      ++widening_level;
-      ++report_.widening_upgrades;
-      continue;
+    // Progressive Widening upgrade condition (FR-4.4).
+    if (unexpanded_u > 0) {
+      const uint32_t next_unexpanded_metric =
+          is_or_node ? children[window_size].pn : children[window_size].dn;
+      const uint32_t widen_trigger =
+          std::max(next_unexpanded_metric, 8U * (widening_level + 1U));
+      if (best_idx < 0 || best_metric >= widen_trigger) {
+        ++widening_level;
+        ++report_.widening_upgrades;
+        continue;
+      }
+      second_best_metric = std::min(second_best_metric, widen_trigger);
     }
 
     if (best_idx < 0 || best_metric >= kPnDnSaturation) {
@@ -416,16 +525,28 @@ void DfpnSolver<N>::MidSearch(
     }
 
     auto& mpc = children[best_idx];
+    if (depth == 0) report_.best_move = mpc.move;
+    const uint32_t eps_bound = ClampSat(std::max<uint64_t>(
+        static_cast<uint64_t>(second_best_metric) + 1ULL,
+        static_cast<uint64_t>(second_best_metric) * 5ULL / 4ULL + 2ULL));
     uint32_t child_th_pn = th_pn;
     uint32_t child_th_dn = th_dn;
     if (is_or_node) {
-      child_th_pn = std::min(th_pn, ClampSat(static_cast<uint64_t>(second_best_metric) + 1));
+      child_th_pn = std::min(th_pn, eps_bound);
       const uint64_t other_dn = cur_dn - mpc.dn;
-      child_th_dn = (th_dn > other_dn) ? static_cast<uint32_t>(th_dn - other_dn) : 1U;
+      child_th_dn = (th_dn >= kPnDnSaturation)
+                        ? kPnDnSaturation
+                        : ((th_dn > other_dn)
+                               ? std::max(2U, static_cast<uint32_t>(th_dn - other_dn))
+                               : 1U);
     } else {
       const uint64_t other_pn = cur_pn - mpc.pn;
-      child_th_pn = (th_pn > other_pn) ? static_cast<uint32_t>(th_pn - other_pn) : 1U;
-      child_th_dn = std::min(th_dn, ClampSat(static_cast<uint64_t>(second_best_metric) + 1));
+      child_th_pn = (th_pn >= kPnDnSaturation)
+                        ? kPnDnSaturation
+                        : ((th_pn > other_pn)
+                               ? std::max(2U, static_cast<uint32_t>(th_pn - other_pn))
+                               : 1U);
+      child_th_dn = std::min(th_dn, eps_bound);
     }
 
     bool is_ko_capture = false;
@@ -442,28 +563,31 @@ void DfpnSolver<N>::MidSearch(
     pos.UndoMove();
     mpc.expanded = true;
 
-    // FR-5.7: KoDependent witness barrier check.
-    if (is_ko_capture) {
-      const bool restricted_side =
-          (pos.ToPlay() == context.root_attacker && !context.attacker_allow_ko) ||
-          (pos.ToPlay() != context.root_attacker && !context.defender_allow_ko);
-      if (restricted_side &&
-          ((is_or_node && mpc.pn == 0) || (!is_or_node && mpc.dn == 0))) {
-        mpc.ko_dependent = true;
-        mpc.outcome = ProofOutcome::kUnknown;
-        mpc.pn = kPnDnSaturation / 2;
-        mpc.dn = kPnDnSaturation / 2;
-        *out_ko_dependent = true;
-      }
+    // FR-5.7: KoDependent witness barrier check (propagates child_ko_dep too!).
+    const bool restricted_side =
+        (pos.ToPlay() == context.root_attacker && !context.attacker_allow_ko) ||
+        (pos.ToPlay() != context.root_attacker && !context.defender_allow_ko);
+    if ((is_ko_capture || child_ko_dep) && restricted_side &&
+        ((is_or_node && mpc.pn == 0) || (!is_or_node && mpc.dn == 0))) {
+      mpc.ko_dependent = true;
+      mpc.outcome = ProofOutcome::kUnknown;
+      mpc.pn = kPnDnSaturation / 2;
+      mpc.dn = kPnDnSaturation / 2;
+      *out_ko_dependent = true;
     }
 
-    // Record sibling certificate RZ for OutsideRZRevalidated pruning (FR-5.5).
-    if (!is_or_node && mpc.pn == 0 && mpc.proof_rz.Size() > 0) {
+    // Record compact sibling certificate RZ for OutsideRZRevalidated pruning (FR-5.5).
+    // Never seed OR-node active_null_move_rz from PASS_MOVE (DOUBLE_PASS_RESOLUTION)!
+    if (!is_or_node && mpc.pn == 0 && mpc.proof_rz.Size() > 0 &&
+        (!has_null_move_rz || mpc.proof_rz.Size() < active_null_move_rz.Size())) {
       active_null_move_rz = mpc.proof_rz;
       has_null_move_rz = true;
       representative_dag_id = mpc.dag_node_id;
       representative_outcome = ProofOutcome::kProvenWin;
-    } else if (is_or_node && mpc.dn == 0 && mpc.disproof_rz.Size() > 0) {
+    } else if (is_or_node && mpc.move != kPassMove && mpc.dn == 0 &&
+               mpc.disproof_rz.Size() > 0 &&
+               (!has_null_move_rz ||
+                mpc.disproof_rz.Size() < active_null_move_rz.Size())) {
       active_null_move_rz = mpc.disproof_rz;
       has_null_move_rz = true;
       representative_dag_id = mpc.dag_node_id;

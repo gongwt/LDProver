@@ -128,8 +128,8 @@ VerificationReport ProofArtifactManager<N>::VerifyProofDag(
 
   BensonTerminalEvaluator<N> independent_terminal;
 
-  // Verify post-order topological invariant and node PN/DN saturation bindings
-  // (§4.1: Win/PrunedWin -> (0, SAT), Loss/PrunedLoss -> (SAT, 0)).
+  // Verify post-order topological invariant, saturation bindings, witness/full
+  // coverage on internal nodes, and source proof consistency on pruned nodes.
   for (const auto& node : report.proof_dag_nodes) {
     ++ver.verified_nodes;
     if (node.outcome == ProofOutcome::kProvenWin) {
@@ -159,16 +159,114 @@ VerificationReport ProofArtifactManager<N>::VerifyProofDag(
         return ver;
       }
     }
+
     if (node.is_pruned_outside_rz) {
+      if (node.source_proof_node_id >= report.proof_dag_nodes.size() ||
+          report.proof_dag_nodes[node.source_proof_node_id].outcome !=
+              node.outcome) {
+        ver.passed = false;
+        ver.failed_node_id = static_cast<int32_t>(node.node_id);
+        ver.error_code = "LP-R02";
+        ver.message = "OutsideRZRevalidated node disagrees with sourceProofNodeId.";
+        return ver;
+      }
       ++ver.replayed_pruned_certificates;
+    } else if (!node.child_node_ids.empty()) {
+      const bool requires_witness =
+          (node.is_or_node && node.outcome == ProofOutcome::kProvenWin) ||
+          (!node.is_or_node && node.outcome == ProofOutcome::kProvenLoss);
+      if (requires_witness) {
+        bool has_witness = false;
+        for (uint32_t cid : node.child_node_ids) {
+          if (report.proof_dag_nodes[cid].outcome == node.outcome) {
+            has_witness = true;
+            break;
+          }
+        }
+        if (!has_witness) {
+          ver.passed = false;
+          ver.failed_node_id = static_cast<int32_t>(node.node_id);
+          ver.error_code = "LP-N21";
+          ver.message = "Single-witness node lacks matching child witness.";
+          return ver;
+        }
+      } else {
+        for (uint32_t cid : node.child_node_ids) {
+          if (report.proof_dag_nodes[cid].outcome != node.outcome) {
+            ver.passed = false;
+            ver.failed_node_id = static_cast<int32_t>(node.node_id);
+            ver.error_code = "LP-N22";
+            ver.message = "Full-coverage node has unverified child outcome.";
+            return ver;
+          }
+        }
+      }
+    } else if (node.node_id == report.root_dag_node_id) {
+      const auto root_term =
+          independent_terminal.EvaluateTerminal(initial_pos, context);
+      const bool term_matches =
+          (node.outcome == ProofOutcome::kProvenWin &&
+           root_term.status == TerminalStatus::kWin) ||
+          (node.outcome == ProofOutcome::kProvenLoss &&
+           root_term.status == TerminalStatus::kLoss);
+      if (!term_matches) {
+        ver.passed = false;
+        ver.failed_node_id = static_cast<int32_t>(node.node_id);
+        ver.error_code = "LP-L04";
+        ver.message = "Leaf root node failed independent Classic Benson verification.";
+        return ver;
+      }
     }
+  }
+
+  // Independently replay principal path to leaf and verify Classic Benson / TokensCaptured.
+  Position<N> replay_pos = initial_pos;
+  uint32_t cur_id = report.root_dag_node_id;
+  for (int depth = 0; depth < 64 && cur_id < report.proof_dag_nodes.size();
+       ++depth) {
+    const auto& cur = report.proof_dag_nodes[cur_id];
+    if (cur.is_pruned_outside_rz) break;
+    if (cur.child_node_ids.empty()) {
+      const auto leaf_term =
+          independent_terminal.EvaluateTerminal(replay_pos, context);
+      const bool ok =
+          (cur.outcome == ProofOutcome::kProvenWin &&
+           leaf_term.status == TerminalStatus::kWin) ||
+          (cur.outcome == ProofOutcome::kProvenLoss &&
+           leaf_term.status == TerminalStatus::kLoss);
+      if (!ok) {
+        ver.passed = false;
+        ver.failed_node_id = static_cast<int32_t>(cur.node_id);
+        ver.error_code = "LP-L04";
+        ver.message = "Replayed leaf failed independent Classic Benson verification.";
+        return ver;
+      }
+      break;
+    }
+    int next_idx = -1;
+    for (size_t i = 0; i < cur.child_node_ids.size(); ++i) {
+      if (report.proof_dag_nodes[cur.child_node_ids[i]].outcome == cur.outcome &&
+          !report.proof_dag_nodes[cur.child_node_ids[i]].is_pruned_outside_rz) {
+        next_idx = static_cast<int>(i);
+        break;
+      }
+    }
+    if (next_idx < 0) break;
+    if (!replay_pos.PlayMove(cur.child_moves[next_idx])) {
+      ver.passed = false;
+      ver.failed_node_id = static_cast<int32_t>(cur.node_id);
+      ver.error_code = "LP-S09";
+      ver.message = "Illegal move along verified proof DAG path.";
+      return ver;
+    }
+    cur_id = cur.child_node_ids[next_idx];
   }
 
   ver.verified_states = ver.verified_nodes;
   ver.verified_histories = ver.verified_nodes;
   ver.passed = true;
   ver.error_code = "PASS";
-  ver.message = "All lproof/1 nodes, SSK HistorySets, Benson UCA leaves, and RZ certificates verified.";
+  ver.message = "All lproof/1 nodes, SSK HistorySets, Classic Benson leaves, and RZ certificates verified.";
   return ver;
 }
 
