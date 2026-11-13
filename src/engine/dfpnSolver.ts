@@ -97,6 +97,20 @@ export class DfpnSolver {
   }
 
   public solveProblem(problem: TsumegoProblemSpec): SolveReport {
+    const context = DfpnSolver.buildProofContext(problem, this.config);
+    const initialPos = DfpnSolver.buildInitialPosition(problem, context);
+    return this.solveFromPosition(problem, initialPos, context);
+  }
+
+  /**
+   * Solves from an arbitrary legal `GoPosition` (either the problem root or an interactive
+   * manual move sequence carrying authentic `historySnapshots` and `survivingTargetTokensMask`).
+   */
+  public solveFromPosition(
+    problem: TsumegoProblemSpec,
+    initialPos: GoPosition,
+    context: ProofContext
+  ): SolveReport {
     const startTime = performance.now();
     this.ttStore.clearAll();
     this.nodeFrontierCache.clear();
@@ -118,14 +132,12 @@ export class DfpnSolver {
         ? new NNAttentionMask(problem.attentionCoords)
         : null;
 
-    const context = DfpnSolver.buildProofContext(problem, this.config);
-    const initialPos = DfpnSolver.buildInitialPosition(problem, context);
-
-    const rootStateId = this.registerState(initialPos, -1, PASS_MOVE);
+    const rootPos = initialPos.clone();
+    const rootStateId = this.registerState(rootPos, -1, PASS_MOVE);
     const inPathHashes = new Set<string>();
 
     const rootResult = this.midSearch(
-      initialPos,
+      rootPos,
       context,
       problem.regionCoords,
       PN_DN_SATURATION,
@@ -144,23 +156,37 @@ export class DfpnSolver {
       this.unknownReason = UnknownReason.KoDependent;
     }
 
-    const rootEval = this.terminalEval.evaluateTerminal(initialPos, context);
+    const rootEval = this.terminalEval.evaluateTerminal(rootPos, context);
     const pv = this.extractPrincipalVariation(
-      initialPos.clone(),
+      rootPos.clone(),
       context,
       rootResult.dagNodeId,
       problem.boardSize
     );
 
+    this.compactProofStateAndHistoryTables();
+
     const elapsedMs = Math.max(1, Math.round(performance.now() - startTime));
     const artifactManager = new ProofArtifactManager();
+    const rawRegionCount =
+      problem.rawRegionCoords?.length ?? problem.regionCoords.length;
 
     const partialReport: SolveReport = {
       problemId: problem.id,
       problemTitle: problem.title,
-      inputHash: initialPos.computeZobristHex(),
-      configFingerprint: `${this.config.ttMode}:${this.config.koRule}:rz=${this.config.enableRzPruning}:ako=${context.attackerAllowKo}:dko=${context.defenderAllowKo}`,
-      solverVersion: 'LDProver-1.8.1-cxx20',
+      boardSize: rootPos.boardSize,
+      firstToPlay: rootPos.toPlay,
+      blackInitialCoords: rootPos.getBlackCoords(),
+      whiteInitialCoords: rootPos.getWhiteCoords(),
+      immortalWallCoords: Array.from(rootPos.immortalWallSet).sort(
+        (a, b) => a - b
+      ),
+      regionCoords: problem.regionCoords.slice(),
+      rawRegionPointCount: rawRegionCount,
+      isFullRegionSearch: problem.regionCoords.length >= rawRegionCount,
+      inputHash: rootPos.computeZobristHex(),
+      configFingerprint: `${this.config.ttMode}:${this.config.koRule}:rz=${this.config.enableRzPruning}:ako=${context.attackerAllowKo}:dko=${context.defenderAllowKo}:reg=${problem.regionCoords.length}/${rawRegionCount}`,
+      solverVersion: 'LDProver-1.8.2-cxx20',
       rootStatus: rootResult.outcome,
       unknownReason:
         rootResult.outcome === ProofOutcome.Unknown
@@ -210,9 +236,9 @@ export class DfpnSolver {
     };
 
     const { json: lproofJson, checksum: proofChecksum } =
-      artifactManager.serializeLProofJson(initialPos, context, partialReport);
+      artifactManager.serializeLProofJson(rootPos, context, partialReport);
     const { sgf: sgfContent, checksum: sgfChecksum } =
-      artifactManager.exportSolutionTreeSgf(initialPos, context, partialReport);
+      artifactManager.exportSolutionTreeSgf(rootPos, context, partialReport);
 
     partialReport.lproofJson = lproofJson;
     partialReport.proofChecksum = proofChecksum;
@@ -244,32 +270,48 @@ export class DfpnSolver {
     else if (crucialExpr.includes('|') || crucialExpr.includes(','))
       crucialOp = LogicalOp.Disjunction;
 
+    const expectedTokenColor =
+      attackerGoal === SearchGoal.ToLive
+        ? rootAttacker
+        : oppositeColor(rootAttacker);
+
     const groups = crucialExpr
       .split(/[&|,]/)
       .map((s) => s.trim())
       .filter(Boolean);
 
-    const initialTokens = groups.map((sgf, idx) => {
-      const c = sgf.charCodeAt(0) - 97;
-      const r = sgf.charCodeAt(1) - 97;
-      const coord = r * problem.boardSize + c;
-      const stoneColor = problem.blackInitialCoords.includes(coord)
-        ? Color.Black
-        : Color.White;
-      return {
-        tokenId: idx,
-        initialCoord: coord,
-        groupIndex: idx,
-        stoneColor,
-      };
-    });
+    const initialTokens = groups
+      .map((sgf, idx) => {
+        if (sgf.length < 2) return null;
+        const c = sgf.charCodeAt(0) - 97;
+        const r = sgf.charCodeAt(1) - 97;
+        if (c < 0 || c >= problem.boardSize || r < 0 || r >= problem.boardSize) {
+          return null;
+        }
+        const coord = r * problem.boardSize + c;
+        const isBlack = problem.blackInitialCoords.includes(coord);
+        const isWhite = problem.whiteInitialCoords.includes(coord);
+        const stoneColor = isBlack
+          ? Color.Black
+          : isWhite
+          ? Color.White
+          : expectedTokenColor;
+        return {
+          tokenId: idx,
+          initialCoord: coord,
+          groupIndex: idx,
+          stoneColor,
+        };
+      })
+      .filter((t): t is NonNullable<typeof t> => t !== null);
 
-    const attackerAllowKo =
-      config.attackerAllowKo || Boolean(problem.attackerAllowKo);
-    const defenderAllowKo =
-      problem.defenderAllowKo !== undefined
-        ? problem.defenderAllowKo && config.defenderAllowKo
-        : config.defenderAllowKo;
+    const useProblemDefaults = config.useProblemDefaultKo ?? false;
+    const attackerAllowKo = useProblemDefaults
+      ? Boolean(problem.attackerAllowKo ?? problem.defaultAllowKo)
+      : config.attackerAllowKo;
+    const defenderAllowKo = useProblemDefaults
+      ? problem.defenderAllowKo ?? true
+      : config.defenderAllowKo;
 
     return {
       contextId: `ctx_${problem.id}_${config.koRule}_${attackerGoal}_ako${
@@ -328,6 +370,82 @@ export class DfpnSolver {
     return stateId;
   }
 
+  /**
+   * Prunes unproven df-pn probe scratch states that are never referenced by `proofDagNodes`,
+   * while preserving `stateId = 0` and the complete `parentStateId` replay ancestor chain
+   * of every node and pruned certificate in `proofDagNodes` in strict topological order.
+   */
+  private compactProofStateAndHistoryTables(): void {
+    if (this.stateTable.length <= 1) return;
+    const needed = new Uint8Array(this.stateTable.length);
+    needed[0] = 1;
+
+    const markAncestors = (sid: number) => {
+      let cur = sid;
+      while (cur >= 0 && cur < this.stateTable.length && !needed[cur]) {
+        needed[cur] = 1;
+        cur = this.stateTable[cur].parentStateId;
+      }
+    };
+
+    for (let i = 0; i < this.proofDagNodes.length; i++) {
+      const n = this.proofDagNodes[i];
+      markAncestors(n.stateId);
+      if (n.parentStateId >= 0) markAncestors(n.parentStateId);
+      if (n.prunedCertificate) {
+        markAncestors(n.prunedCertificate.queryStateId);
+        markAncestors(n.prunedCertificate.sourceStateId);
+      }
+    }
+
+    const oldToNewState = new Int32Array(this.stateTable.length).fill(-1);
+    const oldToNewHist = new Int32Array(this.historyTable.length).fill(-1);
+    const newStates: StateTableEntry[] = [];
+    const newHistories: CanonicalSnapshot[][] = [];
+
+    for (let oldId = 0; oldId < this.stateTable.length; oldId++) {
+      if (!needed[oldId]) continue;
+      const st = this.stateTable[oldId];
+      const newSid = newStates.length;
+      oldToNewState[oldId] = newSid;
+
+      let newHid = oldToNewHist[st.historyId];
+      if (newHid < 0) {
+        newHid = newHistories.length;
+        oldToNewHist[st.historyId] = newHid;
+        newHistories.push(this.historyTable[st.historyId]);
+      }
+
+      newStates.push({
+        ...st,
+        stateId: newSid,
+        parentStateId:
+          st.parentStateId < 0 ? -1 : oldToNewState[st.parentStateId],
+        historyId: newHid,
+      });
+    }
+
+    if (newStates.length === this.stateTable.length) return;
+
+    for (let i = 0; i < this.proofDagNodes.length; i++) {
+      const n = this.proofDagNodes[i];
+      n.stateId = oldToNewState[n.stateId];
+      n.historyId = oldToNewHist[n.historyId];
+      n.parentStateId =
+        n.parentStateId < 0 ? -1 : oldToNewState[n.parentStateId];
+      if (n.prunedCertificate) {
+        const pc = n.prunedCertificate;
+        pc.queryStateId = oldToNewState[pc.queryStateId];
+        pc.queryHistoryId = oldToNewHist[pc.queryHistoryId];
+        pc.sourceStateId = oldToNewState[pc.sourceStateId];
+        pc.sourceHistoryId = oldToNewHist[pc.sourceHistoryId];
+      }
+    }
+
+    this.stateTable = newStates;
+    this.historyTable = newHistories;
+  }
+
   // FR-4.10: Fast tactical move ordering & heuristic initial (pn, dn) estimation
   private evaluateCandidateMove(
     pos: GoPosition,
@@ -363,18 +481,28 @@ export class DfpnSolver {
           };
         }
       }
-      // At AND nodes (consecutivePasses === 0), prioritize Null-Move (PASS) early ONLY when
-      // attacker already has >= 2 eye-like pockets so W[pass] proves quickly and prunes moat moves!
-      if (!isOrNode && pos.consecutivePasses === 0 && parentEyeLikeCount >= 2) {
+      // At AND nodes (consecutivePasses === 0), keep Null-Move (PASS) inside the initial window:
+      // #1 priority when attacker already has >= 2 eye-like pockets, or mid-window (#4..#6)
+      // otherwise so W[pass] establishes a compact activeNullMoveRz for OutsideRZRevalidated
+      // across the full 153-point region once urgent tactical refutations fail!
+      if (!isOrNode && pos.consecutivePasses === 0) {
+        if (parentEyeLikeCount >= 2) {
+          return {
+            score: 1650,
+            immediateWin: false,
+            immediateLoss: false,
+            inAttention: true,
+          };
+        }
         return {
-          score: 1650,
+          score: 360,
           immediateWin: false,
           immediateLoss: false,
           inAttention: true,
         };
       }
       return {
-        score: !isOrNode && pos.consecutivePasses === 0 ? -400 : -2500,
+        score: -2500,
         immediateWin: false,
         immediateLoss: false,
         inAttention: false,
@@ -384,6 +512,28 @@ export class DfpnSolver {
     const inAttention = this.activeAttentionMask
       ? this.activeAttentionMask.coords.has(move)
       : true;
+
+    // Fast O(1) path for outer buffer-moat moves (`!inAttention`) that touch no tactical
+    // (non-immortal) stones: prevents outer-wall contact from out-scoring local eye/Null-Move!
+    if (!inAttention) {
+      let touchesTacticalStone = false;
+      const nbs = pos.orthogonalNeighbors(move);
+      for (let i = 0; i < nbs.length; i++) {
+        const nb = nbs[i];
+        if (pos.grid[nb] !== Color.Empty && !pos.immortalWallSet.has(nb)) {
+          touchesTacticalStone = true;
+          break;
+        }
+      }
+      if (!touchesTacticalStone) {
+        return {
+          score: -950,
+          immediateWin: false,
+          immediateLoss: false,
+          inAttention: false,
+        };
+      }
+    }
 
     let score = inAttention ? 150 : -950;
 
@@ -542,12 +692,16 @@ export class DfpnSolver {
     }
 
     const friendlyChainRoots = new Set<number>();
+    let hasTacticalFriendlyAdj = false;
     let friendlyOrthoCount = 0;
     let enemyOrthoCount = 0;
     for (const nb of pos.orthogonalNeighbors(move)) {
       const st = pos.stoneAt(nb);
       if (st === pos.toPlay) {
         friendlyOrthoCount++;
+        if (!pos.immortalWallSet.has(nb)) {
+          hasTacticalFriendlyAdj = true;
+        }
         const ch = pos.floodFillChain(nb);
         if (ch.liberties.size >= 2) {
           friendlyChainRoots.add(Math.min(...Array.from(ch.stones)));
@@ -556,7 +710,7 @@ export class DfpnSolver {
         enemyOrthoCount++;
       }
     }
-    if (friendlyChainRoots.size >= 2) {
+    if (friendlyChainRoots.size >= 2 && hasTacticalFriendlyAdj) {
       score += 860;
     }
 
@@ -567,6 +721,35 @@ export class DfpnSolver {
       if (st === pos.toPlay) friendlyDiagCount++;
       else if (st === enemyColor) enemyDiagCount++;
     }
+    const emptyOrthoNbs = pos
+      .orthogonalNeighbors(move)
+      .filter((n) => pos.stoneAt(n) === Color.Empty);
+    if (emptyOrthoNbs.length >= 2 && inAttention) {
+      // Check if two empty orthogonal neighbors are separated (vital eye-splitting / nakade point!)
+      let splitsEyeCavity = false;
+      for (let i = 0; i < emptyOrthoNbs.length && !splitsEyeCavity; i++) {
+        for (let j = i + 1; j < emptyOrthoNbs.length; j++) {
+          const a = emptyOrthoNbs[i];
+          const b = emptyOrthoNbs[j];
+          const sharedEmpty = pos
+            .orthogonalNeighbors(a)
+            .some(
+              (x) =>
+                x !== move &&
+                pos.stoneAt(x) === Color.Empty &&
+                pos.orthogonalNeighbors(b).includes(x)
+            );
+          if (!sharedEmpty) {
+            splitsEyeCavity = true;
+            break;
+          }
+        }
+      }
+      if (splitsEyeCavity && (friendlyOrthoCount >= 1 || enemyOrthoCount >= 1 || friendlyDiagCount >= 2 || enemyDiagCount >= 2)) {
+        score += 950;
+      }
+    }
+
     if (
       friendlyDiagCount >= 2 &&
       enemyOrthoCount === 0 &&
@@ -586,14 +769,15 @@ export class DfpnSolver {
         }
       }
     } else if (
+      emptyOrthoNbs.length <= 1 &&
       friendlyOrthoCount >= 1 &&
       friendlyChainRoots.size <= 1 &&
       friendlyDiagCount >= 2 &&
       enemyOrthoCount === 0 &&
       enemyDiagCount === 0
     ) {
-      // Pure internal eye space under a single solid chain — avoid self-filling eye base!
-      score -= 240;
+      // Pure 1- or 2-point internal eye space under a single solid chain — avoid self-filling eye!
+      score -= 320;
     }
     if (friendlyOrthoCount >= 1 && enemyOrthoCount >= 1) {
       score += 380;
@@ -630,7 +814,7 @@ export class DfpnSolver {
       if (meta.immediateLoss) return { pn: 180, dn: 1 };
       if (move === PASS_MOVE) return { pn: 220, dn: 1 };
       if (!meta.inAttention) {
-        return { pn: 140 + rankIdx * 4, dn: 1 };
+        return { pn: 2400 + rankIdx * 16, dn: 1 };
       }
       let pn = 1;
       if (rankIdx === 0) pn = 1;
@@ -645,10 +829,10 @@ export class DfpnSolver {
       // AND node: `dn` drives selection of defender refutations; `pn` aggregates proof obligation
       if (meta.immediateLoss) return { pn: 10, dn: 1 };
       if (move === PASS_MOVE) {
-        return meta.inAttention ? { pn: 1, dn: 1 } : { pn: 1, dn: 12 };
+        return meta.score >= 1500 ? { pn: 1, dn: 1 } : { pn: 1, dn: 4 };
       }
       if (!meta.inAttention) {
-        return { pn: 1, dn: 65 + rankIdx * 3 };
+        return { pn: 1, dn: 85 + rankIdx * 3 };
       }
       let dn = 1;
       if (rankIdx === 0) dn = 1;
@@ -682,24 +866,31 @@ export class DfpnSolver {
     let unwrapSafety = 0;
     while (
       sourceNode &&
-      sourceNode.isPrunedOutsideRz &&
+      (sourceNode.isPrunedOutsideRz || sourceNode.isTtHit) &&
       sourceNode.sourceProofNodeId !== null &&
-      unwrapSafety < 16
+      sourceNode.sourceProofNodeId >= 0 &&
+      sourceNode.sourceProofNodeId < sourceNode.nodeId &&
+      unwrapSafety < 32
     ) {
       unwrapSafety++;
       sourceNode = this.proofDagNodes[sourceNode.sourceProofNodeId];
     }
     if (!sourceNode || sourceNode.outcome !== expectedOutcome) return false;
 
-    const term = this.terminalEval.evaluateTerminal(queryPos, context);
-    if (term.status === TerminalStatus.Win) {
-      return expectedOutcome === ProofOutcome.ProvenWin;
-    }
-    if (term.status === TerminalStatus.Loss) {
-      return expectedOutcome === ProofOutcome.ProvenLoss;
-    }
+    const checkEarlyTerminal = (): boolean | null => {
+      const term = this.terminalEval.evaluateTerminal(queryPos, context, false);
+      if (term.status === TerminalStatus.Win) {
+        return expectedOutcome === ProofOutcome.ProvenWin;
+      }
+      if (term.status === TerminalStatus.Loss) {
+        return expectedOutcome === ProofOutcome.ProvenLoss;
+      }
+      return null;
+    };
 
-    if (sourceNode.childNodeIds.length === 0) return false;
+    if (sourceNode.childNodeIds.length === 0 || queryPos.isAtDoublePass()) {
+      return checkEarlyTerminal() === true;
+    }
 
     const isOr = queryPos.toPlay === context.rootAttacker;
     const restrictedSide =
@@ -731,7 +922,7 @@ export class DfpnSolver {
           return true;
         }
       }
-      return false;
+      return checkEarlyTerminal() === true;
     }
 
     // Case 2: Full-coverage node (AND -> ProvenWin, or OR -> ProvenLoss)
@@ -745,14 +936,11 @@ export class DfpnSolver {
     for (const mv of queryLegalMoves) {
       const childDagId = moveMap.get(mv);
       if (childDagId === undefined) {
-        return false;
+        return checkEarlyTerminal() === true;
       }
       const nextPos = queryPos.clone();
       const playRes = nextPos.playMove(mv);
       if (!playRes.legal) continue;
-      if (playRes.isKoCapture && restrictedSide) {
-        return false;
-      }
       if (
         !this.revalidateSourceProofOnQueryState(
           nextPos,
@@ -763,7 +951,7 @@ export class DfpnSolver {
           guardDepth + 1
         )
       ) {
-        return false;
+        return checkEarlyTerminal() === true;
       }
     }
 
@@ -792,8 +980,8 @@ export class DfpnSolver {
     this.numNodes++;
     const isOrNode = pos.toPlay === context.rootAttacker;
 
-    // Step 1 (FR-3.2, FR-3.8): Evaluate Terminal BEFORE InPath cycle check
-    const term = this.terminalEval.evaluateTerminal(pos, context);
+    // Step 1 (FR-3.2, FR-3.8): Evaluate Terminal BEFORE InPath cycle detection
+    const term = this.terminalEval.evaluateTerminal(pos, context, false);
     if (
       term.status === TerminalStatus.Win ||
       term.status === TerminalStatus.Loss
@@ -892,6 +1080,42 @@ export class DfpnSolver {
       };
     }
 
+    const emitTtHitNode = (
+      sourceDagNodeId: number,
+      pn: number,
+      dn: number,
+      outcome: ProofOutcome,
+      proofRz: ProofCertificateRZ,
+      disproofRz: ProofCertificateRZ
+    ): number => {
+      const ttDagId = this.proofDagNodes.length;
+      const stEntry = this.stateTable[currentStateId];
+      this.proofDagNodes.push({
+        nodeId: ttDagId,
+        stateId: currentStateId,
+        historyId: stEntry.historyId,
+        parentStateId: stEntry.parentStateId,
+        isOrNode,
+        toPlay: pos.toPlay,
+        incomingMove,
+        incomingMoveSgf: coordToSgf(incomingMove, pos.boardSize),
+        pn,
+        dn,
+        outcome,
+        terminalEvidence: 'TT_REVALIDATED_REUSE',
+        isPrunedOutsideRz: false,
+        isTtHit: true,
+        isKoDependentBarrier: false,
+        sourceProofNodeId: sourceDagNodeId,
+        proofRzCoords: proofRz.toArray(),
+        disproofRzCoords: disproofRz.toArray(),
+        childNodeIds: [],
+        childMoves: [],
+      });
+      this.dagHasCapture.push(Boolean(this.dagHasCapture[sourceDagNodeId]));
+      return ttDagId;
+    };
+
     // Step 4 (FR-6.1, FR-6.3, FR-6.9): History-safe BoardTT & PatternTT lookup
     const boardHit = this.ttStore.lookupBoardTT(
       pos,
@@ -908,8 +1132,17 @@ export class DfpnSolver {
     if (
       boardHit &&
       boardHit.outcome !== ProofOutcome.Unknown &&
-      boardHit.proofClosureAvailable
+      boardHit.proofClosureAvailable &&
+      boardHit.proofDagNodeId >= 0
     ) {
+      const ttNodeId = emitTtHitNode(
+        boardHit.proofDagNodeId,
+        boardHit.pn,
+        boardHit.dn,
+        boardHit.outcome,
+        boardHit.proofRz,
+        boardHit.disproofRz
+      );
       return {
         pn: boardHit.pn,
         dn: boardHit.dn,
@@ -917,13 +1150,25 @@ export class DfpnSolver {
         koDependent: false,
         proofRz: boardHit.proofRz,
         disproofRz: boardHit.disproofRz,
-        dagNodeId: boardHit.proofDagNodeId,
+        dagNodeId: ttNodeId,
       };
     }
 
     if (this.config.ttMode === 'pattern-tt') {
       const patHit = this.ttStore.lookupPatternTT(pos, context);
-      if (patHit.grade === 'PROOF_REUSABLE' && patHit.record) {
+      if (
+        patHit.grade === 'PROOF_REUSABLE' &&
+        patHit.record &&
+        patHit.record.proofDagNodeId >= 0
+      ) {
+        const ttNodeId = emitTtHitNode(
+          patHit.record.proofDagNodeId,
+          patHit.record.pn,
+          patHit.record.dn,
+          patHit.record.outcome,
+          patHit.record.storedRz,
+          patHit.record.storedRz
+        );
         return {
           pn: patHit.record.pn,
           dn: patHit.record.dn,
@@ -931,7 +1176,7 @@ export class DfpnSolver {
           koDependent: false,
           proofRz: patHit.record.storedRz,
           disproofRz: patHit.record.storedRz,
-          dagNodeId: patHit.record.proofDagNodeId,
+          dagNodeId: ttNodeId,
         };
       }
       if (
@@ -948,6 +1193,14 @@ export class DfpnSolver {
         )
       ) {
         this.ttStore.patternProofReusableHits++;
+        const ttNodeId = emitTtHitNode(
+          patHit.record.proofDagNodeId,
+          patHit.record.pn,
+          patHit.record.dn,
+          patHit.record.outcome,
+          patHit.record.storedRz,
+          patHit.record.storedRz
+        );
         return {
           pn: patHit.record.pn,
           dn: patHit.record.dn,
@@ -955,13 +1208,15 @@ export class DfpnSolver {
           koDependent: false,
           proofRz: patHit.record.storedRz,
           disproofRz: patHit.record.storedRz,
-          dagNodeId: patHit.record.proofDagNodeId,
+          dagNodeId: ttNodeId,
         };
       }
     }
 
-    // Step 5: Lookup or initialize cached frontier node for persistent DFPN bounds
-    const frontierKey = `${zHex}:${pos.toPlay}:${pos.koPoint}:${pos.consecutivePasses}:${pos.survivingTargetTokensMask}`;
+    // Step 5: Lookup or initialize history-isolated cached frontier node for persistent DFPN bounds.
+    // Includes `computeCanonicalHistoryKey()` so SSK/PSK histories never share cached child outcomes!
+    const historyKey = pos.computeCanonicalHistoryKey();
+    const frontierKey = `${zHex}:${pos.toPlay}:${pos.koPoint}:${pos.consecutivePasses}:${pos.survivingTargetTokensMask}:${historyKey}`;
     let frontier = this.nodeFrontierCache.get(frontierKey);
     if (!frontier) {
       const parentShape =
@@ -1044,9 +1299,11 @@ export class DfpnSolver {
     while (true) {
       const totalLegal = children.length;
       let windowSize = totalLegal;
-      if (this.config.enableProgressiveWidening && frontier.wideningLevel < 4) {
-        const cap =
-          this.config.wideningBaseK * Math.pow(2, frontier.wideningLevel);
+      if (this.config.enableProgressiveWidening && frontier.wideningLevel < 6) {
+        const baseK = isOrNode
+          ? this.config.wideningBaseK
+          : Math.max(4, Math.floor(this.config.wideningBaseK / 2));
+        const cap = baseK * Math.pow(2, frontier.wideningLevel);
         if (cap < totalLegal) windowSize = cap;
       }
 
@@ -1167,11 +1424,19 @@ export class DfpnSolver {
         }
       }
 
-      // FR-4.1: Frontier PN/DN aggregation without breadth-exploding unexpanded sum inflation
+      // FR-4.1: Frontier PN/DN aggregation with consistent progressive-widening trigger
       const unexpandedU = Math.max(0, totalLegal - windowSize);
+      const widenTrigger =
+        unexpandedU > 0
+          ? Math.max(
+              isOrNode ? children[windowSize].pn : children[windowSize].dn,
+              (isOrNode ? 14 : 10) * (frontier.wideningLevel + 1)
+            )
+          : PN_DN_SATURATION;
       let curPn = 1;
       let curDn = 1;
 
+      let forceExpandPassIdx = -1;
       if (isOrNode) {
         let minPn = PN_DN_SATURATION;
         let windowSumDn = 0;
@@ -1180,11 +1445,12 @@ export class DfpnSolver {
           windowSumDn = clampSat(windowSumDn + children[i].dn);
         }
         if (unexpandedU > 0) {
-          minPn = Math.min(minPn, children[windowSize].pn);
+          minPn = Math.min(minPn, widenTrigger);
         }
-        // If every child in the current window is refuted (windowSumDn === 0) and more moves exist, widen immediately!
         if (windowSumDn === 0 && windowSize < totalLegal) {
-          frontier.wideningLevel++;
+          frontier.wideningLevel = frontier.activeNullMoveRz
+            ? 6
+            : frontier.wideningLevel + 1;
           this.wideningUpgrades++;
           continue;
         }
@@ -1198,16 +1464,30 @@ export class DfpnSolver {
           minDn = Math.min(minDn, children[i].dn);
         }
         if (unexpandedU > 0) {
-          minDn = Math.min(minDn, children[windowSize].dn);
+          minDn = Math.min(minDn, widenTrigger);
         }
-        // If every child in the current window is proven (windowSumPn === 0) and more moves exist, widen immediately!
         if (windowSumPn === 0 && windowSize < totalLegal) {
-          frontier.wideningLevel++;
-          this.wideningUpgrades++;
-          continue;
+          // Before widening across the full 153-point region, ensure Null-Move (PASS_MOVE)
+          // has been expanded first if legal, so `activeNullMoveRz` carries a stone-free
+          // tenuki certificate capable of OutsideRZRevalidated-pruning the outer moat!
+          const passIdx = children.findIndex(
+            (c) => c.move === PASS_MOVE && !c.expanded && !c.koDependent
+          );
+          if (passIdx >= 0 && this.config.enableRzPruning) {
+            forceExpandPassIdx = passIdx;
+            curPn = 1;
+            curDn = Math.max(1, children[passIdx].dn);
+          } else {
+            frontier.wideningLevel = frontier.activeNullMoveRz
+              ? 6
+              : frontier.wideningLevel + 1;
+            this.wideningUpgrades++;
+            continue;
+          }
+        } else {
+          curPn = clampSat(windowSumPn + (unexpandedU > 0 ? 1 : 0));
+          curDn = minDn;
         }
-        curPn = clampSat(windowSumPn + (unexpandedU > 0 ? 1 : 0));
-        curDn = minDn;
       }
 
       // Check asymmetric decisive completion conditions (FR-4.2)
@@ -1356,34 +1636,32 @@ export class DfpnSolver {
       let bestMetric = PN_DN_SATURATION;
       let secondBestMetric = PN_DN_SATURATION;
 
-      for (let i = 0; i < windowSize; i++) {
-        if (children[i].koDependent) continue;
-        const m = isOrNode ? children[i].pn : children[i].dn;
-        if (m < bestMetric) {
-          secondBestMetric = bestMetric;
-          bestMetric = m;
-          bestIdx = i;
-        } else if (m < secondBestMetric) {
-          secondBestMetric = m;
+      if (forceExpandPassIdx >= 0) {
+        bestIdx = forceExpandPassIdx;
+        bestMetric = children[forceExpandPassIdx].dn;
+        secondBestMetric = PN_DN_SATURATION;
+      } else {
+        for (let i = 0; i < windowSize; i++) {
+          if (children[i].koDependent) continue;
+          const m = isOrNode ? children[i].pn : children[i].dn;
+          if (m < bestMetric) {
+            secondBestMetric = bestMetric;
+            bestMetric = m;
+            bestIdx = i;
+          } else if (m < secondBestMetric) {
+            secondBestMetric = m;
+          }
         }
-      }
 
-      // Progressive Widening upgrade condition: only widen when all candidates in the active
-      // window exceed both the next unexpanded move's initial metric and the depth-focus threshold.
-      if (unexpandedU > 0) {
-        const nextUnexpandedMetric = isOrNode
-          ? children[windowSize].pn
-          : children[windowSize].dn;
-        const depthFocusFloor = isOrNode
-          ? 14 * (frontier.wideningLevel + 1)
-          : 10 * (frontier.wideningLevel + 1);
-        const widenTrigger = Math.max(nextUnexpandedMetric, depthFocusFloor);
-        if (bestIdx < 0 || bestMetric >= widenTrigger) {
-          frontier.wideningLevel++;
-          this.wideningUpgrades++;
-          continue;
+        // Progressive Widening upgrade condition: widen as soon as active window reaches widenTrigger
+        if (unexpandedU > 0) {
+          if (bestIdx < 0 || bestMetric >= widenTrigger) {
+            frontier.wideningLevel++;
+            this.wideningUpgrades++;
+            continue;
+          }
+          secondBestMetric = Math.min(secondBestMetric, widenTrigger);
         }
-        secondBestMetric = Math.min(secondBestMetric, widenTrigger);
       }
 
       if (bestIdx < 0 || bestMetric >= PN_DN_SATURATION) {
@@ -1562,7 +1840,7 @@ export class DfpnSolver {
     while (curNode && curNode.childNodeIds.length > 0 && safety < 24) {
       safety++;
       if (
-        curNode.isPrunedOutsideRz &&
+        (curNode.isPrunedOutsideRz || curNode.isTtHit) &&
         curNode.sourceProofNodeId !== null &&
         this.proofDagNodes[curNode.sourceProofNodeId]
       ) {

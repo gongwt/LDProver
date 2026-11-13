@@ -113,6 +113,7 @@ export interface SolverConfig {
   koRule: KoRule;
   attackerAllowKo: boolean;
   defenderAllowKo: boolean;
+  useProblemDefaultKo?: boolean;
 }
 
 export interface PrunedCertificateRecord {
@@ -169,6 +170,14 @@ export interface StateTableEntry {
 export interface SolveReport {
   problemId: string;
   problemTitle: string;
+  boardSize: number;
+  firstToPlay: Color;
+  blackInitialCoords: number[];
+  whiteInitialCoords: number[];
+  immortalWallCoords: number[];
+  regionCoords: number[];
+  rawRegionPointCount?: number;
+  isFullRegionSearch?: boolean;
   inputHash: string;
   configFingerprint: string;
   solverVersion: string;
@@ -267,6 +276,7 @@ export interface TsumegoProblemSpec {
   attackerAllowKo?: boolean;
   defenderAllowKo?: boolean;
   regionCoords: number[];
+  rawRegionCoords?: number[];
   attentionCoords?: number[];
   blackInitialCoords: number[];
   whiteInitialCoords: number[];
@@ -280,6 +290,14 @@ export interface TsumegoProblemSpec {
   verifiedGroundTruthFirstMoves?: string[];
   refutationFirstMoves?: string[];
   groundTruthNote?: string;
+  d8SymmetryAudit?: {
+    d8Index: number;
+    matchedStones: number;
+    totalRawStones: number;
+    missingInMaskedSgf: string[];
+    extraInMaskedRegion: string[];
+    isExactBijection: boolean;
+  };
   referencePv?: {
     move: number;
     sgf: string;

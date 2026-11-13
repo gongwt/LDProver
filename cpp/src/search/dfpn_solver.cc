@@ -26,6 +26,8 @@ SolveReport<N> DfpnSolver<N>::Solve(
   // FR-6.2: Clear BoardTT and PatternTT at the start of every problem.
   tt_store_.ClearAll();
   report_ = SolveReport<N>{};
+  report_.input_hash = initial_pos.ZobristHash();
+  report_.region_hint = region_hint;
 
   Position<N> work_pos = initial_pos;
   std::unordered_set<uint64_t> in_path_hashes;
@@ -41,10 +43,40 @@ SolveReport<N> DfpnSolver<N>::Solve(
     report_.unknown_reason = UnknownReason::kKoDependent;
   }
 
+  // Extract principal variation when proven.
+  if (report_.root_status != ProofOutcome::kUnknown &&
+      report_.root_dag_node_id < report_.proof_dag_nodes.size()) {
+    uint32_t cur_id = report_.root_dag_node_id;
+    for (int step = 0; step < 64 && cur_id < report_.proof_dag_nodes.size();
+         ++step) {
+      const auto& cur = report_.proof_dag_nodes[cur_id];
+      if ((cur.is_pruned_outside_rz || cur.is_tt_hit) &&
+          cur.source_proof_node_id < cur.node_id) {
+        cur_id = cur.source_proof_node_id;
+        continue;
+      }
+      if (cur.child_node_ids.empty()) break;
+      int chosen = -1;
+      for (size_t i = 0; i < cur.child_node_ids.size(); ++i) {
+        if (report_.proof_dag_nodes[cur.child_node_ids[i]].outcome ==
+            cur.outcome) {
+          chosen = static_cast<int>(i);
+          if (cur.child_moves[i] != kPassMove) break;
+        }
+      }
+      if (chosen < 0) break;
+      report_.principal_variation.push_back(cur.child_moves[chosen]);
+      cur_id = cur.child_node_ids[chosen];
+    }
+  }
+
   report_.board_tt_hits = tt_store_.BoardHits();
   report_.pattern_tt_hits = tt_store_.PatternHits();
   report_.pattern_proof_reusable = tt_store_.PatternProofReusableHits();
-  report_.rz_size_at_root = report_.root_proof_rz.Size();
+  report_.rz_size_at_root =
+      (report_.root_status == ProofOutcome::kProvenWin)
+          ? report_.root_proof_rz.Size()
+          : report_.root_disproof_rz.Size();
   return report_;
 }
 
@@ -123,10 +155,11 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
   }
 
   uint32_t resolved_id = source_dag_node_id;
-  for (int hop = 0; hop < 16 && resolved_id < report_.proof_dag_nodes.size();
+  for (int hop = 0; hop < 32 && resolved_id < report_.proof_dag_nodes.size();
        ++hop) {
     const auto& cur = report_.proof_dag_nodes[resolved_id];
-    if (!cur.is_pruned_outside_rz) break;
+    if (!cur.is_pruned_outside_rz && !cur.is_tt_hit) break;
+    if (cur.source_proof_node_id >= cur.node_id) return false;
     resolved_id = cur.source_proof_node_id;
   }
   if (resolved_id >= report_.proof_dag_nodes.size()) return false;
@@ -225,6 +258,7 @@ void DfpnSolver<N>::MidSearch(
     ProofDagNode<N> dag_node;
     dag_node.node_id = static_cast<uint32_t>(report_.proof_dag_nodes.size());
     dag_node.is_or_node = is_or_node;
+    dag_node.to_play = pos.ToPlay();
     dag_node.incoming_move = incoming_move;
     dag_node.pn = *out_pn;
     dag_node.dn = *out_dn;
@@ -267,15 +301,73 @@ void DfpnSolver<N>::MidSearch(
     return;
   }
 
-  // Step 4 (FR-6.1, FR-6.9): History-safe BoardTT lookup.
+  auto emit_tt_hit_node = [&](uint32_t src_dag_id, uint32_t pn, uint32_t dn,
+                              ProofOutcome outcome,
+                              const ProofCertificateRZ<N>& p_rz,
+                              const ProofCertificateRZ<N>& d_rz) {
+    ProofDagNode<N> tt_node;
+    tt_node.node_id = static_cast<uint32_t>(report_.proof_dag_nodes.size());
+    tt_node.is_or_node = is_or_node;
+    tt_node.to_play = pos.ToPlay();
+    tt_node.incoming_move = incoming_move;
+    tt_node.pn = pn;
+    tt_node.dn = dn;
+    tt_node.outcome = outcome;
+    tt_node.is_tt_hit = true;
+    tt_node.source_proof_node_id = src_dag_id;
+    tt_node.proof_rz = p_rz;
+    tt_node.disproof_rz = d_rz;
+    report_.proof_dag_nodes.push_back(tt_node);
+    return tt_node.node_id;
+  };
+
+  // Step 4 (FR-6.1, FR-6.3, FR-6.9): History-safe BoardTT & PatternTT lookup.
   if (auto hit = tt_store_.LookupBoardTT(pos, context); hit.has_value()) {
-    if (hit->outcome != ProofOutcome::kUnknown && hit->proof_closure_available) {
+    if (hit->outcome != ProofOutcome::kUnknown &&
+        hit->proof_closure_available &&
+        hit->proof_dag_node_id < report_.proof_dag_nodes.size()) {
       *out_pn = hit->pn;
       *out_dn = hit->dn;
       *out_outcome = hit->outcome;
       *out_proof_rz = hit->proof_rz;
       *out_disproof_rz = hit->disproof_rz;
-      *out_dag_node_id = hit->proof_dag_node_id;
+      *out_dag_node_id = emit_tt_hit_node(
+          hit->proof_dag_node_id, hit->pn, hit->dn, hit->outcome,
+          hit->proof_rz, hit->disproof_rz);
+      return;
+    }
+  }
+
+  if (config_.enable_pattern_tt) {
+    RadixPatternRecord<N> pat_rec;
+    const PatternHitGrade grade =
+        tt_store_.LookupPatternTT(pos, context, &pat_rec);
+    if (grade == PatternHitGrade::kProofReusable &&
+        pat_rec.proof_dag_node_id < report_.proof_dag_nodes.size()) {
+      *out_pn = pat_rec.pn;
+      *out_dn = pat_rec.dn;
+      *out_outcome = pat_rec.outcome;
+      *out_proof_rz = pat_rec.stored_rz;
+      *out_disproof_rz = pat_rec.stored_rz;
+      *out_dag_node_id = emit_tt_hit_node(
+          pat_rec.proof_dag_node_id, pat_rec.pn, pat_rec.dn, pat_rec.outcome,
+          pat_rec.stored_rz, pat_rec.stored_rz);
+      return;
+    }
+    if (grade == PatternHitGrade::kHeuristicOnly &&
+        pat_rec.proof_closure_available &&
+        pat_rec.proof_dag_node_id < report_.proof_dag_nodes.size() &&
+        RevalidateSourceProofOnQueryState(
+            pos, context, region_hint, pat_rec.proof_dag_node_id,
+            pat_rec.outcome)) {
+      *out_pn = pat_rec.pn;
+      *out_dn = pat_rec.dn;
+      *out_outcome = pat_rec.outcome;
+      *out_proof_rz = pat_rec.stored_rz;
+      *out_disproof_rz = pat_rec.stored_rz;
+      *out_dag_node_id = emit_tt_hit_node(
+          pat_rec.proof_dag_node_id, pat_rec.pn, pat_rec.dn, pat_rec.outcome,
+          pat_rec.stored_rz, pat_rec.stored_rz);
       return;
     }
   }
@@ -348,18 +440,35 @@ void DfpnSolver<N>::MidSearch(
               RevalidateSourceProofOnQueryState(
                   next_pos, context, region_hint, representative_dag_id,
                   representative_outcome)) {
+            ProofDagNode<N> pruned_node;
+            pruned_node.node_id =
+                static_cast<uint32_t>(report_.proof_dag_nodes.size());
+            pruned_node.is_or_node = !is_or_node;
+            pruned_node.to_play = next_pos.ToPlay();
+            pruned_node.incoming_move = ch.move;
+            pruned_node.pn =
+                (representative_outcome == ProofOutcome::kProvenWin)
+                    ? 0
+                    : kPnDnSaturation;
+            pruned_node.dn =
+                (representative_outcome == ProofOutcome::kProvenWin)
+                    ? kPnDnSaturation
+                    : 0;
+            pruned_node.outcome = representative_outcome;
+            pruned_node.is_pruned_outside_rz = true;
+            pruned_node.source_proof_node_id = representative_dag_id;
+            pruned_node.proof_rz = active_null_move_rz;
+            pruned_node.disproof_rz = active_null_move_rz;
+            report_.proof_dag_nodes.push_back(pruned_node);
+
             ch.expanded = true;
             ch.pruned_outside_rz = true;
             ch.outcome = representative_outcome;
-            ch.pn = (representative_outcome == ProofOutcome::kProvenWin)
-                        ? 0
-                        : kPnDnSaturation;
-            ch.dn = (representative_outcome == ProofOutcome::kProvenWin)
-                        ? kPnDnSaturation
-                        : 0;
+            ch.pn = pruned_node.pn;
+            ch.dn = pruned_node.dn;
             ch.proof_rz = active_null_move_rz;
             ch.disproof_rz = active_null_move_rz;
-            ch.dag_node_id = representative_dag_id;
+            ch.dag_node_id = pruned_node.node_id;
             ++report_.pruned_outside_rz_count;
           }
         }
@@ -369,6 +478,12 @@ void DfpnSolver<N>::MidSearch(
     // FR-4.1: Frontier PN/DN aggregation without breadth-exploding sum inflation.
     const size_t unexpanded_u =
         (total_legal > window_size) ? (total_legal - window_size) : 0;
+    const uint32_t widen_trigger =
+        (unexpanded_u > 0)
+            ? std::max(is_or_node ? children[window_size].pn
+                                  : children[window_size].dn,
+                       8U * (widening_level + 1U))
+            : kPnDnSaturation;
     uint32_t cur_pn = 1;
     uint32_t cur_dn = 1;
 
@@ -380,7 +495,7 @@ void DfpnSolver<N>::MidSearch(
         sum_dn += children[i].dn;
       }
       if (unexpanded_u > 0) {
-        min_pn = std::min(min_pn, children[window_size].pn);
+        min_pn = std::min(min_pn, widen_trigger);
       }
       if (sum_dn == 0 && window_size < total_legal) {
         ++widening_level;
@@ -397,7 +512,7 @@ void DfpnSolver<N>::MidSearch(
         min_dn = std::min(min_dn, children[i].dn);
       }
       if (unexpanded_u > 0) {
-        min_dn = std::min(min_dn, children[window_size].dn);
+        min_dn = std::min(min_dn, widen_trigger);
       }
       if (sum_pn == 0 && window_size < total_legal) {
         ++widening_level;
@@ -456,6 +571,7 @@ void DfpnSolver<N>::MidSearch(
       ProofDagNode<N> dag_node;
       dag_node.node_id = static_cast<uint32_t>(report_.proof_dag_nodes.size());
       dag_node.is_or_node = is_or_node;
+      dag_node.to_play = pos.ToPlay();
       dag_node.incoming_move = incoming_move;
       dag_node.pn = *out_pn;
       dag_node.dn = *out_dn;
@@ -474,6 +590,13 @@ void DfpnSolver<N>::MidSearch(
       tt_store_.StoreBoardTT(pos, context, *out_pn, *out_dn, *out_outcome,
                              *out_ko_dependent, true, *out_dag_node_id,
                              *out_proof_rz, *out_disproof_rz);
+      if (config_.enable_pattern_tt) {
+        const ProofCertificateRZ<N>& active_rz =
+            (*out_outcome == ProofOutcome::kProvenWin) ? *out_proof_rz
+                                                       : *out_disproof_rz;
+        tt_store_.StorePatternTT(pos, context, active_rz, *out_pn, *out_dn,
+                                 *out_outcome, *out_dag_node_id, true);
+      }
       break;
     }
 
@@ -505,10 +628,6 @@ void DfpnSolver<N>::MidSearch(
 
     // Progressive Widening upgrade condition (FR-4.4).
     if (unexpanded_u > 0) {
-      const uint32_t next_unexpanded_metric =
-          is_or_node ? children[window_size].pn : children[window_size].dn;
-      const uint32_t widen_trigger =
-          std::max(next_unexpanded_metric, 8U * (widening_level + 1U));
       if (best_idx < 0 || best_metric >= widen_trigger) {
         ++widening_level;
         ++report_.widening_upgrades;

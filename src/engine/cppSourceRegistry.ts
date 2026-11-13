@@ -51,7 +51,7 @@ export const CPP_SOURCE_FILES: CppSourceFileItem[] = [
     moduleName: 'ldprover_core (Header)',
     srsTracing: 'FR-2.1..2.6',
     googleStyleNotes:
-      'Position<N> class interface with snake_case_ private members, PascalCase methods, const-correctness, and explicit constructors.',
+      'Position<N> class interface with OrthogonalNeighbors & DiagonalNeighbors, ImmortalWall bitboard, snake_case_ private members, and const-correctness.',
     content: positionHeaderRaw,
   },
   {
@@ -59,7 +59,7 @@ export const CPP_SOURCE_FILES: CppSourceFileItem[] = [
     moduleName: 'ldprover_core (Impl)',
     srsTracing: 'FR-2.1..2.6',
     googleStyleNotes:
-      'SplitMix64 deterministic Zobrist table, incremental PlayMove/UndoMove, SSK/PSK full BitBoard HistorySet comparison, and non-revivable surviving_target_tokens_mask_.',
+      'SplitMix64 deterministic Zobrist table, OrthogonalNeighbors/DiagonalNeighbors, PlayMove/UndoMove, SSK/PSK full BitBoard HistorySet comparison, and non-revivable surviving_target_tokens_mask_.',
     content: positionCcRaw,
   },
   {
@@ -67,7 +67,7 @@ export const CPP_SOURCE_FILES: CppSourceFileItem[] = [
     moduleName: 'ldprover_core (Parser Header)',
     srsTracing: 'FR-1.1..1.3',
     googleStyleNotes:
-      'Strict tsumego/*.json contract parser interface; forbids synthetic pass insertion on turn_color conflict.',
+      'Strict tsumego/*.json contract parser (ParseTsumegoJson & ParseTsumegoJsonObject); forbids synthetic pass insertion on turn_color conflict.',
     content: parserHeaderRaw,
   },
   {
@@ -75,7 +75,7 @@ export const CPP_SOURCE_FILES: CppSourceFileItem[] = [
     moduleName: 'ldprover_core (Parser Impl)',
     srsTracing: 'FR-1.1..1.3',
     googleStyleNotes:
-      'Validates required fields, rejects mixed & and | operators in crucial_stone, and enforces TurnConflictPolicy.',
+      'Parses AB/AW SGF setup, full region BitBoard, outer ImmortalWall, crucial_stone presence & color validation on board, and strict TurnConflictPolicy.',
     content: parserCcRaw,
   },
   {
@@ -155,7 +155,7 @@ export const CPP_SOURCE_FILES: CppSourceFileItem[] = [
     moduleName: 'ldprover_proof (Impl)',
     srsTracing: 'FR-8.1..8.4 / FR-9.1..9.3',
     googleStyleNotes:
-      'lproof/1 JSON DAG serializer, SGF exporter, and independent ProofChecker enforcing LP-N15, LP-T02, full-coverage/witness invariants, and Classic Benson leaf EvaluateTerminal.',
+      'Self-contained lproof/1 serializer (RFC 8785 JCS + FIPS 180-4 SHA-256), standalone VerifyLProofJsonString, and full-DAG zero-trust VerifyProofDag rejecting self-referenced prunes and incomplete universal nodes.',
     content: checkerCcRaw,
   },
   {
@@ -163,7 +163,7 @@ export const CPP_SOURCE_FILES: CppSourceFileItem[] = [
     moduleName: 'tprover CLI',
     srsTracing: 'FR-10.1..10.3',
     googleStyleNotes:
-      'CLI subcommands solve, check, and bench with strict exit code contract (0, 2, 3).',
+      'End-to-end CLI subcommands solve, check, and bench wired to ProblemContractParser, DfpnSolver, and ProofArtifactManager with strict exit code contract (0, 2, 3).',
     content: cliMainCcRaw,
   },
 ];

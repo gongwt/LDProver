@@ -37,26 +37,31 @@ class ProofArtifactManager {
  public:
   ProofArtifactManager() = default;
 
-  // FR-8.3: Serialize SolveReport into canonical lproof/1 JSON DAG with
-  // stateTable, historyTable, rzTable, post-order node IDs, and JCS checksum.
+  // FR-8.3: Serialize SolveReport into self-contained canonical lproof/1 JSON
+  // DAG with post-order node IDs and RFC 8785 JCS FIPS 180-4 SHA-256 checksum.
   std::string SerializeLProofJson(const Position<N>& initial_pos,
                                   const ProofContext& context,
                                   const SolveReport<N>& report,
                                   std::string* out_checksum = nullptr) const;
 
-  // FR-8.2: Generate SGF solution tree with RZ color annotations
-  // (Green = proof RZ, Red = winning move, Yellow = disproof RZ, Gray = pruned).
+  // FR-8.2: Generate SGF solution tree with RZ annotations.
   std::string ExportSolutionTreeSgf(const Position<N>& initial_pos,
                                     const ProofContext& context,
                                     const SolveReport<N>& report) const;
 
-  // FR-9.1, FR-9.2, FR-9.3: Independent Proof Checker.
-  // Replays initialTrace, verifies every state transition, SSK/PSK HistorySet,
-  // Benson UCA / token capture terminal evidence, AND full response coverage,
-  // and OutsideRZRevalidated certificates without invoking search code.
+  // FR-9.1, FR-9.2, FR-9.3: Zero-trust Independent Proof Checker.
+  // Replays every reachable state transition from `initial_pos`, verifies
+  // SSK/PSK HistorySet, Benson UCA / token capture terminal evidence at leaves,
+  // complete legal-move coverage at universal nodes, and full recursive
+  // semantic replay of OutsideRZRevalidated / TT certificates.
   VerificationReport VerifyProofDag(const Position<N>& initial_pos,
                                     const ProofContext& context,
                                     const SolveReport<N>& report) const;
+
+  // Standalone process-independent verifier reconstructing initial Position<N>,
+  // ProofContext, and SolveReport<N> strictly from a serialized `.lproof.json`
+  // text payload and validating its RFC 8785 JCS SHA-256 checksum + full DAG.
+  VerificationReport VerifyLProofJsonString(const std::string& json_text) const;
 };
 
 }  // namespace ldprover

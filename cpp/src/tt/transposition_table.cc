@@ -78,16 +78,34 @@ void TranspositionStore<N>::StoreBoardTT(
   // FR-5.7: KoDependent states must never be stored as decisive proof entries.
   if (is_ko_dependent && outcome != ProofOutcome::kUnknown) return;
 
+  auto history_sets_equal = [&](const std::vector<CanonicalSnapshot<N>>& a,
+                                const std::vector<CanonicalSnapshot<N>>& b) {
+    if (context.ko_rule == KoRule::kSimpleKoOnly) return true;
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+      bool found = false;
+      for (size_t j = 0; j < b.size(); ++j) {
+        if (a[i].MatchesUnderRule(b[j], context.ko_rule)) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) return false;
+    }
+    return true;
+  };
+
   auto& bucket = board_buckets_[pos.ZobristHash()];
   for (auto& existing : bucket) {
     if (existing.proof_context_id == context.context_id &&
+        existing.full_context == context &&
         existing.to_play == pos.ToPlay() &&
         existing.ko_point == pos.KoPoint() &&
         existing.consecutive_passes == pos.ConsecutivePasses() &&
         existing.surviving_tokens_mask == pos.SurvivingTargetTokensMask() &&
         existing.black_stones == pos.Stones(Color::kBlack) &&
         existing.white_stones == pos.Stones(Color::kWhite) &&
-        existing.history_snapshots.size() == pos.HistorySnapshots().size()) {
+        history_sets_equal(existing.history_snapshots, pos.HistorySnapshots())) {
       existing.pn = pn;
       existing.dn = dn;
       existing.outcome = outcome;
@@ -159,20 +177,34 @@ PatternHitGrade TranspositionStore<N>::LookupPatternTT(
     if (out_record != nullptr) *out_record = rec;
 
     // Two-grade classification (FR-6.3, FR-6.9):
-    // ProofReuse requires full canonical HistorySet equality and closure.
+    // Direct kProofReusable requires full-board equality AND full canonical
+    // HistorySet equality; any outside-zone stone difference returns
+    // kHeuristicOnly so DfpnSolver executes RevalidateSourceProofOnQueryState!
+    const bool full_board_equal =
+        (stored_curr.black_stones == pos.Stones(Color::kBlack)) &&
+        (stored_curr.white_stones == pos.Stones(Color::kWhite)) &&
+        (rec.ko_point == pos.KoPoint());
     const auto& q_hist = pos.HistorySnapshots();
     bool full_hist_equal = (q_hist.size() == rec.history_snapshots.size());
     if (full_hist_equal && context.ko_rule != KoRule::kSimpleKoOnly) {
       for (size_t i = 0; i < q_hist.size(); ++i) {
-        if (!q_hist[i].MatchesUnderRule(rec.history_snapshots[i],
-                                        context.ko_rule)) {
+        bool found = false;
+        for (size_t j = 0; j < rec.history_snapshots.size(); ++j) {
+          if (q_hist[i].MatchesUnderRule(rec.history_snapshots[j],
+                                         context.ko_rule)) {
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
           full_hist_equal = false;
           break;
         }
       }
     }
 
-    if (full_hist_equal && rec.proof_closure_available && !rec.ghi_flag) {
+    if (full_board_equal && full_hist_equal && rec.proof_closure_available &&
+        !rec.ghi_flag) {
       ++pattern_proof_reusable_hits_;
       return PatternHitGrade::kProofReusable;
     }

@@ -35,6 +35,7 @@ import {
   parseStudyLdRzJsonToProblemSpec,
   RawStudyLdRzProblemJson,
   STUDY_LD_RZ_FAILURE_TAXONOMY,
+  validateStudyLdRzContract,
 } from './engine/studyLdRzCatalog';
 import { ProofArtifactManager } from './engine/proofChecker';
 import {
@@ -78,19 +79,27 @@ export default function App() {
   const [isFetchingGithub, setIsFetchingGithub] = useState<boolean>(false);
 
   // Solver Configuration State (FR-4, FR-5, FR-6, FR-7)
-  const [solverConfig, setSolverConfig] = useState<SolverConfig>({
-    maxNodes: 2500,
-    maxDepth: 48,
-    memoryBudgetMb: 512,
-    ttMode: 'pattern-tt',
-    enableRzPruning: true,
-    enableFastCaptureOrdering: true,
-    enableProgressiveWidening: true,
-    wideningBaseK: 8,
-    deterministicMode: true,
-    koRule: KoRule.SituationalSuperko,
-    attackerAllowKo: false,
-    defenderAllowKo: true,
+  // Initialized from the default problem's ko contract with `useProblemDefaultKo: false`
+  // so interactive checkbox toggles work bidirectionally (both true -> false and false -> true).
+  const [solverConfig, setSolverConfig] = useState<SolverConfig>(() => {
+    const firstProb = TSUMEGO_PROBLEMS_CATALOG[0];
+    return {
+      maxNodes: 3500,
+      maxDepth: 48,
+      memoryBudgetMb: 512,
+      ttMode: 'pattern-tt',
+      enableRzPruning: true,
+      enableFastCaptureOrdering: true,
+      enableProgressiveWidening: true,
+      wideningBaseK: 8,
+      deterministicMode: true,
+      koRule: KoRule.SituationalSuperko,
+      attackerAllowKo: Boolean(
+        firstProb.attackerAllowKo ?? firstProb.defaultAllowKo
+      ),
+      defenderAllowKo: firstProb.defenderAllowKo ?? true,
+      useProblemDefaultKo: false,
+    };
   });
 
   // Board Viewport & Overlay State
@@ -103,6 +112,8 @@ export default function App() {
   );
   const [pvStepIndex, setPvStepIndex] = useState<number | null>(null);
   const [manualMoves, setManualMoves] = useState<number[]>([]);
+  const [solveManualSubposition, setSolveManualSubposition] =
+    useState<boolean>(false);
   const [statusToast, setStatusToast] = useState<string | null>(null);
 
   // C++ Source Browser State
@@ -116,7 +127,11 @@ export default function App() {
 
   // Contract Parser Test State (FR-1.1..1.3)
   const [contractPreset, setContractPreset] = useState<
-    'valid' | 'turn-conflict' | 'mixed-op' | 'empty-crucial'
+    | 'valid'
+    | 'turn-conflict'
+    | 'mixed-op'
+    | 'missing-crucial'
+    | 'empty-crucial'
   >('valid');
 
   // Batch Benchmark Results
@@ -139,21 +154,44 @@ export default function App() {
     [allProblems, selectedProblemId]
   );
 
-  // Run DfpnSolver on currentProblem + solverConfig
-  const { solveReport, initialPosition, proofContext } = useMemo(() => {
-    const solver = new DfpnSolver(solverConfig);
-    const report = solver.solveProblem(currentProblem);
+  // Build root ProofContext and root initial position
+  const { rootInitialPosition, proofContext } = useMemo(() => {
     const ctx = DfpnSolver.buildProofContext(currentProblem, solverConfig);
     const initPos = DfpnSolver.buildInitialPosition(currentProblem, ctx);
     return {
-      solveReport: report,
-      initialPosition: initPos,
+      rootInitialPosition: initPos,
       proofContext: ctx,
     };
   }, [currentProblem, solverConfig]);
 
+  // Active solve root: either problem initial root, or user-requested manual sub-position
+  // (replayed from rootInitialPosition so survivingTargetTokensMask & SSK HistorySet stay exact).
+  const activeSolvePosition = useMemo(() => {
+    if (!solveManualSubposition || manualMoves.length === 0) {
+      return rootInitialPosition;
+    }
+    const subPos = rootInitialPosition.clone();
+    for (const mv of manualMoves) {
+      subPos.playMove(mv);
+    }
+    return subPos;
+  }, [rootInitialPosition, solveManualSubposition, manualMoves]);
+
+  // Run DfpnSolver on activeSolvePosition + proofContext
+  const solveReport = useMemo(() => {
+    const solver = new DfpnSolver(solverConfig);
+    return solver.solveFromPosition(
+      currentProblem,
+      activeSolvePosition,
+      proofContext
+    );
+  }, [currentProblem, activeSolvePosition, proofContext, solverConfig]);
+
   // Active Principal Variation sequence (either LDProver engine PV or rawsgf reference PV)
   const activePvSequence = useMemo(() => {
+    if (solveManualSubposition && manualMoves.length > 0) {
+      return solveReport.principalVariation;
+    }
     if (
       pvSourceMode === 'reference' &&
       currentProblem.referencePv &&
@@ -169,17 +207,24 @@ export default function App() {
       return currentProblem.referencePv;
     }
     return solveReport.principalVariation;
-  }, [pvSourceMode, currentProblem, solveReport]);
+  }, [
+    solveManualSubposition,
+    manualMoves.length,
+    pvSourceMode,
+    currentProblem,
+    solveReport,
+  ]);
 
-  // Compute current displayed board position (either PV playback or manual moves)
+  // Compute current displayed board position (manual exploration or PV playback)
   const displayedPosition = useMemo(() => {
-    const pos = initialPosition.clone();
-    if (manualMoves.length > 0) {
+    if (manualMoves.length > 0 && !solveManualSubposition) {
+      const pos = rootInitialPosition.clone();
       for (const mv of manualMoves) {
         pos.playMove(mv);
       }
       return pos;
     }
+    const pos = activeSolvePosition.clone();
     if (pvStepIndex !== null && pvStepIndex >= 0) {
       for (
         let i = 0;
@@ -190,8 +235,14 @@ export default function App() {
       }
     }
     return pos;
-  }, [initialPosition, manualMoves, pvStepIndex, activePvSequence]);
-
+  }, [
+    rootInitialPosition,
+    activeSolvePosition,
+    manualMoves,
+    solveManualSubposition,
+    pvStepIndex,
+    activePvSequence,
+  ]);
 
   // Live terminal evaluation on displayedPosition
   const liveTerminalEval = useMemo(() => {
@@ -199,11 +250,15 @@ export default function App() {
     return evaluator.evaluateTerminal(displayedPosition, proofContext);
   }, [displayedPosition, proofContext]);
 
-  // Independent lproof/1 Proof Checker execution (with optional Fault Injection)
+  // Independent lproof/1 Proof Checker execution (with semantic re-signing in Fault Injection Sandbox)
   const verificationReport = useMemo((): VerificationReport => {
     const checker = new ProofArtifactManager();
     if (faultMode === 'none') {
-      return checker.verifyProofDag(initialPosition, proofContext, solveReport);
+      return checker.verifyProofDag(
+        activeSolvePosition,
+        proofContext,
+        solveReport
+      );
     }
 
     const clonedReport: SolveReport = JSON.parse(JSON.stringify(solveReport));
@@ -211,12 +266,16 @@ export default function App() {
       faultMode === 'lp-n15-violation' &&
       clonedReport.proofDagNodes.length > 0
     ) {
-      // Corrupt root node saturation binding
       const rootIdx = clonedReport.rootDagNodeId;
       if (rootIdx >= 0 && rootIdx < clonedReport.proofDagNodes.length) {
         clonedReport.proofDagNodes[rootIdx].pn = 7;
         clonedReport.proofDagNodes[rootIdx].dn = 42;
       }
+      clonedReport.proofChecksum = checker.serializeLProofJson(
+        activeSolvePosition,
+        proofContext,
+        clonedReport
+      ).checksum;
     } else if (
       faultMode === 'lp-t02-topology' &&
       clonedReport.proofDagNodes.length > 0
@@ -224,26 +283,74 @@ export default function App() {
       const rootIdx = clonedReport.rootDagNodeId;
       if (rootIdx >= 0 && rootIdx < clonedReport.proofDagNodes.length) {
         clonedReport.proofDagNodes[rootIdx].childNodeIds.push(rootIdx + 99);
+        clonedReport.proofDagNodes[rootIdx].childMoves.push(PASS_MOVE);
       }
+      clonedReport.proofChecksum = checker.serializeLProofJson(
+        activeSolvePosition,
+        proofContext,
+        clonedReport
+      ).checksum;
     } else if (faultMode === 'jcs-checksum-tamper') {
       clonedReport.proofChecksum =
         'sha256-jcs:deadbeef00000000cafebabe11111111';
     } else if (faultMode === 'missing-pruned-cert') {
+      let mutatedPruned = false;
       for (const n of clonedReport.proofDagNodes) {
         if (n.isPrunedOutsideRz) {
           delete n.prunedCertificate;
+          mutatedPruned = true;
         }
       }
+      if (!mutatedPruned && clonedReport.proofDagNodes.length > 0) {
+        const rootIdx = Math.max(0, clonedReport.rootDagNodeId);
+        if (clonedReport.proofDagNodes[rootIdx]) {
+          clonedReport.proofDagNodes[rootIdx].isPrunedOutsideRz = true;
+          clonedReport.proofDagNodes[rootIdx].sourceProofNodeId = rootIdx;
+          delete clonedReport.proofDagNodes[rootIdx].prunedCertificate;
+        }
+      }
+      clonedReport.proofChecksum = checker.serializeLProofJson(
+        activeSolvePosition,
+        proofContext,
+        clonedReport
+      ).checksum;
     }
 
-    return checker.verifyProofDag(initialPosition, proofContext, clonedReport);
-  }, [initialPosition, proofContext, solveReport, faultMode]);
+    return checker.verifyProofDag(
+      activeSolvePosition,
+      proofContext,
+      clonedReport
+    );
+  }, [activeSolvePosition, proofContext, solveReport, faultMode]);
 
-  const handleSelectProblem = (problemId: string) => {
+  // Process-independent standalone JSON text verifier (runs when viewing Tab 3 Checker)
+  const standaloneJsonVerification = useMemo((): VerificationReport | null => {
+    if (activeTab !== 'checker' || faultMode !== 'none') return null;
+    const checker = new ProofArtifactManager();
+    return checker.verifySerializedLProofJson(solveReport.lproofJson);
+  }, [activeTab, faultMode, solveReport.lproofJson]);
+
+  const handleSelectProblem = (
+    problemId: string,
+    explicitSpec?: TsumegoProblemSpec
+  ) => {
+    const targetProb =
+      explicitSpec ?? allProblems.find((p) => p.id === problemId);
     setSelectedProblemId(problemId);
     setPvStepIndex(null);
     setManualMoves([]);
+    setSolveManualSubposition(false);
     setStatusToast(null);
+    if (targetProb) {
+      setSolverConfig((prev) => ({
+        ...prev,
+        attackerAllowKo: Boolean(
+          targetProb.attackerAllowKo ?? targetProb.defaultAllowKo
+        ),
+        defenderAllowKo: targetProb.defenderAllowKo ?? true,
+        useProblemDefaultKo: false,
+      }));
+    }
   };
 
   const handleFetchGithubProblem = async (targetFilename?: string) => {
@@ -252,12 +359,11 @@ export default function App() {
     const filename = rawName.endsWith('.json') ? rawName : `${rawName}.json`;
     const cleanId = filename.replace(/\.json$/i, '');
 
-    // If already in catalog, select it directly
     const existing = allProblems.find(
       (p) => p.id === cleanId || p.rawJsonFilename === filename
     );
     if (existing) {
-      handleSelectProblem(existing.id);
+      handleSelectProblem(existing.id, existing);
       setStatusToast(`已切换至题库内置题目 ${filename}`);
       return;
     }
@@ -274,24 +380,28 @@ export default function App() {
         throw new Error(`HTTP ${resp.status}`);
       }
       const rawJson = (await resp.json()) as RawStudyLdRzProblemJson;
+      const contractCheck = validateStudyLdRzContract(rawJson, 'strict');
+      if (!contractCheck.valid) {
+        throw new Error(`${contractCheck.code} — ${contractCheck.summary}`);
+      }
       const spec = parseStudyLdRzJsonToProblemSpec(filename, rawJson);
       setCustomProblems((prev) => [
         spec,
         ...prev.filter((p) => p.id !== spec.id),
       ]);
-      handleSelectProblem(spec.id);
+      handleSelectProblem(spec.id, spec);
       setStatusToast(
-        `已从 rlglab/study-LD-RZ 动态抓取并解析 ${filename}（关键子: ${
+        `已通过 FR-1 契约校验 (${contractCheck.code}) 并载入 ${filename}（关键子: ${
           spec.winningColor === 'B'
             ? spec.blackCrucialStone
             : spec.whiteCrucialStone
-        }）`
+        }，Region: ${spec.regionCoords.length} 点）`
       );
     } catch (err) {
       setStatusToast(
-        `抓取 ${filename} 失败 (${
+        `抓取或契约校验 ${filename} 失败 (${
           err instanceof Error ? err.message : '网络错误'
-        })，请检查题号格式（如 chao_vol1_p098.json）`
+        })`
       );
     } finally {
       setIsFetchingGithub(false);
@@ -311,21 +421,27 @@ export default function App() {
       return;
     }
     const baseMoves =
-      manualMoves.length > 0
+      manualMoves.length > 0 && !solveManualSubposition
         ? manualMoves
-        : pvStepIndex !== null
-        ? activePvSequence
-            .slice(0, pvStepIndex + 1)
-            .map((s) => s.move)
+        : solveManualSubposition
+        ? [
+            ...manualMoves,
+            ...(pvStepIndex !== null && pvStepIndex >= 0
+              ? activePvSequence.slice(0, pvStepIndex + 1).map((s) => s.move)
+              : []),
+          ]
+        : pvStepIndex !== null && pvStepIndex >= 0
+        ? activePvSequence.slice(0, pvStepIndex + 1).map((s) => s.move)
         : [];
     setManualMoves([...baseMoves, coord]);
+    setSolveManualSubposition(false);
     setPvStepIndex(null);
     setStatusToast(
       `已手动试下 ${coordToHumanLabel(coord, 19)}${
         res.capturedCoords.length > 0
           ? `（提子 ${res.capturedCoords.length} 颗）`
           : ''
-      }`
+      } — 可继续试下或点击下方「求解当前试下子局面」生成子局面形式化证明`
     );
   };
 
@@ -338,8 +454,9 @@ export default function App() {
     const results = allProblems.map((prob) => {
       const cfg: SolverConfig = {
         ...solverConfig,
-        attackerAllowKo: prob.attackerAllowKo ?? prob.defaultAllowKo,
-        defenderAllowKo: prob.defenderAllowKo ?? solverConfig.defenderAllowKo,
+        attackerAllowKo: Boolean(prob.attackerAllowKo ?? prob.defaultAllowKo),
+        defenderAllowKo: prob.defenderAllowKo ?? true,
+        useProblemDefaultKo: true,
       };
       const solver = new DfpnSolver(cfg);
       const rep = solver.solveProblem(prob);
@@ -398,88 +515,73 @@ export default function App() {
     [selectedCppPath]
   );
 
-  // FR-1.1..1.3 Contract validation preview
+  // FR-1.1..1.3 Real Contract Validator execution via `validateStudyLdRzContract`
   const contractTestResult = useMemo(() => {
+    let samplePayload: RawStudyLdRzProblemJson;
     if (contractPreset === 'valid') {
-      return {
-        valid: true,
-        code: 'FR1-OK',
-        summary: '契约解析通过：PL[B] 与 turn_color="B" 一致，crucial_stone="ab&da" 合法合取表达式。',
-        jsonSample: JSON.stringify(
-          {
-            masked_sgf_str: currentProblem.maskedSgfStr,
-            winning_color: currentProblem.winningColor,
-            turn_color: currentProblem.turnColor,
-            black_search_goal: currentProblem.blackSearchGoal,
-            white_search_goal: currentProblem.whiteSearchGoal,
-            black_crucial_stone: currentProblem.blackCrucialStone,
-            white_crucial_stone: currentProblem.whiteCrucialStone,
-          },
-          null,
-          2
-        ),
+      samplePayload = {
+        masked_sgf_str: currentProblem.maskedSgfStr,
+        winning_color: currentProblem.winningColor,
+        turn_color: currentProblem.turnColor,
+        black_search_goal: currentProblem.blackSearchGoal,
+        white_search_goal: currentProblem.whiteSearchGoal,
+        black_crucial_stone: currentProblem.blackCrucialStone,
+        white_crucial_stone: currentProblem.whiteCrucialStone,
+        answer_firstmove: currentProblem.groundTruthFirstMoves ?? [],
+      };
+    } else if (contractPreset === 'turn-conflict') {
+      samplePayload = {
+        masked_sgf_str: '(;GM[1]FF[4]SZ[19]PL[B]AB[da][ab][bb]AW[ea][eb])',
+        winning_color: 'B',
+        turn_color: 'W',
+        black_search_goal: 'TOLIVE',
+        white_search_goal: 'TOKILL',
+        black_crucial_stone: 'bb',
+        white_crucial_stone: 'ea',
+        answer_firstmove: 'ca',
+      };
+    } else if (contractPreset === 'mixed-op') {
+      samplePayload = {
+        masked_sgf_str: '(;GM[1]FF[4]SZ[19]PL[B]AB[ab][cb][db]AW[ea][eb])',
+        winning_color: 'B',
+        turn_color: 'B',
+        black_search_goal: 'TOLIVE',
+        white_search_goal: 'TOKILL',
+        black_crucial_stone: 'ab&cb|db',
+        white_crucial_stone: 'ea',
+        answer_firstmove: 'ca',
+      };
+    } else if (contractPreset === 'missing-crucial') {
+      samplePayload = {
+        masked_sgf_str: '(;GM[1]FF[4]SZ[19]PL[B]AB[da][ab][bb]AW[ea][eb])',
+        winning_color: 'B',
+        turn_color: 'B',
+        black_search_goal: 'TOLIVE',
+        white_search_goal: 'TOKILL',
+        black_crucial_stone: 'ss',
+        white_crucial_stone: 'ea',
+        answer_firstmove: 'ca',
+      };
+    } else {
+      samplePayload = {
+        masked_sgf_str: '(;GM[1]FF[4]SZ[19]PL[B]AB[da][ab][bb]AW[ea][eb])',
+        winning_color: 'B',
+        turn_color: 'B',
+        black_search_goal: 'TOLIVE',
+        white_search_goal: 'TOKILL',
+        black_crucial_stone: '',
+        white_crucial_stone: 'ea',
+        answer_firstmove: 'ca',
       };
     }
-    if (contractPreset === 'turn-conflict') {
-      return {
-        valid: false,
-        code: 'FR1-TURN-CONFLICT (ExitCode=2)',
-        summary:
-          '拒题保护触发（FR-1.2）：SGF PL[B] 与 turn_color="W" 冲突。严格禁止插入虚拟 pass 校正（避免污染 HistorySet 与双 pass 终局语义）。',
-        jsonSample: JSON.stringify(
-          {
-            masked_sgf_str: '(;GM[1]FF[4]SZ[19]PL[B]AB[da][ab][bb]AW[ea][eb])',
-            winning_color: 'B',
-            turn_color: 'W',
-            black_search_goal: 'TOLIVE',
-            white_search_goal: 'TOKILL',
-            black_crucial_stone: 'bb',
-            white_crucial_stone: 'ea',
-          },
-          null,
-          2
-        ),
-      };
-    }
-    if (contractPreset === 'mixed-op') {
-      return {
-        valid: false,
-        code: 'FR1-MIXED-LOGICAL-OP (ExitCode=2)',
-        summary:
-          '拒题保护触发（FR-1.3）：crucial_stone="ab&cb|db" 内混用合取 (&) 与析取 (|) 运算符，缺少括号优先级定义，按规范强制拒题。',
-        jsonSample: JSON.stringify(
-          {
-            masked_sgf_str: '(;GM[1]FF[4]SZ[19]PL[B]AB[ab][cb][db]AW[ea][eb])',
-            winning_color: 'B',
-            turn_color: 'B',
-            black_search_goal: 'TOLIVE',
-            white_search_goal: 'TOKILL',
-            black_crucial_stone: 'ab&cb|db',
-            white_crucial_stone: 'ea',
-          },
-          null,
-          2
-        ),
-      };
-    }
+
+    const res = validateStudyLdRzContract(samplePayload, 'strict');
     return {
-      valid: true,
-      code: 'FR1-EMPTY-CRUCIAL-WARN',
-      summary:
-        '空关键子串告警（FR-1.3）：black_crucial_stone="" 按“该方目标恒假”处理并输出结构化告警，禁止静默使用默认值。',
-      jsonSample: JSON.stringify(
-        {
-          masked_sgf_str: '(;GM[1]FF[4]SZ[19]PL[B]AB[da][ab][bb]AW[ea][eb])',
-          winning_color: 'B',
-          turn_color: 'B',
-          black_search_goal: 'TOLIVE',
-          white_search_goal: 'TOKILL',
-          black_crucial_stone: '',
-          white_crucial_stone: 'ea',
-        },
-        null,
-        2
-      ),
+      valid: res.valid,
+      warning: res.warning,
+      code: res.code,
+      summary: res.summary,
+      jsonSample: JSON.stringify(samplePayload, null, 2),
     };
   }, [contractPreset, currentProblem]);
 
@@ -842,13 +944,17 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Ground-Truth Comparison Banner for study-LD-RZ problems */}
+              {/* Ground-Truth Comparison Banner for study-LD-RZ problems (strictly gated on verificationReport.passed && manualMoves.length === 0) */}
               {currentProblem.groundTruthFirstMoves &&
                 currentProblem.groundTruthFirstMoves.length > 0 && (
                   <div className="mt-3 space-y-1.5 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-mono tabular-nums">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div>
-                        <span className="text-slate-500">引擎首手：</span>
+                        <span className="text-slate-500">
+                          {solveManualSubposition && manualMoves.length > 0
+                            ? '子局面最佳应手：'
+                            : '引擎首手：'}
+                        </span>
                         <strong className="text-slate-900">
                           {solveReport.bestMoveSgf
                             ? `${solveReport.bestMoveSgf} (${coordToHumanLabel(
@@ -881,11 +987,31 @@ export default function App() {
                           </div>
                         )}
                       <div>
-                        {solveReport.rootStatus === ProofOutcome.ProvenWin &&
-                        solveReport.bestMoveSgf &&
-                        (currentProblem.verifiedGroundTruthFirstMoves ??
-                          currentProblem.groundTruthFirstMoves
-                        ).includes(solveReport.bestMoveSgf) ? (
+                        {manualMoves.length > 0 ? (
+                          solveManualSubposition ? (
+                            <span className="font-sans font-semibold text-indigo-700">
+                              试下子局面 ({manualMoves.length} 手) 独立证明 · Checker:{' '}
+                              {verificationReport.errorCode}
+                            </span>
+                          ) : (
+                            <span className="font-sans font-semibold text-amber-800">
+                              手动试下探索态 ({manualMoves.length} 手) · 非初始根局面
+                            </span>
+                          )
+                        ) : (solveReport.rootStatus ===
+                            ProofOutcome.ProvenWin ||
+                            solveReport.rootStatus ===
+                              ProofOutcome.ProvenLoss) &&
+                          !verificationReport.passed ? (
+                          <span className="font-sans font-semibold text-red-700">
+                            独立 Checker 拦截 ({verificationReport.errorCode}) · 证明无效
+                          </span>
+                        ) : verificationReport.passed &&
+                          solveReport.rootStatus === ProofOutcome.ProvenWin &&
+                          solveReport.bestMoveSgf &&
+                          (currentProblem.verifiedGroundTruthFirstMoves ??
+                            currentProblem.groundTruthFirstMoves
+                          ).includes(solveReport.bestMoveSgf) ? (
                           <span className="font-sans font-semibold text-emerald-700">
                             形式化证明通过 · 与原谱真解一致
                           </span>
@@ -901,6 +1027,28 @@ export default function App() {
                         数据集勘误：{currentProblem.groundTruthNote}
                       </div>
                     )}
+                    {currentProblem.d8SymmetryAudit &&
+                      !currentProblem.d8SymmetryAudit.isExactBijection && (
+                        <div className="border-t border-slate-200 pt-1 font-sans text-[11px] text-slate-700">
+                          D8 原谱棋子核对（D8=#{
+                            currentProblem.d8SymmetryAudit.d8Index
+                          }）：原谱局部匹配{' '}
+                          {currentProblem.d8SymmetryAudit.matchedStones}/
+                          {currentProblem.d8SymmetryAudit.totalRawStones} 子
+                          {currentProblem.d8SymmetryAudit.missingInMaskedSgf
+                            .length > 0
+                            ? `；masked_sgf 缺失 [${currentProblem.d8SymmetryAudit.missingInMaskedSgf.join(
+                                ', '
+                              )}]`
+                            : ''}
+                          {currentProblem.d8SymmetryAudit.extraInMaskedRegion
+                            .length > 0
+                            ? `；region 内多出 [${currentProblem.d8SymmetryAudit.extraInMaskedRegion.join(
+                                ', '
+                              )}]`
+                            : ''}
+                        </div>
+                      )}
                   </div>
                 )}
 
@@ -972,11 +1120,12 @@ export default function App() {
                     </strong>
                   </div>
 
-                  <div className="flex items-center gap-1.5">
+                   <div className="flex flex-wrap items-center gap-1.5">
                     <button
                       type="button"
                       onClick={() => {
                         setManualMoves([]);
+                        setSolveManualSubposition(false);
                         setPvStepIndex(-1);
                         setStatusToast(null);
                       }}
@@ -990,6 +1139,7 @@ export default function App() {
                       type="button"
                       onClick={() => {
                         setManualMoves([]);
+                        setSolveManualSubposition(false);
                         setPvStepIndex((prev) =>
                           prev === null
                             ? activePvSequence.length - 2
@@ -1006,6 +1156,7 @@ export default function App() {
                       type="button"
                       onClick={() => {
                         setManualMoves([]);
+                        setSolveManualSubposition(false);
                         setPvStepIndex((prev) => {
                           const cur = prev === null ? -1 : prev;
                           return Math.min(
@@ -1027,6 +1178,7 @@ export default function App() {
                       type="button"
                       onClick={() => {
                         setManualMoves([]);
+                        setSolveManualSubposition(false);
                         setPvStepIndex(activePvSequence.length - 1);
                       }}
                       title="跳至终局叶节点"
@@ -1042,11 +1194,28 @@ export default function App() {
                     >
                       虚手 Pass
                     </button>
+                    {manualMoves.length > 0 && !solveManualSubposition && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSolveManualSubposition(true);
+                          setPvStepIndex(null);
+                          setStatusToast(
+                            `已对当前试下子局面 (${manualMoves.length} 手后，保留真实 HistorySet 与存活令牌掩码) 执行独立 df-pn 求解与 ProofChecker 复验`
+                          );
+                        }}
+                        className="inline-flex items-center gap-1 rounded-md border border-indigo-600 bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 cursor-pointer whitespace-nowrap shrink-0"
+                      >
+                        <Play className="h-3.5 w-3.5" />
+                        求解当前试下子局面
+                      </button>
+                    )}
                     {manualMoves.length > 0 && (
                       <button
                         type="button"
                         onClick={() => {
                           setManualMoves([]);
+                          setSolveManualSubposition(false);
                           setPvStepIndex(null);
                           setStatusToast(null);
                         }}
@@ -1121,7 +1290,9 @@ export default function App() {
                         <div
                           key={`pv-${idx}`}
                           onClick={() => {
-                            setManualMoves([]);
+                            if (!solveManualSubposition) {
+                              setManualMoves([]);
+                            }
                             setPvStepIndex(idx);
                           }}
                           className={`flex items-center justify-between rounded-md px-2.5 py-1.5 text-xs font-mono cursor-pointer transition-colors ${
@@ -1271,12 +1442,22 @@ export default function App() {
                   </div>
 
                   <div>
+                    <dt className="text-slate-500">全称证明域 (Region 全集)</dt>
+                    <dd className="mt-0.5 font-mono text-xs font-semibold text-slate-900 tabular-nums">
+                      {solveReport.regionCoords.length} /{' '}
+                      {solveReport.rawRegionPointCount ??
+                        solveReport.regionCoords.length}{' '}
+                      点 ({solveReport.isFullRegionSearch ? '100% 原题域' : '裁剪域'})
+                    </dd>
+                  </div>
+
+                  <div>
                     <dt className="text-slate-500">独立 ProofChecker (FR-9)</dt>
                     <dd
                       className={`mt-0.5 font-mono text-xs font-bold ${
                         verificationReport.passed
                           ? 'text-emerald-700'
-                          : 'text-amber-700'
+                          : 'text-red-700'
                       }`}
                     >
                       {verificationReport.errorCode} ({verificationReport.verifiedNodes} 节点)
@@ -1383,6 +1564,37 @@ export default function App() {
                           }
                           className={`py-1 font-mono text-xs rounded-xs cursor-pointer ${
                             solverConfig.koRule === rule
+                              ? 'bg-white text-slate-900 font-semibold shadow-2xs'
+                              : 'text-slate-600'
+                          }`}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Node Budget Selector */}
+                  <div>
+                    <label className="block font-medium text-slate-700">
+                      最大搜索节点预算 (maxNodes FR-4.7)
+                    </label>
+                    <div className="mt-1 grid grid-cols-3 gap-1 rounded-md bg-slate-100 p-1">
+                      {(
+                        [
+                          [3500, '3,500 (快速)'],
+                          [10000, '10,000 (标准)'],
+                          [25000, '25,000 (深搜)'],
+                        ] as const
+                      ).map(([budget, label]) => (
+                        <button
+                          key={budget}
+                          type="button"
+                          onClick={() =>
+                            setSolverConfig((c) => ({ ...c, maxNodes: budget }))
+                          }
+                          className={`py-1 font-mono text-xs rounded-xs cursor-pointer ${
+                            solverConfig.maxNodes === budget
                               ? 'bg-white text-slate-900 font-semibold shadow-2xs'
                               : 'text-slate-600'
                           }`}
@@ -1752,11 +1964,24 @@ export default function App() {
                 ))}
               </div>
 
-              <div className="mt-4 pt-4 border-t border-slate-200 text-xs font-mono text-slate-700">
+              <div className="mt-4 pt-4 border-t border-slate-200 text-xs font-mono text-slate-700 space-y-1">
                 <div>Checker Message: {verificationReport.message}</div>
-                <div className="mt-1 text-slate-500">
-                  JCS Checksum: {verificationReport.jcsSha256Checksum}
+                <div className="text-slate-500">
+                  RFC 8785 JCS SHA-256: {verificationReport.jcsSha256Checksum}
                 </div>
+                {standaloneJsonVerification && (
+                  <div
+                    className={
+                      standaloneJsonVerification.passed
+                        ? 'text-emerald-700 font-semibold'
+                        : 'text-red-700 font-semibold'
+                    }
+                  >
+                    Standalone JSON File Verifier (verifySerializedLProofJson):{' '}
+                    {standaloneJsonVerification.passed ? 'PASS' : 'FAIL'} (
+                    {standaloneJsonVerification.errorCode})
+                  </div>
+                )}
               </div>
             </div>
 
@@ -1774,11 +1999,20 @@ export default function App() {
                   className="inline-flex items-center gap-1 text-xs font-medium text-slate-600 hover:text-slate-900 cursor-pointer"
                 >
                   <Copy className="h-3.5 w-3.5" />
-                  {copiedFeedback === 'lproofJson' ? '已复制' : '复制 lproof/1'}
+                  {copiedFeedback === 'lproofJson' ? '已复制' : '复制全量 lproof/1'}
                 </button>
               </div>
+              {solveReport.lproofJson.length > 48000 && (
+                <div className="mt-2 rounded border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-[11px] font-mono text-slate-600">
+                  预览窗口显示前 48 KB（完整自包含证书共{' '}
+                  {(solveReport.lproofJson.length / 1024).toFixed(1)}{' '}
+                  KB，点击上方复制或 Tab 2 下载可获取完整无截断文件）
+                </div>
+              )}
               <pre className="mt-3 max-h-[560px] overflow-y-auto overflow-x-auto rounded-md bg-slate-950 p-4 text-xs font-mono text-slate-100 leading-relaxed">
-                {solveReport.lproofJson}
+                {solveReport.lproofJson.length > 48000
+                  ? `${solveReport.lproofJson.slice(0, 48000)}\n... [Preview truncated at 48 KB; use Copy/Download for full lproof/1 artifact]`
+                  : solveReport.lproofJson}
               </pre>
             </div>
           </div>
@@ -2177,6 +2411,10 @@ export default function App() {
                     ['valid', '合法契约样本 (FR1-OK)'],
                     ['turn-conflict', '测试 PL 与 turn_color 冲突拒题 (FR-1.2)'],
                     ['mixed-op', '测试 crucial_stone 混用 & 与 | 拒题 (FR-1.3)'],
+                    [
+                      'missing-crucial',
+                      '测试 crucial_stone 不在盘拒题 (FR-1.3)',
+                    ],
                     ['empty-crucial', '测试空关键子串恒假告警 (FR-1.3)'],
                   ] as const
                 ).map(([preset, label]) => (
@@ -2201,15 +2439,23 @@ export default function App() {
                 </pre>
                 <div className="rounded-md border border-slate-200 bg-slate-50 p-4 flex flex-col justify-between">
                   <div>
-                    <div className="text-xs font-mono font-bold text-slate-900">
-                      Parser Status: {contractTestResult.code}
+                    <div
+                      className={`text-xs font-mono font-bold ${
+                        !contractTestResult.valid
+                          ? 'text-red-700'
+                          : contractTestResult.warning
+                          ? 'text-amber-700'
+                          : 'text-emerald-700'
+                      }`}
+                    >
+                      Validator Status: {contractTestResult.code}
                     </div>
                     <p className="mt-2 text-xs leading-relaxed text-slate-700">
                       {contractTestResult.summary}
                     </p>
                   </div>
                   <div className="mt-4 pt-3 border-t border-slate-200 text-[11px] font-mono text-slate-500">
-                    C++ 实现位置：cpp/src/core/problem_parser.cc (ProblemContractParser&lt;N&gt;::ParseTsumegoJson)
+                    实时执行引擎：validateStudyLdRzContract() ↔ C++ ProblemContractParser&lt;N&gt;::ParseTsumegoJson
                   </div>
                 </div>
               </div>

@@ -41,6 +41,7 @@ struct ProofDagNode {
   uint32_t state_id = 0;
   uint32_t history_id = 0;
   bool is_or_node = true;
+  Color to_play = Color::kBlack;
   int16_t incoming_move = kPassMove;
   uint32_t pn = 1;
   uint32_t dn = 1;
@@ -57,6 +58,8 @@ struct ProofDagNode {
 
 template <int N = kDefaultBoardSize>
 struct SolveReport {
+  uint64_t input_hash = 0;
+  std::optional<BitBoard<N>> region_hint;
   ProofOutcome root_status = ProofOutcome::kUnknown;
   UnknownReason unknown_reason = UnknownReason::kNone;
   uint32_t root_pn = 1;

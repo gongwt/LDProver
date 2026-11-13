@@ -92,13 +92,13 @@ BitBoard<N> BensonTerminalEvaluator<N>::ComputeUnconditionalAlive(
       }
     }
 
-    // Pure Classic Benson (1976): region cannot contain immortal outer wall
-    // enemy stones and contributes at most 1 vital region when enclosed.
+    // Pure Classic Benson (1976) under Local Tsumego Boundary Axiom:
+    // region cannot contain immortal outer-wall enemy stones (`ImmortalWall`)
+    // and contributes at most 1 vital region when enclosed by active chains.
     reg.is_small_enclosed = !touches_immortal_enemy &&
                             touches_tactical_chain &&
                             reg.empty_points.Any() &&
-                            !reg.boundary_chain_ids.empty() &&
-                            reg.empty_points.Count() <= 15;
+                            !reg.boundary_chain_ids.empty();
     regions.push_back(reg);
   }
 

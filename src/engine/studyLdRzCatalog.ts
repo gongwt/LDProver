@@ -248,30 +248,58 @@ export function parseSgfInitialStones(sgf: string): {
   return { blackCoords, whiteCoords };
 }
 
+export interface D8SymmetryAuditResult {
+  d8Index: number;
+  matchedStones: number;
+  totalRawStones: number;
+  missingInMaskedSgf: string[];
+  extraInMaskedRegion: string[];
+  isExactBijection: boolean;
+}
+
 /**
- * Automatically identifies which of the 8 D_8 board symmetries maps `rawsgf` initial stones
- * onto the tactical stones inside `region` of `masked_sgf_str`.
+ * Identifies the best D_8 symmetry mapping `rawsgf` initial stones onto tactical stones inside
+ * `region` of `masked_sgf_str`, and records any missing/extra stone discrepancies (e.g. p351 W[pp]).
  */
-export function detectD8TransformFromRawSgf(
+export function auditD8TransformFromRawSgf(
   rawsgf: string | undefined,
   maskedBlackCoords: number[],
   maskedWhiteCoords: number[],
   rawRegionSet: Set<number>
-): number {
-  if (!rawsgf) return 2;
+): D8SymmetryAuditResult {
+  if (!rawsgf) {
+    return {
+      d8Index: 2,
+      matchedStones: 0,
+      totalRawStones: 0,
+      missingInMaskedSgf: [],
+      extraInMaskedRegion: [],
+      isExactBijection: false,
+    };
+  }
   const rawStones = parseSgfInitialStones(rawsgf);
-  if (
-    rawStones.blackCoords.length === 0 &&
-    rawStones.whiteCoords.length === 0
-  ) {
-    return 2;
+  const totalRaw =
+    rawStones.blackCoords.length + rawStones.whiteCoords.length;
+  if (totalRaw === 0) {
+    return {
+      d8Index: 2,
+      matchedStones: 0,
+      totalRawStones: 0,
+      missingInMaskedSgf: [],
+      extraInMaskedRegion: [],
+      isExactBijection: false,
+    };
   }
 
   const maskedBlackInReg = new Set(
-    maskedBlackCoords.filter((c) => rawRegionSet.size === 0 || rawRegionSet.has(c))
+    maskedBlackCoords.filter(
+      (c) => rawRegionSet.size === 0 || rawRegionSet.has(c)
+    )
   );
   const maskedWhiteInReg = new Set(
-    maskedWhiteCoords.filter((c) => rawRegionSet.size === 0 || rawRegionSet.has(c))
+    maskedWhiteCoords.filter(
+      (c) => rawRegionSet.size === 0 || rawRegionSet.has(c)
+    )
   );
 
   let bestD8 = 2;
@@ -292,7 +320,63 @@ export function detectD8TransformFromRawSgf(
       bestD8 = k;
     }
   }
-  return bestD8;
+
+  const mappedBlack = new Set<number>();
+  const mappedWhite = new Set<number>();
+  const missingInMaskedSgf: string[] = [];
+
+  for (const bc of rawStones.blackCoords) {
+    const [tr, tc] = D8_TRANSFORMS[bestD8](rowOf(bc, 19), colOf(bc, 19));
+    const mc = coordFromRowCol(tr, tc, 19);
+    mappedBlack.add(mc);
+    if (!maskedBlackInReg.has(mc)) {
+      missingInMaskedSgf.push(`B[${coordToSgf(mc, 19)}]`);
+    }
+  }
+  for (const wc of rawStones.whiteCoords) {
+    const [tr, tc] = D8_TRANSFORMS[bestD8](rowOf(wc, 19), colOf(wc, 19));
+    const mc = coordFromRowCol(tr, tc, 19);
+    mappedWhite.add(mc);
+    if (!maskedWhiteInReg.has(mc)) {
+      missingInMaskedSgf.push(`W[${coordToSgf(mc, 19)}]`);
+    }
+  }
+
+  const extraInMaskedRegion: string[] = [];
+  for (const bc of maskedBlackInReg) {
+    if (!mappedBlack.has(bc)) {
+      extraInMaskedRegion.push(`B[${coordToSgf(bc, 19)}]`);
+    }
+  }
+  for (const wc of maskedWhiteInReg) {
+    if (!mappedWhite.has(wc)) {
+      extraInMaskedRegion.push(`W[${coordToSgf(wc, 19)}]`);
+    }
+  }
+
+  return {
+    d8Index: bestD8,
+    matchedStones: bestMatches,
+    totalRawStones: totalRaw,
+    missingInMaskedSgf,
+    extraInMaskedRegion,
+    isExactBijection:
+      missingInMaskedSgf.length === 0 && extraInMaskedRegion.length === 0,
+  };
+}
+
+export function detectD8TransformFromRawSgf(
+  rawsgf: string | undefined,
+  maskedBlackCoords: number[],
+  maskedWhiteCoords: number[],
+  rawRegionSet: Set<number>
+): number {
+  return auditD8TransformFromRawSgf(
+    rawsgf,
+    maskedBlackCoords,
+    maskedWhiteCoords,
+    rawRegionSet
+  ).d8Index;
 }
 
 interface ParsedVariationStep {
@@ -441,8 +525,10 @@ export function extractReferencePvFromRawSgf(
 
 /**
  * Computes exact `immortalWallCoords` (strictly `!rawRegionSet.has(stone)`),
- * active tactical `regionCoords` (`[sMinR..18, sMinC..18] ∩ rawRegionSet`), and
- * `attentionCoords` (`NNAttentionMask`: Chebyshev distance <= 2 to tactical stones).
+ * full uncropped `regionCoords` (`rawRegionSet` from JSON so universal obligations cover
+ * 100% of the original problem's region!), and `attentionCoords` (`NNAttentionMask`:
+ * tight corner/edge tactical core guiding move ordering while `OutsideRZRevalidated`
+ * formally proves and eliminates outer-moat responses).
  */
 export function computeActiveTacticalRegion(
   blackCoords: number[],
@@ -452,6 +538,7 @@ export function computeActiveTacticalRegion(
   maskedSgfStr?: string
 ): {
   rawRegionSet: Set<number>;
+  rawRegionCoords: number[];
   regionCoords: number[];
   attentionCoords: number[];
   viewportRows: [number, number];
@@ -459,7 +546,6 @@ export function computeActiveTacticalRegion(
   immortalWallCoords: number[];
 } {
   const allStones = [...blackCoords, ...whiteCoords];
-  const occupied = new Set<number>(allStones);
 
   const rawRegionSet = new Set<number>();
   if (rawRegionStr && rawRegionStr.trim().length > 0) {
@@ -512,29 +598,33 @@ export function computeActiveTacticalRegion(
   minR = Math.max(0, minR - 2);
   minC = Math.max(0, minC - 2);
 
-  // Include ALL points in `[minR..18, minC..18] ∩ rawRegionSet` (including initially occupied
-  // tactical stones!) so snapbacks / throw-in recaptures (e.g. 3.B[pq] in p040, 9.B[pr] in p101)
-  // become legal moves as soon as those stones are captured during search.
-  const regionCoords: number[] = [];
-  for (let r = minR; r <= maxR; r++) {
-    for (let col = minC; col <= maxC; col++) {
-      const pt = coordFromRowCol(r, col, 19);
-      if (
-        !immortalSet.has(pt) &&
-        (rawRegionSet.size === 0 || rawRegionSet.has(pt))
-      ) {
-        regionCoords.push(pt);
+  // Preserve 100% of the JSON's `rawRegionSet` in `regionCoords` (including initially occupied
+  // tactical stones so snapbacks/recaptures are legal, AND all outer-moat points in `region`
+  // so universal AND/OR proof obligations cover the complete original region!).
+  const rawRegionCoords = Array.from(rawRegionSet)
+    .filter((pt) => !immortalSet.has(pt))
+    .sort((a, b) => a - b);
+
+  const fallbackBoxCoords: number[] = [];
+  if (rawRegionCoords.length === 0) {
+    for (let r = minR; r <= maxR; r++) {
+      for (let col = minC; col <= maxC; col++) {
+        const pt = coordFromRowCol(r, col, 19);
+        if (!immortalSet.has(pt)) fallbackBoxCoords.push(pt);
       }
     }
   }
+  const regionCoords =
+    rawRegionCoords.length > 0 ? rawRegionCoords : fallbackBoxCoords;
 
-  // NNAttentionMask: tight tactical core within Chebyshev distance <= 1 of target-side stones
-  // (plus Chebyshev <= 1 of crucial coords), suppressing outer-moat dame waste at OR nodes.
+  // NNAttentionMask: tight tactical core within `[minR..18, minC..18]` and Chebyshev <= 1
+  // of target-side stones, guiding move ordering while keeping full `regionCoords` legal.
   const attentionAnchors = [...anchorStones, ...crucialCoords];
   const attentionCoords = regionCoords.filter((pt) => {
     const r = rowOf(pt, 19);
     const col = colOf(pt, 19);
-    if (r >= 17 && col >= minC + 1) return true; // 1st/2nd line corner/edge eye corridor
+    if (r < minR || col < minC) return false;
+    if (r >= 17 && col >= minC + 1) return true;
     return attentionAnchors.some(
       (st) =>
         Math.abs(rowOf(st, 19) - r) <= 1 && Math.abs(colOf(st, 19) - col) <= 1
@@ -551,11 +641,165 @@ export function computeActiveTacticalRegion(
 
   return {
     rawRegionSet,
+    rawRegionCoords:
+      rawRegionCoords.length > 0 ? rawRegionCoords : regionCoords,
     regionCoords,
     attentionCoords,
     viewportRows: [Math.max(0, vpMinR - 1), 18],
     viewportCols: [Math.max(0, vpMinC - 1), 18],
     immortalWallCoords,
+  };
+}
+
+export interface ContractValidationResult {
+  valid: boolean;
+  warning: boolean;
+  code: string;
+  summary: string;
+}
+
+/**
+ * Strict FR-1.1..FR-1.3 contract validator executed on real problem JSON payloads.
+ * Rejects SGF PL vs turn_color conflicts, mixed '&' and '|'/',' operators, missing required
+ * fields, and crucial_stone coordinates absent or wrong-colored on the initial board.
+ */
+export function validateStudyLdRzContract(
+  raw: Partial<RawStudyLdRzProblemJson>,
+  conflictPolicy: 'strict' | 'warn_ignore' = 'strict'
+): ContractValidationResult {
+  if (!raw.masked_sgf_str || !raw.winning_color) {
+    return {
+      valid: false,
+      warning: false,
+      code: 'FR1-MISSING-REQUIRED (ExitCode=2)',
+      summary: '拒题保护触发（FR-1.1）：缺少必填字段 masked_sgf_str 或 winning_color。',
+    };
+  }
+
+  const winCol = raw.winning_color.trim().toUpperCase();
+  if (winCol !== 'B' && winCol !== 'W') {
+    return {
+      valid: false,
+      warning: false,
+      code: 'FR1-INVALID-WINNING-COLOR (ExitCode=2)',
+      summary: `拒题保护触发（FR-1.1）：非法 winning_color="${raw.winning_color}"（仅允许 "B" 或 "W"）。`,
+    };
+  }
+
+  const plMatch = raw.masked_sgf_str.match(/PL\[([BW])\]/i);
+  const sgfPl = plMatch ? plMatch[1].toUpperCase() : null;
+  const metaTurn = raw.turn_color ? raw.turn_color.trim().toUpperCase() : null;
+
+  if (metaTurn && metaTurn !== 'B' && metaTurn !== 'W') {
+    return {
+      valid: false,
+      warning: false,
+      code: 'FR1-INVALID-TURN-COLOR (ExitCode=2)',
+      summary: `拒题保护触发（FR-1.2）：非法 turn_color="${raw.turn_color}"。`,
+    };
+  }
+
+  if (sgfPl && metaTurn && sgfPl !== metaTurn && conflictPolicy === 'strict') {
+    return {
+      valid: false,
+      warning: false,
+      code: 'FR1-TURN-CONFLICT (ExitCode=2)',
+      summary: `拒题保护触发（FR-1.2）：SGF PL[${sgfPl}] 与 turn_color="${metaTurn}" 冲突。严格禁止插入虚拟 pass 校正（避免污染 HistorySet 与双 pass 终局语义）。`,
+    };
+  }
+
+  const activeGoal =
+    winCol === 'B' ? raw.black_search_goal : raw.white_search_goal;
+  if (activeGoal !== 'TOLIVE' && activeGoal !== 'TOKILL') {
+    return {
+      valid: false,
+      warning: false,
+      code: 'FR1-INVALID-GOAL (ExitCode=2)',
+      summary: `拒题保护触发（FR-1.1）：胜方目标 "${String(activeGoal)}" 非法（必须为 TOLIVE 或 TOKILL）。`,
+    };
+  }
+
+  for (const [label, exprRaw] of [
+    ['black_crucial_stone', raw.black_crucial_stone ?? ''],
+    ['white_crucial_stone', raw.white_crucial_stone ?? ''],
+  ] as const) {
+    const hasAnd = exprRaw.includes('&');
+    const hasOr = exprRaw.includes('|') || exprRaw.includes(',');
+    if (hasAnd && hasOr) {
+      return {
+        valid: false,
+        warning: false,
+        code: 'FR1-MIXED-LOGICAL-OP (ExitCode=2)',
+        summary: `拒题保护触发（FR-1.3）：${label}="${exprRaw}" 内混用合取 (&) 与析取 (|/,) 运算符，缺少括号优先级定义，按规范强制拒题。`,
+      };
+    }
+  }
+
+  const activeCrucial = (
+    winCol === 'B'
+      ? raw.black_crucial_stone ?? ''
+      : raw.white_crucial_stone ?? ''
+  ).trim();
+
+  if (activeCrucial.length === 0) {
+    return {
+      valid: true,
+      warning: true,
+      code: 'FR1-EMPTY-CRUCIAL-WARN',
+      summary: `空关键子串结构化告警（FR-1.3）：胜方 crucial_stone="" 按“该目标谓词恒假（EMPTY_TARGET_CONSTANT_FALSE）”确定性降级处理，严禁静默替换为默认坐标。`,
+    };
+  }
+
+  const { blackCoords, whiteCoords } = parseSgfInitialStones(raw.masked_sgf_str);
+  const expectedStoneIsBlack =
+    (winCol === 'B' && activeGoal === 'TOLIVE') ||
+    (winCol === 'W' && activeGoal === 'TOKILL');
+
+  const tokens = activeCrucial
+    .split(/[&|,]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  for (const tok of tokens) {
+    if (tok.length !== 2) {
+      return {
+        valid: false,
+        warning: false,
+        code: 'FR1-INVALID-CRUCIAL-COORD (ExitCode=2)',
+        summary: `拒题保护触发（FR-1.3）：关键子坐标 "${tok}" 格式非法。`,
+      };
+    }
+    const coord = sgfToCoord(tok, 19);
+    if (coord < 0) {
+      return {
+        valid: false,
+        warning: false,
+        code: 'FR1-OUT-OF-RANGE-CRUCIAL (ExitCode=2)',
+        summary: `拒题保护触发（FR-1.3）：关键子坐标 "${tok}" 超出 19x19 棋盘范围。`,
+      };
+    }
+    const presentCorrectColor = expectedStoneIsBlack
+      ? blackCoords.includes(coord)
+      : whiteCoords.includes(coord);
+    if (!presentCorrectColor) {
+      return {
+        valid: false,
+        warning: false,
+        code: 'FR1-MISSING-CRUCIAL-STONE (ExitCode=2)',
+        summary: `拒题保护触发（FR-1.3）：关键子 "${tok}" 在初始盘面上不存在或颜色与 ${winCol}:${activeGoal} 目标不匹配。`,
+      };
+    }
+  }
+
+  return {
+    valid: true,
+    warning: Boolean(sgfPl && metaTurn && sgfPl !== metaTurn),
+    code: 'FR1-OK',
+    summary: `契约解析通过：PL[${sgfPl ?? metaTurn ?? 'B'}] 与 turn_color="${
+      metaTurn ?? sgfPl ?? 'B'
+    }" 一致，胜方 ${winCol} (${activeGoal}) 关键子 "${activeCrucial}" 共 ${
+      tokens.length
+    } 枚令牌全部在盘且颜色匹配。`,
   };
 }
 
@@ -571,13 +815,18 @@ function normalizeAnswerFirstMoves(ans: string | string[] | undefined): string[]
 
 /**
  * Converts a real study-LD-RZ JSON object into a complete TsumegoProblemSpec
- * with zero hardcoded board overrides and automatic D8 rawsgf cross-validation.
+ * with strict FR-1 contract validation, full uncropped `regionCoords`, and D8 stone audit.
  */
 export function parseStudyLdRzJsonToProblemSpec(
   filename: string,
   raw: RawStudyLdRzProblemJson,
   overrides?: Partial<TsumegoProblemSpec>
 ): TsumegoProblemSpec {
+  const validation = validateStudyLdRzContract(raw, 'strict');
+  if (!validation.valid) {
+    throw new Error(`[${filename}] ${validation.code}: ${validation.summary}`);
+  }
+
   const cleanId = filename.replace(/\.json$/i, '');
   const { blackCoords, whiteCoords } = parseSgfInitialStones(raw.masked_sgf_str);
   const turnColor: 'B' | 'W' =
@@ -604,6 +853,7 @@ export function parseStudyLdRzJsonToProblemSpec(
 
   const {
     rawRegionSet,
+    rawRegionCoords,
     regionCoords,
     attentionCoords,
     viewportRows,
@@ -617,12 +867,13 @@ export function parseStudyLdRzJsonToProblemSpec(
     raw.masked_sgf_str
   );
 
-  const d8Index = detectD8TransformFromRawSgf(
+  const d8Audit = auditD8TransformFromRawSgf(
     raw.rawsgf,
     blackCoords,
     whiteCoords,
     rawRegionSet
   );
+  const d8Index = d8Audit.d8Index;
   const { referencePv, solutionFirstMoves, refutationFirstMoves } =
     extractVariationsFromRawSgf(raw.rawsgf, d8Index);
 
@@ -640,6 +891,17 @@ export function parseStudyLdRzJsonToProblemSpec(
     groundTruthFirstMoves[0] ??
     'pass';
 
+  const autoDiscrepancyNote =
+    d8Audit.missingInMaskedSgf.length > 0
+      ? `rawsgf 经 D8=${d8Index} 映射存在缺子差异：masked_sgf_str 缺失 ${d8Audit.missingInMaskedSgf.join(
+          ', '
+        )}（以 masked_sgf_str 实际盘面为准）`
+      : undefined;
+
+  const combinedNote = [overrides?.groundTruthNote, autoDiscrepancyNote]
+    .filter(Boolean)
+    .join('；');
+
   return {
     id: cleanId,
     title: overrides?.title ?? `${cleanId} · study-LD-RZ 真实死活题`,
@@ -652,7 +914,7 @@ export function parseStudyLdRzJsonToProblemSpec(
         SearchGoal.ToLive
           ? '做活 (TOLIVE)'
           : '净杀 (TOKILL)'
-      } · 原谱真解: ${verifiedGroundTruthFirstMoves.join(', ') || '无'}`,
+      } · 参考首手: ${verifiedGroundTruthFirstMoves.join(', ') || '无'}`,
     source:
       overrides?.source ?? `public/tsumego/${filename} (rlglab/study-LD-RZ)`,
     difficulty: overrides?.difficulty ?? '趙治勲死活题库 (study-LD-RZ)',
@@ -670,15 +932,16 @@ export function parseStudyLdRzJsonToProblemSpec(
     attackerAllowKo,
     defenderAllowKo,
     regionCoords,
+    rawRegionCoords,
     attentionCoords,
     blackInitialCoords: blackCoords,
     whiteInitialCoords: whiteCoords,
     immortalWallCoords,
     description:
       overrides?.description ??
-      `直读 public/tsumego/${filename} 原始数据（D8=${d8Index} 自动对齐）。关键子谓词：${activeCrucial}，JSON 标注首手：${groundTruthFirstMoves.join(
+      `直读 public/tsumego/${filename} 原始数据（region=${regionCoords.length} 点全覆盖，D8=${d8Index} 匹配 ${d8Audit.matchedStones}/${d8Audit.totalRawStones} 子）。关键子谓词：${activeCrucial}，JSON 标注首手：${groundTruthFirstMoves.join(
         ', '
-      )}，rawsgf 核验首手：${verifiedGroundTruthFirstMoves.join(', ')}。`,
+      )}，rawsgf 映射参考首手：${verifiedGroundTruthFirstMoves.join(', ')}。`,
     expectedOutcome: overrides?.expectedOutcome ?? ProofOutcome.ProvenWin,
     expectedBestMoveSgf,
     datasetGroup: 'study-ld-rz',
@@ -686,7 +949,8 @@ export function parseStudyLdRzJsonToProblemSpec(
     groundTruthFirstMoves,
     verifiedGroundTruthFirstMoves,
     refutationFirstMoves,
-    groundTruthNote: overrides?.groundTruthNote,
+    groundTruthNote: combinedNote || undefined,
+    d8SymmetryAudit: d8Audit,
     referencePv: overrides?.referencePv ?? referencePv,
     failureDiagnosis: overrides?.failureDiagnosis,
   };
@@ -703,15 +967,15 @@ export const STUDY_LD_RZ_PROBLEMS_CATALOG: TsumegoProblemSpec[] = [
       title: 'RZ-01 · chao_vol1_p031（一路立下扩眼做活）',
       expectedOutcome: ProofOutcome.Unknown,
       description:
-        '直读 public/tsumego/chao_vol1_p031.json（黑关键子 or）。原谱正解：1.B[sr](T2 一路立扩眼) -> 2.W[nr] -> 3.B[os](P1 形成一路直四活形 ps-qs-rs-ss)；失败图包含 B[nr]（失敗圖1）与 B[sq]（失敗圖2）。在棋盘手动落子 1.B[sr] 后约 2058 节点即可完成经典 Benson 形式化证明。',
+        '直读 public/tsumego/chao_vol1_p031.json（黑关键子 or，完整 153 点原始 region）。原谱正解：1.B[sr](T2 一路立扩眼) -> 2.W[nr] -> 3.B[os](P1 形成一路直四活形 ps-qs-rs-ss)；失败图包含 B[nr]（失敗圖1）与 B[sq]（失敗圖2）。',
       failureDiagnosis: {
         category: 'FT-01 · 直四终形需再补两手分隔成双独立 Benson 眼区',
         rootCause:
-          '原谱第 3 手 B[os] 走完时眼位为 4 连空点 [ps,qs,rs,ss]（单连通域），纯经典 Benson 仅计 1 只 Vital 眼，需白点入、黑应手分隔成两只独立单眼后才触发静态 Win（手动落子 1.B[sr] 后 2058 节点可证完）。',
+          '原谱第 3 手 B[os] 走完时眼位为 4 连空点 [ps,qs,rs,ss]（单连通域），经典 Benson 仅计 1 只 Vital 眼，需白点入、黑应手分隔成两只独立单眼后才触发静态 Win。',
         improvementMethod:
-          '保持经典 Benson 零误判，可在叶节点层增加带严格拓扑度=1/2 校验的「封闭直四（Closed Straight-Four）」可证引理以提前 2 层截断。',
+          '保持 Benson 不动点零误判，可在叶节点层增加带严格拓扑度=1/2 校验的「封闭直四（Closed Straight-Four）」可证引理以提前 2 层截断。',
         targetCppModule: 'ldprover_terminal (benson_uca.cc)',
-        estimatedSpeedup: '根节点预算内直接收敛 (< 900 nodes)',
+        estimatedSpeedup: '缩短末端直四分隔层数',
       },
     }
   ),
@@ -759,10 +1023,10 @@ export const STUDY_LD_RZ_PROBLEMS_CATALOG: TsumegoProblemSpec[] = [
     'chao_vol1_p042.json',
     rawP042 as RawStudyLdRzProblemJson,
     {
-      title: 'RZ-04 · chao_vol1_p042（左右见合直四活形 · 纯经典 Benson 已证）',
+      title: 'RZ-04 · chao_vol1_p042（左右见合直四活形 · 153 点全区域完备证明）',
       expectedOutcome: ProofOutcome.ProvenWin,
       description:
-        '直读 public/tsumego/chao_vol1_p042.json（黑关键子 or）。原谱包含三个正解分支：正解1 B[os] -> W[sq] -> B[sr]、正解2 B[sq] -> W[os] -> B[ss]、正解3 B[rs]。在 100% 纯经典 Benson (1976) 终局算子下约 2035 节点形式化证明 PROVEN_WIN（RZ 剪枝 285 次，lproof/1 独立校验 PASS）！',
+        '直读 public/tsumego/chao_vol1_p042.json（黑关键子 or，完整保留 153 点原始 region，零裁剪）。原谱包含三个正解分支：正解1 B[os] -> W[sq] -> B[sr]、正解2 B[sq] -> W[os] -> B[ss]、正解3 B[rs]。引擎在完整 153 点原 region 下完成全称应手覆盖证明，并经零信任 lproof/1 独立检查器语义重放通过！',
     }
   ),
   parseStudyLdRzJsonToProblemSpec(

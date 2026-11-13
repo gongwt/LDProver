@@ -48,6 +48,14 @@ class ProblemContractParser {
       const std::string& black_crucial_stone,
       const std::string& white_crucial_stone,
       const std::string& turn_color = "",
+      TurnConflictPolicy conflict_policy = TurnConflictPolicy::kRejectStrict,
+      const std::string& region_str = "",
+      bool attacker_allow_ko = false,
+      bool defender_allow_ko = true) const;
+
+  // Parse a raw study-LD-RZ / tsumego JSON object string directly.
+  ParsedProblem<N> ParseTsumegoJsonObject(
+      const std::string& problem_id, const std::string& raw_json_text,
       TurnConflictPolicy conflict_policy =
           TurnConflictPolicy::kRejectStrict) const;
 };

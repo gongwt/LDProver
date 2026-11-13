@@ -259,9 +259,17 @@ export class TranspositionStore {
       rec.lastTouchSeq = ++this.touchSeq;
       this.patternHits++;
 
-      // Check full HistorySet equality for ProofReusable grade (FR-6.3, FR-6.9)
+      // Check full board + HistorySet equality for direct ProofReusable grade (FR-6.3, FR-6.9);
+      // any outside-RZ stone difference returns HEURISTIC_ONLY so DfpnSolver runs full
+      // RevalidateSourceProofOnQueryState before accepting proof reuse.
       let fullHistEqual =
-        pos.historySnapshots.length === rec.historySnapshots.length;
+        pos.historySnapshots.length === rec.historySnapshots.length &&
+        pos.historySnapshots.length > 0 &&
+        GoPosition.snapshotsMatch(
+          pos.historySnapshots[pos.historySnapshots.length - 1],
+          rec.historySnapshots[rec.historySnapshots.length - 1],
+          KoRule.SituationalSuperko
+        );
       if (fullHistEqual && context.koRule !== KoRule.SimpleKoOnly) {
         for (let i = 0; i < pos.historySnapshots.length; i++) {
           if (

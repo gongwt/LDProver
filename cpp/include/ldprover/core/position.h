@@ -89,6 +89,7 @@ class Position {
   }
 
   std::vector<int> OrthogonalNeighbors(int coord) const;
+  std::vector<int> DiagonalNeighbors(int coord) const;
   BitBoard<N> FloodFillChain(int start_coord, BitBoard<N>* out_liberties) const;
 
  private:

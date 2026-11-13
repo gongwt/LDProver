@@ -126,6 +126,19 @@ std::vector<int> Position<N>::OrthogonalNeighbors(int coord) const {
 }
 
 template <int N>
+std::vector<int> Position<N>::DiagonalNeighbors(int coord) const {
+  std::vector<int> nb;
+  nb.reserve(4);
+  const int r = RowOf(coord);
+  const int c = ColOf(coord);
+  if (r > 0 && c > 0) nb.push_back(CoordFromRowCol(r - 1, c - 1));
+  if (r > 0 && c + 1 < N) nb.push_back(CoordFromRowCol(r - 1, c + 1));
+  if (r + 1 < N && c > 0) nb.push_back(CoordFromRowCol(r + 1, c - 1));
+  if (r + 1 < N && c + 1 < N) nb.push_back(CoordFromRowCol(r + 1, c + 1));
+  return nb;
+}
+
+template <int N>
 BitBoard<N> Position<N>::FloodFillChain(int start_coord,
                                         BitBoard<N>* out_liberties) const {
   BitBoard<N> chain;

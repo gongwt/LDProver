@@ -151,13 +151,19 @@ export class GoPosition {
   private boardZobrist: bigint = 0n;
   private cachedZobristHex: string | null = null;
 
+  private readonly bfsStamp: Uint32Array;
+  private readonly libStamp: Uint32Array;
+  private readonly bfsQueue: Int32Array;
+  private stampCounter = 1;
+
   constructor(
     context: ProofContext,
     boardSize: number = DEFAULT_BOARD_SIZE,
     immortalWallCoords: number[] = []
   ) {
+    const numPts = boardSize * boardSize;
     this.boardSize = boardSize;
-    this.grid = new Uint8Array(boardSize * boardSize);
+    this.grid = new Uint8Array(numPts);
     this.toPlay = Color.Black;
     this.koPoint = NULL_MOVE;
     this.consecutivePasses = 0;
@@ -168,6 +174,19 @@ export class GoPosition {
     this.immortalWallSet = new Set(immortalWallCoords);
     this.orthoTable = getOrthoTable(boardSize);
     this.diagTable = getDiagTable(boardSize);
+    this.bfsStamp = new Uint32Array(numPts);
+    this.libStamp = new Uint32Array(numPts);
+    this.bfsQueue = new Int32Array(numPts);
+  }
+
+  private nextStamp(): number {
+    this.stampCounter = (this.stampCounter + 1) >>> 0;
+    if (this.stampCounter === 0) {
+      this.bfsStamp.fill(0);
+      this.libStamp.fill(0);
+      this.stampCounter = 1;
+    }
+    return this.stampCounter;
   }
 
   public clone(): GoPosition {
@@ -197,6 +216,42 @@ export class GoPosition {
       if (pastCount >= currCount) return false;
     }
     return true;
+  }
+
+  /**
+   * True iff placing one stone without capturing strictly exceeds every historical
+   * snapshot's total stone count, guaranteeing zero SSK/PSK superko collision even after passes.
+   */
+  public canNonCaptureExceedAllPastStoneCounts(): boolean {
+    const n = this.historySnapshots.length;
+    if (n <= 1) return true;
+    const currCount =
+      this.historySnapshots[n - 1].blackCoords.length +
+      this.historySnapshots[n - 1].whiteCoords.length;
+    for (let i = 0; i < n - 1; i++) {
+      const pastCount =
+        this.historySnapshots[i].blackCoords.length +
+        this.historySnapshots[i].whiteCoords.length;
+      if (pastCount > currCount) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Computes an exact canonical digest of the SSK/PSK HistorySet so search caches
+   * (such as nodeFrontierCache) never conflate states with distinct superko histories.
+   */
+  public computeCanonicalHistoryKey(): string {
+    if (this.context.koRule === KoRule.SimpleKoOnly) {
+      return `simple:${this.koPoint}`;
+    }
+    const items = this.historySnapshots.map((s) =>
+      this.context.koRule === KoRule.SituationalSuperko
+        ? `${s.toPlay}:${s.blackCoords.join(',')}/${s.whiteCoords.join(',')}`
+        : `${s.blackCoords.join(',')}/${s.whiteCoords.join(',')}`
+    );
+    items.sort();
+    return items.join('|');
   }
 
   public setupInitialStones(
@@ -269,9 +324,17 @@ export class GoPosition {
   }
 
   public currentCanonicalSnapshot(): CanonicalSnapshot {
+    const blackCoords: number[] = [];
+    const whiteCoords: number[] = [];
+    const g = this.grid;
+    for (let i = 0; i < g.length; i++) {
+      const v = g[i];
+      if (v === Color.Black) blackCoords.push(i);
+      else if (v === Color.White) whiteCoords.push(i);
+    }
     return {
-      blackCoords: this.getBlackCoords(),
-      whiteCoords: this.getWhiteCoords(),
+      blackCoords,
+      whiteCoords,
       toPlay: this.toPlay,
       zobristHex: this.computeZobristHex(),
     };
@@ -317,27 +380,66 @@ export class GoPosition {
     return this.diagTable[coord] ?? [];
   }
 
+  /**
+   * Zero-allocation liberty count check using typed stamp buffers.
+   * Returns true iff the chain at `startCoord` has >= `minLibs` liberties.
+   */
+  public chainHasAtLeastLiberties(startCoord: number, minLibs: number): boolean {
+    const color = this.grid[startCoord];
+    if (color === Color.Empty) return false;
+    const stamp = this.nextStamp();
+    this.bfsStamp[startCoord] = stamp;
+    this.bfsQueue[0] = startCoord;
+    let head = 0;
+    let tail = 1;
+    let libs = 0;
+
+    while (head < tail) {
+      const cur = this.bfsQueue[head++];
+      const nbs = this.orthoTable[cur];
+      for (let i = 0; i < nbs.length; i++) {
+        const nb = nbs[i];
+        const nbCol = this.grid[nb];
+        if (nbCol === Color.Empty) {
+          if (this.libStamp[nb] !== stamp) {
+            this.libStamp[nb] = stamp;
+            libs++;
+            if (libs >= minLibs) return true;
+          }
+        } else if (nbCol === color && this.bfsStamp[nb] !== stamp) {
+          this.bfsStamp[nb] = stamp;
+          this.bfsQueue[tail++] = nb;
+        }
+      }
+    }
+    return libs >= minLibs;
+  }
+
   public floodFillChain(startCoord: number): ChainFloodResult {
     const stones = new Set<number>();
     const liberties = new Set<number>();
     const color = this.grid[startCoord] as Color;
     if (!color) return { stones, liberties };
 
-    const queue: number[] = [startCoord];
+    const stamp = this.nextStamp();
+    this.bfsStamp[startCoord] = stamp;
+    this.bfsQueue[0] = startCoord;
     stones.add(startCoord);
     let head = 0;
+    let tail = 1;
 
-    while (head < queue.length) {
-      const cur = queue[head++];
+    while (head < tail) {
+      const cur = this.bfsQueue[head++];
       const nbs = this.orthoTable[cur];
       for (let i = 0; i < nbs.length; i++) {
         const nb = nbs[i];
         const nbColor = this.grid[nb];
         if (nbColor === Color.Empty) {
           liberties.add(nb);
-        } else if (nbColor === color && !stones.has(nb)) {
+        } else if (nbColor === color && this.bfsStamp[nb] !== stamp) {
+          this.bfsStamp[nb] = stamp;
           stones.add(nb);
-          queue.push(nb);
+          this.bfsQueue[tail++] = nb;
         }
       }
     }
@@ -383,14 +485,17 @@ export class GoPosition {
       us === Color.Black ? ZOBRIST_BLACK[move] : ZOBRIST_WHITE[move];
 
     const capturedCoords: number[] = [];
-    const capturedSeen = new Set<number>();
+    let capturedSeen: Set<number> | null = null;
     const nbs = this.orthoTable[move];
 
     for (let i = 0; i < nbs.length; i++) {
       const nb = nbs[i];
-      if (this.grid[nb] === them && !capturedSeen.has(nb)) {
-        const enemyChain = this.floodFillChain(nb);
-        if (enemyChain.liberties.size === 0) {
+      if (
+        this.grid[nb] === them &&
+        (capturedSeen === null || !capturedSeen.has(nb))
+      ) {
+        if (!this.chainHasAtLeastLiberties(nb, 1)) {
+          const enemyChain = this.floodFillChain(nb);
           let isImmortal = false;
           for (const s of enemyChain.stones) {
             if (this.immortalWallSet.has(s)) {
@@ -399,6 +504,7 @@ export class GoPosition {
             }
           }
           if (!isImmortal) {
+            if (capturedSeen === null) capturedSeen = new Set<number>();
             for (const s of enemyChain.stones) {
               capturedSeen.add(s);
               capturedCoords.push(s);
@@ -422,8 +528,32 @@ export class GoPosition {
       }
     }
 
-    const ourChain = this.floodFillChain(move);
-    if (ourChain.liberties.size === 0) {
+    let isKoCapture = false;
+    let nextKo = NULL_MOVE;
+
+    if (capturedCoords.length === 1) {
+      const ourChain = this.floodFillChain(move);
+      if (ourChain.liberties.size === 0) {
+        let ourIsImmortal = false;
+        for (const s of ourChain.stones) {
+          if (this.immortalWallSet.has(s)) {
+            ourIsImmortal = true;
+            break;
+          }
+        }
+        if (!ourIsImmortal) {
+          this.grid[move] = Color.Empty;
+          this.grid[capturedCoords[0]] = them;
+          this.boardZobrist = prevBoardZobrist;
+          this.survivingTargetTokensMask = prevTokens;
+          return { legal: false, capturedCoords: [], isKoCapture: false };
+        }
+      } else if (ourChain.stones.size === 1 && ourChain.liberties.size === 1) {
+        nextKo = capturedCoords[0];
+        isKoCapture = true;
+      }
+    } else if (!this.chainHasAtLeastLiberties(move, 1)) {
+      const ourChain = this.floodFillChain(move);
       let ourIsImmortal = false;
       for (const s of ourChain.stones) {
         if (this.immortalWallSet.has(s)) {
@@ -432,7 +562,6 @@ export class GoPosition {
         }
       }
       if (!ourIsImmortal) {
-        // Suicide is forbidden (FR-2.1, C-2): restore state
         this.grid[move] = Color.Empty;
         for (let i = 0; i < capturedCoords.length; i++) {
           this.grid[capturedCoords[i]] = them;
@@ -441,17 +570,6 @@ export class GoPosition {
         this.survivingTargetTokensMask = prevTokens;
         return { legal: false, capturedCoords: [], isKoCapture: false };
       }
-    }
-
-    let nextKo = NULL_MOVE;
-    let isKoCapture = false;
-    if (
-      capturedCoords.length === 1 &&
-      ourChain.stones.size === 1 &&
-      ourChain.liberties.size === 1
-    ) {
-      nextKo = capturedCoords[0];
-      isKoCapture = true;
     }
 
     this.koPoint = nextKo;
@@ -495,7 +613,10 @@ export class GoPosition {
     return { legal: true, capturedCoords, isKoCapture };
   }
 
-  public isLegalMove(move: number, knownMonotonicHistory?: boolean): boolean {
+  public isLegalMove(
+    move: number,
+    canExceedPastCounts?: boolean
+  ): boolean {
     if (this.consecutivePasses >= 2) return false;
     if (move === PASS_MOVE) return true;
     if (
@@ -516,15 +637,15 @@ export class GoPosition {
       }
     }
 
-    const monotonic =
-      knownMonotonicHistory ?? this.isCaptureFreeMonotonicHistory();
-    if (monotonic && hasEmptyNb) {
+    const nonCapSafe =
+      canExceedPastCounts ?? this.canNonCaptureExceedAllPastStoneCounts();
+    if (nonCapSafe && hasEmptyNb) {
       const them = oppositeColor(this.toPlay);
       let mightCapture = false;
       for (let i = 0; i < nbs.length; i++) {
         const n = nbs[i];
         if (this.grid[n] === them && !this.immortalWallSet.has(n)) {
-          if (this.floodFillChain(n).liberties.size <= 1) {
+          if (!this.chainHasAtLeastLiberties(n, 2)) {
             mightCapture = true;
             break;
           }
@@ -542,12 +663,12 @@ export class GoPosition {
       for (let i = 0; i < nbs.length; i++) {
         const n = nbs[i];
         if (this.grid[n] === us) {
-          if (this.floodFillChain(n).liberties.size >= 2) {
+          if (this.chainHasAtLeastLiberties(n, 2)) {
             connectsAliveFriendly = true;
             break;
           }
         } else if (this.grid[n] === them && !this.immortalWallSet.has(n)) {
-          if (this.floodFillChain(n).liberties.size === 1) {
+          if (!this.chainHasAtLeastLiberties(n, 2)) {
             capturesEnemy = true;
             break;
           }
@@ -556,7 +677,7 @@ export class GoPosition {
       if (!connectsAliveFriendly && !capturesEnemy) {
         return false;
       }
-      if (monotonic && connectsAliveFriendly && !capturesEnemy) {
+      if (nonCapSafe && connectsAliveFriendly && !capturesEnemy) {
         return true;
       }
     }
@@ -567,20 +688,20 @@ export class GoPosition {
 
   public generateLegalMoves(regionCoords?: number[]): number[] {
     if (this.consecutivePasses >= 2) return [];
-    const monotonic = this.isCaptureFreeMonotonicHistory();
+    const nonCapSafe = this.canNonCaptureExceedAllPastStoneCounts();
     const legal: number[] = [];
 
     if (regionCoords && regionCoords.length > 0) {
       for (let i = 0; i < regionCoords.length; i++) {
         const c = regionCoords[i];
         if (this.grid[c] === Color.Empty && c !== this.koPoint) {
-          if (this.isLegalMove(c, monotonic)) legal.push(c);
+          if (this.isLegalMove(c, nonCapSafe)) legal.push(c);
         }
       }
     } else {
       for (let c = 0; c < this.grid.length; c++) {
         if (this.grid[c] === Color.Empty && c !== this.koPoint) {
-          if (this.isLegalMove(c, monotonic)) legal.push(c);
+          if (this.isLegalMove(c, nonCapSafe)) legal.push(c);
         }
       }
     }

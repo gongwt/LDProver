@@ -180,6 +180,13 @@ struct TargetToken {
   int16_t initial_coord = 0;
   uint8_t group_index = 0;
   Color stone_color = Color::kBlack;
+
+  bool operator==(const TargetToken& other) const noexcept {
+    return token_id == other.token_id &&
+           initial_coord == other.initial_coord &&
+           group_index == other.group_index &&
+           stone_color == other.stone_color;
+  }
 };
 
 // Structured ProofContext (C-6, FR-6.1, FR-6.2, FR-9.1).
@@ -202,7 +209,7 @@ struct ProofContext {
            ko_rule == other.ko_rule &&
            attacker_allow_ko == other.attacker_allow_ko &&
            defender_allow_ko == other.defender_allow_ko &&
-           initial_tokens.size() == other.initial_tokens.size();
+           initial_tokens == other.initial_tokens;
   }
 };
 
