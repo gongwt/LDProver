@@ -662,19 +662,21 @@ export class DfpnSolver {
           };
         }
       }
-      // At AND nodes (consecutivePasses === 0), prioritize Null-Move (PASS) inside the initial
-      // window so `activeNullMoveRz` is seeded early for OutsideRZRevalidated pruning!
+      // At AND nodes (consecutivePasses === 0), place Null-Move (PASS) inside the initial
+      // tactical window (right behind top immediate captures/vital refutations) so that once
+      // the #1 defense does not immediately refute, PASS either seeds `activeNullMoveRz` to
+      // prune 120+ outer-moat moves across the whole frontier or immediately refutes dead shapes.
       if (!isOrNode && pos.consecutivePasses === 0) {
         if (parentEyeLikeCount >= 2) {
           return {
-            score: 1950,
+            score: 3850,
             immediateWin: false,
             immediateLoss: false,
             inAttention: true,
           };
         }
         return {
-          score: this.config.enableRzPruning ? 1050 : 360,
+          score: this.config.enableRzPruning ? 3450 : 360,
           immediateWin: false,
           immediateLoss: false,
           inAttention: true,
@@ -688,11 +690,37 @@ export class DfpnSolver {
       };
     }
 
-    const inAttention = this.activeAttentionMask
+    const orthoNbs = pos.orthogonalNeighbors(move);
+    let inAttention = this.activeAttentionMask
       ? this.activeAttentionMask.coords.has(move)
       : true;
 
-    const orthoNbs = pos.orthogonalNeighbors(move);
+    // Dynamic tactical attention: follow the live fight when crucial target chains extend
+    // (or non-immortal chains drop to <= 3 liberties) beyond the static root bounding box.
+    if (!inAttention && tacCtx.crucialLibMinLibs[move] < 99) {
+      inAttention = true;
+    }
+    if (!inAttention) {
+      for (let i = 0; i < orthoNbs.length; i++) {
+        const nb = orthoNbs[i];
+        if (pos.grid[nb] !== Color.Empty && !pos.immortalWallSet.has(nb)) {
+          const cid = tacCtx.chainIdAt[nb];
+          if (cid >= 0 && !tacCtx.chainIsImmortal[cid] && tacCtx.chainLibs[cid] <= 3) {
+            inAttention = true;
+            break;
+          }
+        }
+      }
+    }
+    if (!inAttention) {
+      const dNbs = pos.diagonalNeighbors(move);
+      for (let i = 0; i < dNbs.length; i++) {
+        if (tacCtx.crucialStoneMask[dNbs[i]]) {
+          inAttention = true;
+          break;
+        }
+      }
+    }
 
     // Fast O(1) path for outer buffer-moat moves (`!inAttention`) that touch no tactical stones
     if (!inAttention) {
@@ -898,9 +926,9 @@ export class DfpnSolver {
       if (st === tacCtx.targetColor) targetDiagCount++;
     }
 
+    let splitsEyeCavity = false;
     if (emptyOrthoCount >= 2 && inAttention) {
       // Check if two empty orthogonal neighbors are separated (vital eye-splitting / nakade point!)
-      let splitsEyeCavity = false;
       for (let i = 0; i < orthoNbs.length && !splitsEyeCavity; i++) {
         const a = orthoNbs[i];
         if (pos.grid[a] !== Color.Empty) continue;
@@ -1019,6 +1047,78 @@ export class DfpnSolver {
       score += 290;
     }
 
+    // 4. Exact post-move single-point true-eye count & immediate Benson UCA detection.
+    // Checking `evaluateTerminal` on the few high-potential in-attention OR-node moves
+    // lets 1-move Benson lives jump directly to rank #0 (`pn=1, dn=10`), closing null-move
+    // proofs in 1 node instead of grinding through tied-score alternatives.
+    let postTrueEyes = 0;
+    if (inAttention && ourChain.liberties.size >= 2) {
+      for (let i = 0; i < orthoNbs.length; i++) {
+        const ep = orthoNbs[i];
+        if (probe.grid[ep] !== Color.Empty) continue;
+        const epOrtho = probe.orthogonalNeighbors(ep);
+        let allTarget = true;
+        for (let j = 0; j < epOrtho.length; j++) {
+          if (probe.grid[epOrtho[j]] !== tacCtx.targetColor) {
+            allTarget = false;
+            break;
+          }
+        }
+        if (allTarget) {
+          const epDiag = probe.diagonalNeighbors(ep);
+          let enemyDiags = 0;
+          for (let j = 0; j < epDiag.length; j++) {
+            if (probe.grid[epDiag[j]] === oppTargetColor) enemyDiags++;
+          }
+          const maxEnemyDiags = epDiag.length === 4 ? 1 : 0;
+          if (enemyDiags <= maxEnemyDiags) {
+            postTrueEyes++;
+          }
+        }
+      }
+      if (postTrueEyes > 0) {
+        score += postTrueEyes * 680;
+      }
+
+      // 4b. Crucial-chain liberty-delta heuristic (O(1), zero extra flood-fill):
+      // Extending a living/escaping crucial chain outward to expand liberties & eye space
+      // outranks cramping into an enemy wall and shrinking liberties without making an eye.
+      if (cLibs < 99 && pos.toPlay === tacCtx.targetColor) {
+        const libDelta = ourChain.liberties.size - cLibs;
+        if (libDelta >= 2) {
+          score += 560;
+        } else if (libDelta === 1) {
+          score += 260;
+        } else if (
+          libDelta < 0 &&
+          res.capturedCoords.length === 0 &&
+          postTrueEyes === 0 &&
+          !splitsEyeCavity &&
+          !connectsDistinctFriendly
+        ) {
+          score -= 220;
+        }
+      }
+
+      if (
+        isOrNode &&
+        context.attackerGoal === SearchGoal.ToLive &&
+        (postTrueEyes > 0 ||
+          res.capturedCoords.length > 0 ||
+          score >= 2200)
+      ) {
+        const term = this.terminalEval.evaluateTerminal(probe, context, false);
+        if (term.status === TerminalStatus.Win) {
+          return {
+            score: 58000,
+            immediateWin: true,
+            immediateLoss: false,
+            inAttention: true,
+          };
+        }
+      }
+    }
+
     return {
       score,
       immediateWin: false,
@@ -1027,7 +1127,8 @@ export class DfpnSolver {
     };
   }
 
-  // Assign heuristic initial (pn_0, dn_0) in [1, 200] to prevent uniform breadth-first collapse
+  // Assign heuristic initial (pn_0, dn_0) with gentle rank separation so winning moves at
+  // rank #2..#4 are reached quickly while eps (+4, 1.5x) still prevents depth-2..4 bounce.
   private computeInitialChildBounds(
     rankIdx: number,
     isOrNode: boolean,
@@ -1051,29 +1152,31 @@ export class DfpnSolver {
       }
       let pn = 1;
       if (rankIdx === 0) pn = 1;
-      else if (rankIdx === 1) pn = 2;
-      else if (rankIdx === 2) pn = 3;
-      else if (rankIdx <= 5) pn = 4 + (rankIdx - 3) * 2;
-      else if (rankIdx <= 10) pn = 10 + (rankIdx - 5) * 2;
-      else pn = 22 + (rankIdx - 10) * 3;
-      if (meta.score < 0) pn += 20;
+      else if (rankIdx === 1) pn = 4;
+      else if (rankIdx === 2) pn = 8;
+      else if (rankIdx <= 5) pn = 12 + (rankIdx - 3) * 4;
+      else if (rankIdx <= 10) pn = 24 + (rankIdx - 5) * 5;
+      else pn = 50 + (rankIdx - 10) * 6;
+      if (meta.score < 0) pn += 24;
       return { pn, dn: 1 };
     } else {
       // AND node: `dn` drives selection of defender refutations; `pn` aggregates proof obligation
       if (meta.immediateLoss) return { pn: 10, dn: 1 };
       if (move === PASS_MOVE) {
-        return meta.score >= 1500 ? { pn: 1, dn: 1 } : { pn: 1, dn: 4 };
+        if (rankIdx === 0) return { pn: 1, dn: 1 };
+        return meta.score >= 3400 ? { pn: 1, dn: 3 } : { pn: 1, dn: 5 };
       }
       if (!meta.inAttention) {
-        return { pn: 1, dn: 85 + rankIdx * 3 };
+        return { pn: 1, dn: 96 + rankIdx * 4 };
       }
       let dn = 1;
       if (rankIdx === 0) dn = 1;
-      else if (rankIdx <= 2) dn = 2;
-      else if (rankIdx <= 5) dn = 3 + (rankIdx - 2);
-      else if (rankIdx <= 10) dn = 7 + (rankIdx - 5) * 2;
-      else dn = 18 + (rankIdx - 10) * 3;
-      if (meta.score < 0) dn += 12;
+      else if (rankIdx === 1) dn = 4;
+      else if (rankIdx === 2) dn = 8;
+      else if (rankIdx <= 5) dn = 12 + (rankIdx - 3) * 4;
+      else if (rankIdx <= 10) dn = 24 + (rankIdx - 5) * 5;
+      else dn = 50 + (rankIdx - 10) * 6;
+      if (meta.score < 0) dn += 16;
       return { pn: 1, dn };
     }
   }
@@ -1577,136 +1680,194 @@ export class DfpnSolver {
       let windowSize = totalLegal;
       if (this.config.enableProgressiveWidening && frontier.wideningLevel < 6) {
         const baseK = isOrNode
-          ? this.config.wideningBaseK
-          : Math.max(4, Math.floor(this.config.wideningBaseK / 2));
+          ? Math.min(this.config.wideningBaseK, depth === 0 ? 4 : 3)
+          : Math.min(Math.max(2, Math.floor(this.config.wideningBaseK / 2)), 3);
         const cap = baseK * Math.pow(2, frontier.wideningLevel);
         if (cap < totalLegal) windowSize = cap;
       }
 
-      // FR-5.5: OutsideRZRevalidated sibling/null-move certificate pruning
-      if (
+      const hasActiveRz =
         this.config.enableRzPruning &&
-        frontier.activeNullMoveRz &&
-        frontier.representativeDagId >= 0
-      ) {
-        const restrictedSide =
-          (pos.toPlay === context.rootAttacker && !context.attackerAllowKo) ||
-          (pos.toPlay !== context.rootAttacker && !context.defenderAllowKo);
+        frontier.activeNullMoveRz !== null &&
+        frontier.representativeDagId >= 0;
 
-        for (let i = 0; i < windowSize; i++) {
+      // Helper to run zero-trust OutsideRZRevalidated revalidation on a single candidate child.
+      const tryPruneChildOutsideRz = (
+        ch: SearchChildSlot,
+        restrictedSide: boolean
+      ): boolean => {
+        if (
+          !frontier.activeNullMoveRz ||
+          ch.expanded ||
+          ch.outcome !== ProofOutcome.Unknown ||
+          ch.checkedNullMoveDagId === frontier.representativeDagId
+        ) {
+          return false;
+        }
+        ch.checkedNullMoveDagId = frontier.representativeDagId;
+        if (!this.rzEngine.isOutsideRZCandidate(ch.move, frontier.activeNullMoveRz)) {
+          return false;
+        }
+        const nextPos = pos.clone();
+        const playRes = nextPos.playMove(ch.move);
+        if (
+          !playRes.legal ||
+          (playRes.isKoCapture && restrictedSide) ||
+          !this.revalidateSourceProofOnQueryState(
+            nextPos,
+            context,
+            regionCoords,
+            frontier.representativeDagId,
+            frontier.representativeOutcome
+          )
+        ) {
+          return false;
+        }
+        const qStateId =
+          ch.stateId >= 0
+            ? ch.stateId
+            : this.registerState(nextPos, currentStateId, ch.move);
+        ch.stateId = qStateId;
+        ch.hasCapture = playRes.capturedCoords.length > 0;
+        const qStateEntry = this.stateTable[qStateId];
+        const srcNode = this.proofDagNodes[frontier.representativeDagId];
+
+        const prunedCert: PrunedCertificateRecord = {
+          queryStateId: qStateId,
+          queryHistoryId: qStateEntry.historyId,
+          sourceStateId: srcNode.stateId,
+          sourceHistoryId: srcNode.historyId,
+          sourceProofNodeId: frontier.representativeDagId,
+          contextId: context.contextId,
+          prunedMove: ch.move,
+          representativeMove: frontier.representativeMove,
+          certificateRzCoords: frontier.activeNullMoveRz.toArray(),
+          reason: 'OutsideRZRevalidated',
+        };
+
+        const prunedNodeId = this.proofDagNodes.length;
+        this.proofDagNodes.push({
+          nodeId: prunedNodeId,
+          stateId: qStateId,
+          historyId: qStateEntry.historyId,
+          parentStateId: currentStateId,
+          isOrNode: !isOrNode,
+          toPlay: nextPos.toPlay,
+          incomingMove: ch.move,
+          incomingMoveSgf: coordToSgf(ch.move, pos.boardSize),
+          pn:
+            frontier.representativeOutcome === ProofOutcome.ProvenWin
+              ? 0
+              : PN_DN_SATURATION,
+          dn:
+            frontier.representativeOutcome === ProofOutcome.ProvenWin
+              ? PN_DN_SATURATION
+              : 0,
+          outcome: frontier.representativeOutcome,
+          terminalEvidence: 'OUTSIDE_RZ_REVALIDATED',
+          isPrunedOutsideRz: true,
+          isTtHit: false,
+          isKoDependentBarrier: false,
+          sourceProofNodeId: frontier.representativeDagId,
+          proofRzCoords: frontier.activeNullMoveRz.toArray(),
+          disproofRzCoords: frontier.activeNullMoveRz.toArray(),
+          childNodeIds: [],
+          childMoves: [],
+          prunedCertificate: prunedCert,
+        });
+        this.dagHasCapture.push(
+          ch.hasCapture || Boolean(this.dagHasCapture[frontier.representativeDagId])
+        );
+
+        ch.expanded = true;
+        ch.prunedOutsideRz = true;
+        ch.outcome = frontier.representativeOutcome;
+        ch.pn =
+          frontier.representativeOutcome === ProofOutcome.ProvenWin
+            ? 0
+            : PN_DN_SATURATION;
+        ch.dn =
+          frontier.representativeOutcome === ProofOutcome.ProvenWin
+            ? PN_DN_SATURATION
+            : 0;
+        ch.proofRz = frontier.activeNullMoveRz;
+        ch.disproofRz = frontier.activeNullMoveRz;
+        ch.dagNodeId = prunedNodeId;
+        ch.prunedCert = prunedCert;
+        this.prunedOutsideRzCount++;
+        return true;
+      };
+
+      const restrictedSide =
+        (pos.toPlay === context.rootAttacker && !context.attackerAllowKo) ||
+        (pos.toPlay !== context.rootAttacker && !context.defenderAllowKo);
+
+      // O(1) lazy outside-RZ predicate: an unexpanded Unknown move strictly outside
+      // `activeNullMoveRz` that has not failed revalidation is deferred until all in-RZ
+      // moves are proven (avoiding both 130+ wasted DAG pushes on refuted internal nodes
+      // and artificial `widenTrigger` throttling from irrelevant outer-moat moves!).
+      const isLazyOutsideRz = (ch: SearchChildSlot): boolean =>
+        hasActiveRz &&
+        !ch.expanded &&
+        ch.outcome === ProofOutcome.Unknown &&
+        ch.checkedNullMoveDagId !== frontier.representativeDagId &&
+        this.rzEngine.isOutsideRZCandidate(ch.move, frontier.activeNullMoveRz!);
+
+      // FR-5.5: When `activeNullMoveRz` is present, focus the active frontier exclusively on
+      // non-lazy moves (all moves inside RZ plus any already-expanded or reval-failed moves)
+      // across the entire legal set, deferring outer-moat revalidation until in-RZ closure.
+      const activeIndices: number[] = [];
+      let lazyOutsideCount = 0;
+      let unexpandedU = 0;
+      let firstUnexpandedIdx = -1;
+      let outsideWitnessMetric = PN_DN_SATURATION;
+
+      if (hasActiveRz) {
+        for (let i = 0; i < totalLegal; i++) {
           const ch = children[i];
-          if (
-            ch.expanded ||
-            ch.outcome !== ProofOutcome.Unknown ||
-            ch.checkedNullMoveDagId === frontier.representativeDagId
-          ) {
-            continue;
+          if (isLazyOutsideRz(ch)) {
+            lazyOutsideCount++;
+          } else {
+            activeIndices.push(i);
           }
-          ch.checkedNullMoveDagId = frontier.representativeDagId;
-          if (
-            this.rzEngine.isOutsideRZCandidate(
-              ch.move,
-              frontier.activeNullMoveRz
-            )
-          ) {
-            const nextPos = pos.clone();
-            const playRes = nextPos.playMove(ch.move);
-            if (
-              playRes.legal &&
-              !(playRes.isKoCapture && restrictedSide) &&
-              this.revalidateSourceProofOnQueryState(
-                nextPos,
-                context,
-                regionCoords,
-                frontier.representativeDagId,
-                frontier.representativeOutcome
-              )
-            ) {
-              const qStateId =
-                ch.stateId >= 0
-                  ? ch.stateId
-                  : this.registerState(nextPos, currentStateId, ch.move);
-              ch.stateId = qStateId;
-              ch.hasCapture = playRes.capturedCoords.length > 0;
-              const qStateEntry = this.stateTable[qStateId];
-              const srcNode = this.proofDagNodes[frontier.representativeDagId];
-
-              const prunedCert: PrunedCertificateRecord = {
-                queryStateId: qStateId,
-                queryHistoryId: qStateEntry.historyId,
-                sourceStateId: srcNode.stateId,
-                sourceHistoryId: srcNode.historyId,
-                sourceProofNodeId: frontier.representativeDagId,
-                contextId: context.contextId,
-                prunedMove: ch.move,
-                representativeMove: frontier.representativeMove,
-                certificateRzCoords: frontier.activeNullMoveRz.toArray(),
-                reason: 'OutsideRZRevalidated',
-              };
-
-              const prunedNodeId = this.proofDagNodes.length;
-              this.proofDagNodes.push({
-                nodeId: prunedNodeId,
-                stateId: qStateId,
-                historyId: qStateEntry.historyId,
-                parentStateId: currentStateId,
-                isOrNode: !isOrNode,
-                toPlay: nextPos.toPlay,
-                incomingMove: ch.move,
-                incomingMoveSgf: coordToSgf(ch.move, pos.boardSize),
-                pn:
-                  frontier.representativeOutcome === ProofOutcome.ProvenWin
-                    ? 0
-                    : PN_DN_SATURATION,
-                dn:
-                  frontier.representativeOutcome === ProofOutcome.ProvenWin
-                    ? PN_DN_SATURATION
-                    : 0,
-                outcome: frontier.representativeOutcome,
-                terminalEvidence: 'OUTSIDE_RZ_REVALIDATED',
-                isPrunedOutsideRz: true,
-                isTtHit: false,
-                isKoDependentBarrier: false,
-                sourceProofNodeId: frontier.representativeDagId,
-                proofRzCoords: frontier.activeNullMoveRz.toArray(),
-                disproofRzCoords: frontier.activeNullMoveRz.toArray(),
-                childNodeIds: [],
-                childMoves: [],
-                prunedCertificate: prunedCert,
-              });
-              this.dagHasCapture.push(
-                ch.hasCapture ||
-                  Boolean(this.dagHasCapture[frontier.representativeDagId])
-              );
-
-              ch.expanded = true;
-              ch.prunedOutsideRz = true;
-              ch.outcome = frontier.representativeOutcome;
-              ch.pn =
-                frontier.representativeOutcome === ProofOutcome.ProvenWin
-                  ? 0
-                  : PN_DN_SATURATION;
-              ch.dn =
-                frontier.representativeOutcome === ProofOutcome.ProvenWin
-                  ? PN_DN_SATURATION
-                  : 0;
-              ch.proofRz = frontier.activeNullMoveRz;
-              ch.disproofRz = frontier.activeNullMoveRz;
-              ch.dagNodeId = prunedNodeId;
-              ch.prunedCert = prunedCert;
-              this.prunedOutsideRzCount++;
+        }
+      } else {
+        for (let i = 0; i < windowSize; i++) {
+          activeIndices.push(i);
+        }
+        for (let i = windowSize; i < totalLegal; i++) {
+          const ch = children[i];
+          if (isOrNode) {
+            if (ch.pn === 0 && ch.outcome === ProofOutcome.ProvenWin && !ch.koDependent) {
+              outsideWitnessMetric = 0;
+            }
+            if (ch.dn > 0 || ch.outcome !== ProofOutcome.ProvenLoss || ch.dagNodeId < 0) {
+              unexpandedU++;
+              if (firstUnexpandedIdx < 0) firstUnexpandedIdx = i;
+            }
+          } else {
+            if (ch.dn === 0 && ch.outcome === ProofOutcome.ProvenLoss && !ch.koDependent) {
+              outsideWitnessMetric = 0;
+            }
+            if (ch.pn > 0 || ch.outcome !== ProofOutcome.ProvenWin || ch.dagNodeId < 0) {
+              unexpandedU++;
+              if (firstUnexpandedIdx < 0) firstUnexpandedIdx = i;
             }
           }
         }
+        if (unexpandedU === 0 && windowSize < totalLegal) {
+          for (let i = windowSize; i < totalLegal; i++) activeIndices.push(i);
+          windowSize = totalLegal;
+        }
       }
 
-      // FR-4.1: Frontier PN/DN aggregation with consistent progressive-widening trigger
-      const unexpandedU = Math.max(0, totalLegal - windowSize);
       const widenTrigger =
-        unexpandedU > 0
+        unexpandedU > 0 && firstUnexpandedIdx >= 0
           ? Math.max(
-              isOrNode ? children[windowSize].pn : children[windowSize].dn,
-              (isOrNode ? 14 : 10) * (frontier.wideningLevel + 1)
+              isOrNode
+                ? children[firstUnexpandedIdx].pn
+                : children[firstUnexpandedIdx].dn,
+              (isOrNode ? 20 : 16) * (frontier.wideningLevel + 1)
             )
           : PN_DN_SATURATION;
       let curPn = 1;
@@ -1714,35 +1875,80 @@ export class DfpnSolver {
 
       let forceExpandPassIdx = -1;
       if (isOrNode) {
-        let minPn = PN_DN_SATURATION;
+        let minPn = outsideWitnessMetric;
         let windowSumDn = 0;
-        for (let i = 0; i < windowSize; i++) {
-          minPn = Math.min(minPn, children[i].pn);
-          windowSumDn = clampSat(windowSumDn + children[i].dn);
+        for (let k = 0; k < activeIndices.length; k++) {
+          const ch = children[activeIndices[k]];
+          minPn = Math.min(minPn, ch.pn);
+          windowSumDn = clampSat(windowSumDn + ch.dn);
+        }
+        if (hasActiveRz && minPn >= 48 && minPn < PN_DN_SATURATION) {
+          // Just-in-time relaxation: all sharp in-RZ moves are closed; only stale !inAttention
+          // unexpanded in-RZ obligations remain. Relax their initial pn so we close them cleanly.
+          let relaxed = false;
+          for (let k = 0; k < activeIndices.length; k++) {
+            const ch = children[activeIndices[k]];
+            if (!ch.expanded && ch.outcome === ProofOutcome.Unknown && !ch.koDependent && ch.pn >= 48) {
+              ch.pn = 8;
+              relaxed = true;
+            }
+          }
+          if (relaxed) continue;
         }
         if (unexpandedU > 0) {
           minPn = Math.min(minPn, widenTrigger);
         }
-        if (windowSumDn === 0 && windowSize < totalLegal) {
-          frontier.wideningLevel = frontier.activeNullMoveRz
-            ? 6
-            : frontier.wideningLevel + 1;
+        if (minPn > 0 && windowSumDn === 0 && lazyOutsideCount > 0) {
+          // All in-RZ moves disproven -> batch-revalidate lazy outside-RZ candidates now!
+          for (let i = 0; i < totalLegal; i++) {
+            if (isLazyOutsideRz(children[i])) {
+              tryPruneChildOutsideRz(children[i], restrictedSide);
+            }
+          }
+          continue;
+        }
+        if (minPn > 0 && windowSumDn === 0 && unexpandedU > 0) {
+          frontier.wideningLevel++;
           this.wideningUpgrades++;
           continue;
         }
         curPn = minPn;
-        curDn = clampSat(windowSumDn + (unexpandedU > 0 ? 1 : 0));
+        curDn = clampSat(windowSumDn + (unexpandedU > 0 || lazyOutsideCount > 0 ? 1 : 0));
       } else {
         let windowSumPn = 0;
-        let minDn = PN_DN_SATURATION;
-        for (let i = 0; i < windowSize; i++) {
-          windowSumPn = clampSat(windowSumPn + children[i].pn);
-          minDn = Math.min(minDn, children[i].dn);
+        let minDn = outsideWitnessMetric;
+        for (let k = 0; k < activeIndices.length; k++) {
+          const ch = children[activeIndices[k]];
+          windowSumPn = clampSat(windowSumPn + ch.pn);
+          minDn = Math.min(minDn, ch.dn);
+        }
+        if (hasActiveRz && minDn >= 48 && minDn < PN_DN_SATURATION) {
+          // Just-in-time relaxation: all sharp in-RZ defenses are already proven; only stale
+          // !inAttention unexpanded in-RZ defenses (dn=96+) remain. Relax them to dn=4 so we
+          // finish closing the RZ instead of spiking ancestor dn and bouncing out of the subtree!
+          let relaxed = false;
+          for (let k = 0; k < activeIndices.length; k++) {
+            const ch = children[activeIndices[k]];
+            if (!ch.expanded && ch.outcome === ProofOutcome.Unknown && !ch.koDependent && ch.dn >= 48) {
+              ch.dn = 4;
+              relaxed = true;
+            }
+          }
+          if (relaxed) continue;
         }
         if (unexpandedU > 0) {
           minDn = Math.min(minDn, widenTrigger);
         }
-        if (windowSumPn === 0 && windowSize < totalLegal) {
+        if (minDn > 0 && windowSumPn === 0 && lazyOutsideCount > 0) {
+          // All in-RZ defenses proven -> batch-revalidate lazy outside-RZ moves in one shot!
+          for (let i = 0; i < totalLegal; i++) {
+            if (isLazyOutsideRz(children[i])) {
+              tryPruneChildOutsideRz(children[i], restrictedSide);
+            }
+          }
+          continue;
+        }
+        if (minDn > 0 && windowSumPn === 0 && unexpandedU > 0) {
           // Before widening across the full 153-point region, ensure Null-Move (PASS_MOVE)
           // has been expanded first if legal, so `activeNullMoveRz` carries a stone-free
           // tenuki certificate capable of OutsideRZRevalidated-pruning the outer moat!
@@ -1754,14 +1960,12 @@ export class DfpnSolver {
             curPn = 1;
             curDn = Math.max(1, children[passIdx].dn);
           } else {
-            frontier.wideningLevel = frontier.activeNullMoveRz
-              ? 6
-              : frontier.wideningLevel + 1;
+            frontier.wideningLevel++;
             this.wideningUpgrades++;
             continue;
           }
         } else {
-          curPn = clampSat(windowSumPn + (unexpandedU > 0 ? 1 : 0));
+          curPn = clampSat(windowSumPn + (unexpandedU > 0 || lazyOutsideCount > 0 ? 1 : 0));
           curDn = minDn;
         }
       }
@@ -1770,10 +1974,18 @@ export class DfpnSolver {
       if (curPn === 0 || curDn === 0) {
         if (
           ((isOrNode && curDn === 0) || (!isOrNode && curPn === 0)) &&
-          windowSize < totalLegal
+          (unexpandedU > 0 || lazyOutsideCount > 0)
         ) {
-          frontier.wideningLevel++;
-          this.wideningUpgrades++;
+          if (lazyOutsideCount > 0) {
+            for (let i = 0; i < totalLegal; i++) {
+              if (isLazyOutsideRz(children[i])) {
+                tryPruneChildOutsideRz(children[i], restrictedSide);
+              }
+            }
+          } else {
+            frontier.wideningLevel++;
+            this.wideningUpgrades++;
+          }
           continue;
         }
 
@@ -1937,7 +2149,8 @@ export class DfpnSolver {
         bestMetric = children[forceExpandPassIdx].dn;
         secondBestMetric = PN_DN_SATURATION;
       } else {
-        for (let i = 0; i < windowSize; i++) {
+        for (let k = 0; k < activeIndices.length; k++) {
+          const i = activeIndices[k];
           if (children[i].koDependent) continue;
           const m = isOrNode ? children[i].pn : children[i].dn;
           if (m < bestMetric) {
@@ -1975,9 +2188,10 @@ export class DfpnSolver {
       if (depth === 0) {
         this.rootBestMove = mpc.move;
       }
-      // 1+epsilon df-pn (Pawlewicz & Lew / Kishimoto & Mueller) to prevent +1 ping-pong thrashing
+      // 1+epsilon df-pn (Pawlewicz & Lew / Kishimoto & Mueller) with >= +4 & 1.65x margin so
+      // child thresholds sustain deep tactical reading without bouncing at depths 2..4.
       const epsMetricBound = clampSat(
-        Math.max(secondBestMetric + 1, Math.ceil(secondBestMetric * 1.25) + 1)
+        Math.max(secondBestMetric + 4, Math.ceil(secondBestMetric * 1.65) + 4)
       );
       let childThPn = thPn;
       let childThDn = thDn;
@@ -2034,11 +2248,7 @@ export class DfpnSolver {
       mpc.dagNodeId = subRes.dagNodeId;
       mpc.expanded = true;
 
-      // FR-5.7: KoDependent witness barrier check
-      const restrictedSide =
-        (pos.toPlay === context.rootAttacker && !context.attackerAllowKo) ||
-        (pos.toPlay !== context.rootAttacker && !context.defenderAllowKo);
-
+      // FR-5.7: KoDependent witness barrier check (reuses loop-scoped `restrictedSide`)
       if (
         (playRes.isKoCapture || subRes.koDependent) &&
         restrictedSide &&

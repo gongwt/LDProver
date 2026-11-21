@@ -648,6 +648,96 @@ void TestSection5R8ProblemContractAndConsistency() {
         "code=" + bad_type_ver.error_code);
 }
 
+void TestSection6RealProblemSolverBreakthrough() {
+  std::cout << "\n=== 6. Real Study-LD-RZ Solver Breakthrough (p042 & p031) ===\n";
+  ProblemContractParser<19> parser;
+  ProofArtifactManager<19> checker;
+
+  static const std::string kCommonRegion =
+      "as,bs,cs,ds,es,fs,gs,hs,is,js,ks,ls,ms,ns,os,ps,qs,rs,ss,"
+      "ar,br,cr,dr,er,fr,gr,hr,ir,jr,kr,lr,mr,nr,or,pr,qr,rr,sr,"
+      "aq,bq,cq,dq,eq,fq,gq,hq,iq,jq,kq,lq,mq,nq,oq,pq,qq,rq,sq,"
+      "jp,kp,lp,mp,np,op,pp,qp,rp,sp,jo,ko,lo,mo,no,oo,po,qo,ro,so,"
+      "jn,kn,ln,mn,nn,on,pn,qn,rn,sn,jm,km,lm,mm,nm,om,pm,qm,rm,sm,"
+      "jl,kl,ll,ml,nl,ol,pl,ql,rl,sl,jk,kk,lk,mk,nk,ok,pk,qk,rk,sk,"
+      "kj,lj,mj,nj,oj,pj,qj,rj,sj,qi,ri,si,qh,rh,sh,qg,rg,sg,qf,rf,sf,"
+      "qe,re,se,qd,rd,sd,qc,rc,sc,qb,rb,sb,qa,ra,sa";
+
+  const std::string p042_json =
+      std::string(
+          R"json({"masked_sgf_str":"(;FF[4]CA[UTF-8]SZ[19]KM[6]AB[or][pr][qr][rr][rq][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[lr][nr][nq][oq][pq][qq][ap][bp][cp][dp][ep][fp][gp][hp][ip][rp][io][qo][in][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[or]MA[as][bs][cs][ds][es][fs][gs][hs][is][js][ks][ls][ms][ns][os][ps][qs][rs][ss][ar][br][cr][dr][er][fr][gr][hr][ir][jr][kr][lr][mr][nr][or][pr][qr][rr][sr][aq][bq][cq][dq][eq][fq][gq][hq][iq][jq][kq][lq][mq][nq][oq][pq][qq][rq][sq][jp][kp][lp][mp][np][op][pp][qp][rp][sp][jo][ko][lo][mo][no][oo][po][qo][ro][so][jn][kn][ln][mn][nn][on][pn][qn][rn][sn][jm][km][lm][mm][nm][om][pm][qm][rm][sm][jl][kl][ll][ml][nl][ol][pl][ql][rl][sl][jk][kk][lk][mk][nk][ok][pk][qk][rk][sk][kj][lj][mj][nj][oj][pj][qj][rj][sj][qi][ri][si][qh][rh][sh][qg][rg][sg][qf][rf][sf][qe][re][se][qd][rd][sd][qc][rc][sc][qb][rb][sb][qa][ra][sa])","winning_color":"b","turn_color":"b","black_crucial_stone":"or","white_crucial_stone":"","black_search_goal":"TOLIVE","white_search_goal":"TOKILL","black_ko_rule":"disallow_ko","white_ko_rule":"allow_ko","region":")json") +
+      kCommonRegion + "\"}";
+
+  const std::string p031_json =
+      std::string(
+          R"json({"masked_sgf_str":"(;FF[4]CA[UTF-8]SZ[19]KM[14]AB[or][pr][qr][rr][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[lq][mq][nq][oq][pq][qq][rq][ap][bp][cp][dp][ep][fp][gp][hp][ip][io][ro][in][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[or]MA[as][bs][cs][ds][es][fs][gs][hs][is][js][ks][ls][ms][ns][os][ps][qs][rs][ss][ar][br][cr][dr][er][fr][gr][hr][ir][jr][kr][lr][mr][nr][or][pr][qr][rr][sr][aq][bq][cq][dq][eq][fq][gq][hq][iq][jq][kq][lq][mq][nq][oq][pq][qq][rq][sq][jp][kp][lp][mp][np][op][pp][qp][rp][sp][jo][ko][lo][mo][no][oo][po][qo][ro][so][jn][kn][ln][mn][nn][on][pn][qn][rn][sn][jm][km][lm][mm][nm][om][pm][qm][rm][sm][jl][kl][ll][ml][nl][ol][pl][ql][rl][sl][jk][kk][lk][mk][nk][ok][pk][qk][rk][sk][kj][lj][mj][nj][oj][pj][qj][rj][sj][qi][ri][si][qh][rh][sh][qg][rg][sg][qf][rf][sf][qe][re][se][qd][rd][sd][qc][rc][sc][qb][rb][sb][qa][ra][sa])","winning_color":"b","turn_color":"b","black_crucial_stone":"or","white_crucial_stone":"","black_search_goal":"TOLIVE","white_search_goal":"TOKILL","black_ko_rule":"disallow_ko","white_ko_rule":"allow_ko","region":")json") +
+      kCommonRegion + "\"}";
+
+  SolverConfig real_cfg = DefaultConfig(3500U);
+  real_cfg.max_depth = 48U;
+  real_cfg.memory_budget_bytes = 512ULL * 1024ULL * 1024ULL;
+
+  // 1. chao_vol1_p042: must prove PROVEN_WIN under <= 1000 nodes with RZ pruning
+  const ParsedProblem<19> p042 = parser.ParseTsumegoJsonObject(
+      "chao_vol1_p042", p042_json, TurnConflictPolicy::kRejectStrict);
+  Check(p042.valid && p042.region_search_mask.has_value(),
+        "Real-problem p042 parses cleanly with full region");
+  if (p042.valid) {
+    DfpnSolver<19> solver(real_cfg);
+    const SolveReport<19> rep = solver.Solve(
+        p042.initial_position, p042.proof_context, p042.region_search_mask,
+        p042.problem_id);
+    Check(rep.root_status == ProofOutcome::kProvenWin &&
+              rep.num_nodes <= 1000U && rep.pruned_outside_rz_count > 0U,
+          "Native C++20 solves p042 as PROVEN_WIN within <= 1000 nodes with RZ pruning",
+          "nodes=" + std::to_string(rep.num_nodes) + ", pruned=" +
+              std::to_string(rep.pruned_outside_rz_count));
+    const VerificationReport mem = checker.VerifyProofDag(
+        p042.initial_position, p042.proof_context, rep,
+        VerificationScope::kOriginalRoot);
+    const std::string lproof = checker.SerializeLProofJson(
+        p042.initial_position, p042.proof_context, rep);
+    const VerificationReport file = checker.VerifyLProofJsonString(
+        lproof, &p042, VerificationScope::kOriginalRoot);
+    Check(mem.passed && file.passed &&
+              mem.canonical_dag_checksum == file.canonical_dag_checksum,
+          "Native C++20 p042 passes memory & external-bound original_root verification",
+          "mem=" + mem.error_code + ", file=" + file.error_code);
+  }
+
+  // 2. chao_vol1_p031: must prove PROVEN_WIN with B[sr] under 3500-node budget
+  const ParsedProblem<19> p031 = parser.ParseTsumegoJsonObject(
+      "chao_vol1_p031", p031_json, TurnConflictPolicy::kRejectStrict);
+  Check(p031.valid && p031.region_search_mask.has_value(),
+        "Real-problem p031 parses cleanly with full region");
+  if (p031.valid) {
+    DfpnSolver<19> solver(real_cfg);
+    const SolveReport<19> rep = solver.Solve(
+        p031.initial_position, p031.proof_context, p031.region_search_mask,
+        p031.problem_id);
+    const int16_t kMoveSr =
+        static_cast<int16_t>(Position<19>::CoordFromRowCol(17, 18));
+    Check(rep.root_status == ProofOutcome::kProvenWin &&
+              rep.best_move == kMoveSr && rep.num_nodes <= 3500U &&
+              rep.pruned_outside_rz_count > 0U,
+          "Native C++20 solves p031 as PROVEN_WIN best_move=sr within 3500 nodes with RZ pruning",
+          "best=" + std::to_string(rep.best_move) + ", nodes=" +
+              std::to_string(rep.num_nodes) + ", pruned=" +
+              std::to_string(rep.pruned_outside_rz_count));
+    const VerificationReport mem = checker.VerifyProofDag(
+        p031.initial_position, p031.proof_context, rep,
+        VerificationScope::kOriginalRoot);
+    const std::string lproof = checker.SerializeLProofJson(
+        p031.initial_position, p031.proof_context, rep);
+    const VerificationReport file = checker.VerifyLProofJsonString(
+        lproof, &p031, VerificationScope::kOriginalRoot);
+    Check(mem.passed && file.passed &&
+              mem.canonical_dag_checksum == file.canonical_dag_checksum,
+          "Native C++20 p031 passes memory & external-bound original_root verification",
+          "mem=" + mem.error_code + ", file=" + file.error_code);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -656,6 +746,7 @@ int main() {
   TestSection3FullStateBindingAndContradictoryRoot();
   TestSection4R7ProtocolEdgeCases();
   TestSection5R8ProblemContractAndConsistency();
+  TestSection6RealProblemSolverBreakthrough();
 
   const int failed = g_total - g_passed;
   std::cout << "\n========================================\n"

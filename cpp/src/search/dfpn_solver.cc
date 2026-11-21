@@ -7,7 +7,11 @@
 #include "ldprover/search/dfpn_solver.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <limits>
+#include <utility>
+#include <vector>
 
 namespace ldprover {
 
@@ -58,31 +62,79 @@ SolveReport<N> DfpnSolver<N>::Solve(
   report_.input_hash = initial_pos.ZobristHash();
   report_.region_hint = region_hint;
 
-  // Build local tactical attention mask (Chebyshev radius 2 around non-immortal
-  // stones inside the declared region, plus crucial tokens).
+  // Build target-anchored local tactical attention mask matching TS
+  // studyLdRzCatalog.ts: Chebyshev radius 1 around target-side non-immortal
+  // stones + crucial tokens + 1st/2nd-line edge strip inside region_hint.
   attention_mask_.reset();
-  if (region_hint.has_value()) {
-    BitBoard<N> seeds =
-        (initial_pos.Stones(Color::kBlack) | initial_pos.Stones(Color::kWhite)) &
-        (~initial_pos.ImmortalWall()) & (*region_hint);
+  if (region_hint.has_value() && region_hint->Any()) {
+    const Color target_color =
+        !context.initial_tokens.empty()
+            ? context.initial_tokens[0].stone_color
+            : (context.attacker_goal == SearchGoal::kToLive
+                   ? context.root_attacker
+                   : OppositeColor(context.root_attacker));
+    const BitBoard<N> non_wall = ~initial_pos.ImmortalWall();
+    BitBoard<N> anchor_stones = initial_pos.Stones(target_color) & non_wall;
+    if (anchor_stones.None()) {
+      anchor_stones = (initial_pos.Stones(Color::kBlack) |
+                       initial_pos.Stones(Color::kWhite)) &
+                      non_wall;
+    }
+    BitBoard<N> anchors = anchor_stones;
     for (const auto& tok : context.initial_tokens) {
       if (tok.initial_coord >= 0 && tok.initial_coord < N * N) {
-        seeds.Set(tok.initial_coord, true);
+        anchors.Set(tok.initial_coord, true);
       }
     }
-    if (seeds.Any()) {
+    const std::vector<int> anchor_coords = anchors.ToCoords();
+    if (!anchor_coords.empty()) {
+      int min_r = N - 1;
+      int max_r = 0;
+      int min_c = N - 1;
+      int max_c = 0;
+      for (int pt : anchor_coords) {
+        const int r = pt / N;
+        const int c = pt % N;
+        if (r < min_r) min_r = r;
+        if (r > max_r) max_r = r;
+        if (c < min_c) min_c = c;
+        if (c > max_c) max_c = c;
+      }
+      const int att_min_r = std::max(0, min_r - 2);
+      const int att_min_c = std::max(0, min_c - 2);
+      const int att_max_r = std::min(N - 1, max_r + 2);
+      const int att_max_c = std::min(N - 1, max_c + 2);
+      const bool bottom_right_study = (N == 19 && max_r >= 12 && max_c >= 12);
+
       BitBoard<N> att;
-      for (int sc : seeds.ToCoords()) {
-        const int sr = sc / N;
-        const int sc_col = sc % N;
-        for (int dr = -2; dr <= 2; ++dr) {
-          for (int dc = -2; dc <= 2; ++dc) {
-            const int nr = sr + dr;
-            const int nc = sc_col + dc;
-            if (nr >= 0 && nr < N && nc >= 0 && nc < N) {
-              const int coord = nr * N + nc;
-              if (region_hint->Get(coord)) att.Set(coord, true);
-            }
+      for (int pt : region_hint->ToCoords()) {
+        const int r = pt / N;
+        const int c = pt % N;
+        if (bottom_right_study) {
+          if (r < att_min_r || c < att_min_c) continue;
+          if (r >= N - 2 && c >= att_min_c + 1) {
+            att.Set(pt, true);
+            continue;
+          }
+        } else {
+          if (r < att_min_r || r > att_max_r || c < att_min_c ||
+              c > att_max_c) {
+            continue;
+          }
+          const bool near_top_edge = (min_r <= 2 && r <= 1);
+          const bool near_bot_edge = (max_r >= N - 3 && r >= N - 2);
+          const bool near_left_edge = (min_c <= 2 && c <= 1);
+          const bool near_right_edge = (max_c >= N - 3 && c >= N - 2);
+          if (near_top_edge || near_bot_edge || near_left_edge ||
+              near_right_edge) {
+            att.Set(pt, true);
+            continue;
+          }
+        }
+        for (int st : anchor_coords) {
+          if (std::abs((st / N) - r) <= 1 && std::abs((st % N) - c) <= 1) {
+            att.Set(pt, true);
+            break;
           }
         }
       }
@@ -152,167 +204,625 @@ typename DfpnSolver<N>::NodeTacticalContext
 DfpnSolver<N>::BuildNodeTacticalContext(const Position<N>& pos,
                                         const ProofContext& context) const {
   NodeTacticalContext ctx;
-  const int board_pts = N * N;
-  ctx.crucial_lib_bonus.assign(static_cast<size_t>(board_pts), 0);
-  ctx.enemy_min_lib.assign(static_cast<size_t>(board_pts), 99);
-  ctx.friendly_min_lib.assign(static_cast<size_t>(board_pts), 99);
+  constexpr int kGridLen = N * N;
+  ctx.chain_id_at.fill(-1);
+  ctx.crucial_lib_min_libs.fill(99U);
+  ctx.chain_libs.reserve(64U);
+  ctx.chain_is_immortal.reserve(64U);
+  ctx.chain_is_cutting_enemy.reserve(64U);
 
-  // Precompute crucial stone chain liberties once per frontier node.
-  BitBoard<N> visited_crucial;
-  for (size_t i = 0; i < context.initial_tokens.size() && i < 64; ++i) {
-    if ((pos.SurvivingTargetTokensMask() & (1ULL << i)) == 0) continue;
-    const int t_coord = context.initial_tokens[i].initial_coord;
-    if (t_coord < 0 || t_coord >= board_pts) continue;
-    ctx.target_coords.Set(t_coord, true);
-    if (visited_crucial.Get(t_coord)) continue;
-    BitBoard<N> libs;
-    const BitBoard<N> chain = pos.FloodFillChain(t_coord, &libs);
-    visited_crucial |= chain;
-    const int lib_cnt = libs.Count();
-    int bonus = 560;
-    if (lib_cnt == 1) bonus += 1400;
-    else if (lib_cnt == 2) bonus += 740;
-    else if (lib_cnt == 3) bonus += 260;
-    for (int lc : libs.ToCoords()) {
-      ctx.crucial_lib_bonus[static_cast<size_t>(lc)] =
-          std::max(ctx.crucial_lib_bonus[static_cast<size_t>(lc)], bonus);
+  std::array<int, kGridLen> bfs_q{};
+  std::array<int, kGridLen> lib_stamp{};
+  lib_stamp.fill(-1);
+
+  const BitBoard<N>& wall = pos.ImmortalWall();
+  const Color us = pos.ToPlay();
+  const Color enemy = OppositeColor(us);
+
+  for (int coord = 0; coord < kGridLen; ++coord) {
+    const Color col = pos.StoneAt(coord);
+    if (col == Color::kEmpty || ctx.chain_id_at[static_cast<size_t>(coord)] != -1) {
+      continue;
+    }
+    const int16_t cid = static_cast<int16_t>(ctx.chain_libs.size());
+    ctx.chain_id_at[static_cast<size_t>(coord)] = cid;
+    bfs_q[0] = coord;
+    int head = 0;
+    int tail = 1;
+    bool immortal = wall.Get(coord);
+    int16_t libs = 0;
+
+    while (head < tail) {
+      const int cur = bfs_q[static_cast<size_t>(head++)];
+      for (int nb : pos.OrthogonalNeighbors(cur)) {
+        const Color st = pos.StoneAt(nb);
+        if (st == col) {
+          if (ctx.chain_id_at[static_cast<size_t>(nb)] == -1) {
+            ctx.chain_id_at[static_cast<size_t>(nb)] = cid;
+            if (!immortal && wall.Get(nb)) immortal = true;
+            bfs_q[static_cast<size_t>(tail++)] = nb;
+          }
+        } else if (st == Color::kEmpty) {
+          if (lib_stamp[static_cast<size_t>(nb)] != cid) {
+            lib_stamp[static_cast<size_t>(nb)] = cid;
+            ++libs;
+          }
+        }
+      }
+    }
+
+    ctx.chain_libs.push_back(libs);
+    ctx.chain_is_immortal.push_back(immortal ? 1U : 0U);
+    ctx.chain_is_cutting_enemy.push_back(0U);
+  }
+
+  // Mark cutting enemy chains (non-immortal enemy chains with <= 3 liberties
+  // touching >= 2 distinct friendly chains).
+  const size_t num_chains = ctx.chain_libs.size();
+  std::vector<uint8_t> seen_enemy_chain(num_chains, 0U);
+  for (int coord = 0; coord < kGridLen; ++coord) {
+    if (pos.StoneAt(coord) != enemy) continue;
+    const int16_t cid = ctx.chain_id_at[static_cast<size_t>(coord)];
+    if (cid < 0) continue;
+    const size_t ucid = static_cast<size_t>(cid);
+    if (seen_enemy_chain[ucid] || ctx.chain_is_immortal[ucid] ||
+        ctx.chain_libs[ucid] > 3) {
+      continue;
+    }
+    seen_enemy_chain[ucid] = 1U;
+    int16_t first_friendly_cid = -1;
+    bool second_friendly_found = false;
+    for (int p = coord; p < kGridLen && !second_friendly_found; ++p) {
+      if (ctx.chain_id_at[static_cast<size_t>(p)] != cid) continue;
+      for (int nb : pos.OrthogonalNeighbors(p)) {
+        if (pos.StoneAt(nb) == us) {
+          const int16_t fcid = ctx.chain_id_at[static_cast<size_t>(nb)];
+          if (first_friendly_cid == -1) {
+            first_friendly_cid = fcid;
+          } else if (fcid != first_friendly_cid) {
+            second_friendly_found = true;
+            break;
+          }
+        }
+      }
+    }
+    if (second_friendly_found) {
+      ctx.chain_is_cutting_enemy[ucid] = 1U;
     }
   }
 
-  // Precompute liberty counts for all non-immortal chains once per node.
-  const Color us = pos.ToPlay();
-  const Color enemy = OppositeColor(us);
-  BitBoard<N> seen_chains;
-  const BitBoard<N> wall = pos.ImmortalWall();
-  const BitBoard<N> non_wall_stones =
-      (pos.Stones(Color::kBlack) | pos.Stones(Color::kWhite)) & (~wall);
-
-  for (int sc : non_wall_stones.ToCoords()) {
-    if (seen_chains.Get(sc)) continue;
-    const Color c = pos.StoneAt(sc);
-    if (c == Color::kEmpty) continue;
-    BitBoard<N> libs;
-    const BitBoard<N> chain = pos.FloodFillChain(sc, &libs);
-    seen_chains |= chain;
-    if ((chain & wall).Any()) continue;
-    const int lib_cnt = libs.Count();
-    for (int lc : libs.ToCoords()) {
-      if (c == enemy) {
-        ctx.enemy_min_lib[static_cast<size_t>(lc)] =
-            std::min(ctx.enemy_min_lib[static_cast<size_t>(lc)], lib_cnt);
-      } else {
-        ctx.friendly_min_lib[static_cast<size_t>(lc)] =
-            std::min(ctx.friendly_min_lib[static_cast<size_t>(lc)], lib_cnt);
+  // Mark surviving crucial target chains and their liberties.
+  std::vector<uint8_t> seen_crucial_chains(num_chains, 0U);
+  for (size_t idx = 0; idx < context.initial_tokens.size() && idx < 64U; ++idx) {
+    if ((pos.SurvivingTargetTokensMask() & (1ULL << idx)) == 0ULL) continue;
+    const int t_coord = context.initial_tokens[idx].initial_coord;
+    if (t_coord < 0 || t_coord >= kGridLen) continue;
+    const int16_t cid = ctx.chain_id_at[static_cast<size_t>(t_coord)];
+    if (cid < 0 || seen_crucial_chains[static_cast<size_t>(cid)]) continue;
+    seen_crucial_chains[static_cast<size_t>(cid)] = 1U;
+    const uint8_t libs = static_cast<uint8_t>(
+        std::min<int>(98, std::max<int>(0, ctx.chain_libs[static_cast<size_t>(cid)])));
+    for (int p = 0; p < kGridLen; ++p) {
+      if (ctx.chain_id_at[static_cast<size_t>(p)] != cid) continue;
+      ctx.crucial_stone_mask.Set(p, true);
+      for (int nb : pos.OrthogonalNeighbors(p)) {
+        if (pos.StoneAt(nb) == Color::kEmpty &&
+            libs < ctx.crucial_lib_min_libs[static_cast<size_t>(nb)]) {
+          ctx.crucial_lib_min_libs[static_cast<size_t>(nb)] = libs;
+        }
       }
     }
   }
+
+  ctx.target_color =
+      !context.initial_tokens.empty()
+          ? context.initial_tokens[0].stone_color
+          : (context.attacker_goal == SearchGoal::kToLive
+                 ? context.root_attacker
+                 : OppositeColor(context.root_attacker));
   return ctx;
 }
 
 template <int N>
-int32_t DfpnSolver<N>::ScoreMoveFastCapture(const Position<N>& pos,
-                                            const ProofContext& context,
-                                            const NodeTacticalContext& tctx,
-                                            int16_t move,
-                                            bool is_or_node) const {
-  if (move == kPassMove) {
-    // At AND nodes (defender to play) with 0 consecutive passes, rank PASS
-    // below immediate tactical captures/refutations so bad attacker moves are
-    // refuted first, while still keeping PASS near the top for null-move RZ.
-    if (!is_or_node && pos.ConsecutivePasses() == 0) {
-      return config_.enable_rz_pruning ? 1050 : 360;
+int DfpnSolver<N>::EstimateParentEyeLikeCount(
+    const Position<N>& pos, const ProofContext& context) const {
+  const Color target_color =
+      !context.initial_tokens.empty()
+          ? context.initial_tokens[0].stone_color
+          : (context.attacker_goal == SearchGoal::kToLive
+                 ? context.root_attacker
+                 : OppositeColor(context.root_attacker));
+  const Color opp_color = OppositeColor(target_color);
+
+  // Check single-point true-eye-like empty neighbors of surviving crucial chains.
+  BitBoard<N> checked_empty;
+  int eye_like = 0;
+  for (size_t idx = 0; idx < context.initial_tokens.size() && idx < 64U; ++idx) {
+    if ((pos.SurvivingTargetTokensMask() & (1ULL << idx)) == 0ULL) continue;
+    const int t_coord = context.initial_tokens[idx].initial_coord;
+    if (t_coord < 0 || t_coord >= N * N) continue;
+    if (pos.StoneAt(t_coord) != target_color) continue;
+    BitBoard<N> libs;
+    (void)pos.FloodFillChain(t_coord, &libs);
+    for (int ep : libs.ToCoords()) {
+      if (checked_empty.Get(ep)) continue;
+      checked_empty.Set(ep, true);
+      const auto ep_ortho = pos.OrthogonalNeighbors(ep);
+      bool all_target = true;
+      for (int nb : ep_ortho) {
+        if (pos.StoneAt(nb) != target_color) {
+          all_target = false;
+          break;
+        }
+      }
+      if (!all_target) continue;
+      const auto ep_diag = pos.DiagonalNeighbors(ep);
+      int enemy_diags = 0;
+      for (int d : ep_diag) {
+        if (pos.StoneAt(d) == opp_color) ++enemy_diags;
+      }
+      const int max_enemy_diags = (ep_diag.size() == 4U) ? 1 : 0;
+      if (enemy_diags <= max_enemy_diags) {
+        ++eye_like;
+      }
     }
-    return -2000;
   }
-  int32_t score = tctx.crucial_lib_bonus[static_cast<size_t>(move)];
+  return eye_like;
+}
 
-  // Penalize outer-moat moves outside local tactical attention zone.
-  if (attention_mask_.has_value() && !attention_mask_->Get(move)) {
-    score -= 950;
+template <int N>
+typename DfpnSolver<N>::MoveEvalMeta DfpnSolver<N>::EvaluateCandidateMove(
+    const Position<N>& pos, const ProofContext& context,
+    const NodeTacticalContext& tctx, int16_t move, bool is_or_node,
+    int parent_eye_like_count) const {
+  if (move == kPassMove) {
+    if (pos.ConsecutivePasses() >= 1U) {
+      Position<N> probe = pos;
+      if (probe.PlayMove(kPassMove)) {
+        const auto term = terminal_eval_.EvaluateTerminal(probe, context);
+        if (is_or_node && term.status == TerminalStatus::kWin) {
+          return MoveEvalMeta{60000, true, false, true};
+        }
+        if (!is_or_node && term.status == TerminalStatus::kLoss) {
+          return MoveEvalMeta{60000, false, true, true};
+        }
+      }
+    }
+    // At AND nodes (consecutivePasses == 0), rank Null-Move (PASS) inside the
+    // initial tactical window right behind top immediate captures/refutations
+    // so PASS seeds active_null_move_rz early without preempting 1-ply refutations.
+    if (!is_or_node && pos.ConsecutivePasses() == 0U) {
+      if (parent_eye_like_count >= 2) {
+        return MoveEvalMeta{3850, false, false, true};
+      }
+      return MoveEvalMeta{config_.enable_rz_pruning ? 3450 : 360, false, false,
+                          true};
+    }
+    return MoveEvalMeta{-2500, false, false, false};
   }
 
-  // Atari / capture / rescue bonuses from precomputed chain liberties.
-  const int e_min = tctx.enemy_min_lib[static_cast<size_t>(move)];
-  const int f_min = tctx.friendly_min_lib[static_cast<size_t>(move)];
-  if (e_min == 1) score += 1550;       // immediate capture
-  else if (e_min == 2) score += 540;   // puts enemy in atari
-  if (f_min == 1) score += 720;        // rescues own atari chain
-  else if (f_min == 2) score += 260;
+  const auto ortho_nbs = pos.OrthogonalNeighbors(move);
+  const auto diag_nbs = pos.DiagonalNeighbors(move);
+  const BitBoard<N>& wall = pos.ImmortalWall();
+  bool in_attention =
+      !attention_mask_.has_value() || attention_mask_->Get(move);
 
-  // Symmetric local eye-vitality & connection geometry (no stone simulation needed
-  // unless capture/atari is plausible).
+  // Dynamic tactical attention: follow the live fight when crucial target
+  // chains extend (or non-immortal chains drop to <= 3 liberties) beyond the
+  // static root bounding box.
+  if (!in_attention && tctx.crucial_lib_min_libs[static_cast<size_t>(move)] < 99U) {
+    in_attention = true;
+  }
+  if (!in_attention) {
+    for (int nb : ortho_nbs) {
+      if (pos.StoneAt(nb) != Color::kEmpty && !wall.Get(nb)) {
+        const int16_t cid = tctx.chain_id_at[static_cast<size_t>(nb)];
+        if (cid >= 0 && !tctx.chain_is_immortal[static_cast<size_t>(cid)] &&
+            tctx.chain_libs[static_cast<size_t>(cid)] <= 3) {
+          in_attention = true;
+          break;
+        }
+      }
+    }
+  }
+  if (!in_attention) {
+    for (int d : diag_nbs) {
+      if (tctx.crucial_stone_mask.Get(d)) {
+        in_attention = true;
+        break;
+      }
+    }
+  }
+
+  // Fast O(1) path for outer buffer-moat moves (!in_attention) touching no
+  // non-immortal tactical stones.
+  if (!in_attention) {
+    bool touches_tactical_stone = false;
+    for (int nb : ortho_nbs) {
+      if (pos.StoneAt(nb) != Color::kEmpty && !wall.Get(nb)) {
+        touches_tactical_stone = true;
+        break;
+      }
+    }
+    if (!touches_tactical_stone) {
+      return MoveEvalMeta{-950, false, false, false};
+    }
+  }
+
+  int32_t score = in_attention ? 150 : -950;
   const Color us = pos.ToPlay();
   const Color enemy = OppositeColor(us);
-  int friendly_ortho = 0;
-  int enemy_ortho = 0;
-  int empty_ortho = 0;
-  int wall_ortho = 0;
-  const auto ortho = pos.OrthogonalNeighbors(move);
-  for (int nb : ortho) {
-    if (pos.ImmortalWall().Get(nb)) ++wall_ortho;
-    const Color s = pos.StoneAt(nb);
-    if (s == us) ++friendly_ortho;
-    else if (s == enemy) ++enemy_ortho;
-    else ++empty_ortho;
-  }
-  int friendly_diag = 0;
-  int enemy_diag = 0;
-  for (int d : pos.DiagonalNeighbors(move)) {
-    const Color s = pos.StoneAt(d);
-    if (s == us) ++friendly_diag;
-    else if (s == enemy) ++enemy_diag;
-  }
+  const Color opp_target_color = OppositeColor(tctx.target_color);
 
-  const int deg = static_cast<int>(ortho.size());
-  // Vital point of enemy eye shape (surrounded by enemy stones -> nakade/vital).
-  if (enemy_ortho >= deg - 1 && enemy_ortho >= 2) {
-    score += 640;
-  }
-  // Vital point of own eye shape (e.g. straight-three / bulky-five center).
-  if (friendly_ortho >= 2 && empty_ortho >= 1 && enemy_ortho == 0) {
-    score += 290;
-  }
-  // Contact / hane / cut / wedge moves.
-  if (friendly_ortho >= 1 && enemy_ortho >= 1) score += 420;
-  if (friendly_ortho >= 1 && enemy_diag >= 1) score += 320;
-  if (enemy_ortho >= 1 && enemy_diag >= 2) score += 310;
-
-  // Penalize obvious self-eye-fill (surrounded exclusively by own stones + diagonals).
-  if (friendly_ortho == deg && enemy_ortho == 0 && enemy_diag == 0 &&
-      e_min > 1) {
-    score -= 680;
-  } else if (friendly_ortho >= 1 && friendly_diag >= 2 && enemy_ortho == 0 &&
-             enemy_diag == 0 && empty_ortho <= 1) {
-    score -= 260;
-  }
-
-  // Slight preference for 1st/2nd line corner/edge vital points near target stones.
+  // 1. O(1) precomputed proximity to surviving crucial chains & their liberties.
   const int r = move / N;
   const int c = move % N;
-  const int edge_r = std::min(r, N - 1 - r);
-  const int edge_c = std::min(c, N - 1 - c);
-  if ((edge_r == 1 && edge_c == 1) || (edge_r == 0 && edge_c <= 2) ||
-      (edge_c == 0 && edge_r <= 2)) {
-    score += 110;
+  const int dist_r = std::min(r, N - 1 - r);
+  const int dist_c = std::min(c, N - 1 - c);
+  const int dist_edge = std::min(dist_r, dist_c);
+
+  const int c_libs =
+      static_cast<int>(tctx.crucial_lib_min_libs[static_cast<size_t>(move)]);
+  if (c_libs < 99) {
+    if (c_libs == 1) score += 1750;
+    else if (c_libs == 2) score += 1080;
+    else if (c_libs <= 4 || dist_edge <= 2) score += 480;
+    else score += 220;
+  }
+  int adj_crucial_count = 0;
+  for (int nb : ortho_nbs) {
+    if (tctx.crucial_stone_mask.Get(nb)) ++adj_crucial_count;
+  }
+  if (adj_crucial_count >= 2) score += 580;
+
+  // Pre-move neighbor chain inspection (O(1) via NodeTacticalContext).
+  bool tightened_low_lib_enemy = false;
+  bool tightened_cutting_enemy = false;
+  int min_enemy_lib_before = 99;
+  int friendly_ortho_count = 0;
+  int enemy_ortho_count = 0;
+  bool has_tactical_friendly_adj = false;
+  int16_t first_friendly_cid = -1;
+  bool connects_distinct_friendly = false;
+  int empty_ortho_count = 0;
+  int target_ortho_count = 0;
+  int opp_target_ortho_count = 0;
+
+  for (int nb : ortho_nbs) {
+    const Color st = pos.StoneAt(nb);
+    if (st == Color::kEmpty) {
+      ++empty_ortho_count;
+    } else if (st == us) {
+      ++friendly_ortho_count;
+      const int16_t fcid = tctx.chain_id_at[static_cast<size_t>(nb)];
+      if (fcid >= 0) {
+        const size_t ufcid = static_cast<size_t>(fcid);
+        if (!tctx.chain_is_immortal[ufcid]) {
+          has_tactical_friendly_adj = true;
+        }
+        if (tctx.chain_libs[ufcid] >= 2) {
+          if (first_friendly_cid == -1) first_friendly_cid = fcid;
+          else if (first_friendly_cid != fcid) connects_distinct_friendly = true;
+        }
+      }
+    } else if (st == enemy) {
+      ++enemy_ortho_count;
+      const int16_t ecid = tctx.chain_id_at[static_cast<size_t>(nb)];
+      if (ecid >= 0) {
+        const size_t uecid = static_cast<size_t>(ecid);
+        if (!tctx.chain_is_immortal[uecid]) {
+          const int elibs = static_cast<int>(tctx.chain_libs[uecid]);
+          if (elibs < min_enemy_lib_before) min_enemy_lib_before = elibs;
+          if (elibs <= 3) {
+            tightened_low_lib_enemy = true;
+            if (tctx.chain_is_cutting_enemy[uecid]) {
+              tightened_cutting_enemy = true;
+            }
+          }
+        }
+      }
+    }
+    if (st == tctx.target_color) ++target_ortho_count;
+    else if (st == opp_target_color) ++opp_target_ortho_count;
   }
 
-  // Exact capture / self-atari check only when contact or capture is possible.
-  if (e_min == 1 || (empty_ortho == 0 && friendly_ortho > 0) ||
-      (empty_ortho <= 1 && enemy_ortho > 0)) {
-    Position<N> next = pos;
-    const int prev_enemy_count = pos.Stones(enemy).Count();
-    if (next.PlayMove(move)) {
-      const int captured = prev_enemy_count - next.Stones(enemy).Count();
-      if (captured > 0) score += 900 + captured * 260;
-      BitBoard<N> our_libs;
-      (void)next.FloodFillChain(move, &our_libs);
-      if (our_libs.Count() == 1 && captured == 0) score -= 420;
-      else if (our_libs.Count() >= 3) score += 180;
+  // 2. Simulate move on probe for fast capture, crucial-token, & liberty checks.
+  Position<N> probe = pos;
+  const int prev_enemy_count = pos.Stones(enemy).Count();
+  if (!probe.PlayMove(move)) {
+    return MoveEvalMeta{-99999, false, false, false};
+  }
+  const int captured_count = prev_enemy_count - probe.Stones(enemy).Count();
+
+  if (captured_count > 0) {
+    score += 1300 + captured_count * 320;
+    bool all_crucial_gone = false;
+    if (!context.initial_tokens.empty()) {
+      if (context.crucial_stone_op == LogicalOp::kConjunction) {
+        for (size_t idx = 0; idx < context.initial_tokens.size() && idx < 64U;
+             ++idx) {
+          if ((probe.SurvivingTargetTokensMask() & (1ULL << idx)) == 0ULL) {
+            all_crucial_gone = true;
+            break;
+          }
+        }
+      } else {
+        all_crucial_gone = true;
+        for (size_t idx = 0; idx < context.initial_tokens.size() && idx < 64U;
+             ++idx) {
+          if ((probe.SurvivingTargetTokensMask() & (1ULL << idx)) != 0ULL) {
+            all_crucial_gone = false;
+            break;
+          }
+        }
+      }
+    }
+    if (all_crucial_gone) {
+      const bool tok_cap_is_win = (context.attacker_goal == SearchGoal::kToKill);
+      if (is_or_node && tok_cap_is_win) {
+        return MoveEvalMeta{55000, true, false, true};
+      }
+      if (!is_or_node && !tok_cap_is_win) {
+        return MoveEvalMeta{55000, false, true, true};
+      }
     }
   }
-  (void)context;
-  (void)wall_ortho;
-  return score;
+
+  BitBoard<N> our_libs_bb;
+  (void)probe.FloodFillChain(move, &our_libs_bb);
+  const int our_libs_cnt = our_libs_bb.Count();
+  if (our_libs_cnt == 1) {
+    bool is_tesuji_throw_in = false;
+    if (captured_count == 0 && in_attention) {
+      const std::vector<int> sole_libs = our_libs_bb.ToCoords();
+      if (!sole_libs.empty()) {
+        const int sole_lib = sole_libs[0];
+        Position<N> cap_probe = probe;
+        if (cap_probe.PlayMove(static_cast<int16_t>(sole_lib))) {
+          BitBoard<N> enemy_after_libs;
+          (void)cap_probe.FloodFillChain(sole_lib, &enemy_after_libs);
+          if (enemy_after_libs.Count() <= 2) {
+            is_tesuji_throw_in = true;
+          }
+        }
+      }
+    }
+    if (is_tesuji_throw_in) {
+      score += 780;
+    } else {
+      bool adj_stone = false;
+      for (int nb : ortho_nbs) {
+        if (probe.StoneAt(nb) != Color::kEmpty) {
+          adj_stone = true;
+          break;
+        }
+      }
+      score += adj_stone ? -240 : -780;
+    }
+  } else if (our_libs_cnt >= 3) {
+    score += 240;
+  }
+
+  if (tightened_low_lib_enemy && our_libs_cnt >= 2) {
+    score += tightened_cutting_enemy ? 740 : 380;
+  }
+
+  if (enemy_ortho_count > 0) {
+    for (int nb : ortho_nbs) {
+      if (probe.StoneAt(nb) == enemy && !wall.Get(nb)) {
+        BitBoard<N> enemy_libs_bb;
+        (void)probe.FloodFillChain(nb, &enemy_libs_bb);
+        const int elibs = enemy_libs_bb.Count();
+        if (elibs == 1) {
+          score += 740;
+        } else if (elibs == 2 && elibs < min_enemy_lib_before) {
+          score += 340;
+        }
+      }
+    }
+  }
+
+  // 3. Corner / Edge & Symmetric Eye-Vitality Geometry Heuristics.
+  if (dist_r == 1 && dist_c == 1) {
+    score += 560;
+  } else if (dist_edge == 1) {
+    score += 300;
+  } else if (dist_edge == 0) {
+    score += 260;
+  }
+
+  if (connects_distinct_friendly && has_tactical_friendly_adj) {
+    score += 820;
+  }
+
+  int friendly_diag_count = 0;
+  int enemy_diag_count = 0;
+  int target_diag_count = 0;
+  for (int d : diag_nbs) {
+    const Color st = pos.StoneAt(d);
+    if (st == us) ++friendly_diag_count;
+    else if (st == enemy) ++enemy_diag_count;
+    if (st == tctx.target_color) ++target_diag_count;
+  }
+
+  bool splits_eye_cavity = false;
+  if (empty_ortho_count >= 2 && in_attention) {
+    for (size_t i = 0; i < ortho_nbs.size() && !splits_eye_cavity; ++i) {
+      const int a = ortho_nbs[i];
+      if (pos.StoneAt(a) != Color::kEmpty) continue;
+      const auto a_nbs = pos.OrthogonalNeighbors(a);
+      for (size_t j = i + 1U; j < ortho_nbs.size(); ++j) {
+        const int b = ortho_nbs[j];
+        if (pos.StoneAt(b) != Color::kEmpty) continue;
+        const auto b_nbs = pos.OrthogonalNeighbors(b);
+        bool shared_empty = false;
+        for (int cand : a_nbs) {
+          if (cand != move && pos.StoneAt(cand) == Color::kEmpty &&
+              std::find(b_nbs.begin(), b_nbs.end(), cand) != b_nbs.end()) {
+            shared_empty = true;
+            break;
+          }
+        }
+        if (!shared_empty) {
+          splits_eye_cavity = true;
+          break;
+        }
+      }
+    }
+    if (splits_eye_cavity &&
+        (friendly_ortho_count >= 1 || enemy_ortho_count >= 1 ||
+         friendly_diag_count >= 2 || enemy_diag_count >= 2)) {
+      score += 960;
+    }
+  }
+
+  // Calm eye-making / eye-destroying vital point along target's 1st/2nd line.
+  if (in_attention && our_libs_cnt >= 2 && dist_edge <= 1 &&
+      (target_diag_count >= 1 || target_ortho_count >= 1)) {
+    int enclosed_edge_pockets = 0;
+    for (int enb : ortho_nbs) {
+      if (pos.StoneAt(enb) != Color::kEmpty) continue;
+      const auto enb_nbs = pos.OrthogonalNeighbors(enb);
+      int target_walls = 0;
+      for (int nn : enb_nbs) {
+        if (nn == move || pos.StoneAt(nn) == tctx.target_color) {
+          ++target_walls;
+        }
+      }
+      if (target_walls >= static_cast<int>(enb_nbs.size()) - 1) {
+        ++enclosed_edge_pockets;
+      }
+    }
+    if (enclosed_edge_pockets >= 1) {
+      score += 480 + (enclosed_edge_pockets >= 2 ? 360 : 0);
+    } else if (dist_edge == 0 && empty_ortho_count >= 1 &&
+               (target_ortho_count >= 1 || opp_target_ortho_count >= 1)) {
+      score += 340;
+    }
+  }
+
+  if (friendly_diag_count >= 2 && enemy_ortho_count == 0 &&
+      (friendly_ortho_count == 0 || connects_distinct_friendly ||
+       enemy_diag_count >= 1)) {
+    score += 520;
+    for (int enb : ortho_nbs) {
+      if (pos.StoneAt(enb) == Color::kEmpty) {
+        const auto enb_nbs = pos.OrthogonalNeighbors(enb);
+        int enb_friendly_walls = 0;
+        for (int n : enb_nbs) {
+          if (n == move || pos.StoneAt(n) == us) ++enb_friendly_walls;
+        }
+        if (enb_friendly_walls >= 3) {
+          score += 620;
+        }
+      }
+    }
+  } else if (enemy_diag_count >= 2 && friendly_ortho_count == 0 &&
+             our_libs_cnt >= 2 && in_attention) {
+    score += 560;
+  } else if (empty_ortho_count <= 1 && friendly_ortho_count >= 1 &&
+             !connects_distinct_friendly && friendly_diag_count >= 2 &&
+             enemy_ortho_count == 0 && enemy_diag_count == 0) {
+    score -= 340;
+  }
+
+  if (friendly_ortho_count >= 1 && enemy_ortho_count >= 1) score += 340;
+  if (friendly_ortho_count >= 1 && enemy_diag_count >= 1) score += 290;
+
+  // 4. Exact post-move single-point true-eye count, crucial-chain liberty-delta,
+  // and immediate 1-ply Benson UCA detection.
+  int post_true_eyes = 0;
+  if (in_attention && our_libs_cnt >= 2) {
+    for (int ep : ortho_nbs) {
+      if (probe.StoneAt(ep) != Color::kEmpty) continue;
+      const auto ep_ortho = probe.OrthogonalNeighbors(ep);
+      bool all_target = true;
+      for (int nb : ep_ortho) {
+        if (probe.StoneAt(nb) != tctx.target_color) {
+          all_target = false;
+          break;
+        }
+      }
+      if (!all_target) continue;
+      const auto ep_diag = probe.DiagonalNeighbors(ep);
+      int enemy_diags = 0;
+      for (int d : ep_diag) {
+        if (probe.StoneAt(d) == opp_target_color) ++enemy_diags;
+      }
+      const int max_enemy_diags = (ep_diag.size() == 4U) ? 1 : 0;
+      if (enemy_diags <= max_enemy_diags) {
+        ++post_true_eyes;
+      }
+    }
+    if (post_true_eyes > 0) {
+      score += post_true_eyes * 680;
+    }
+
+    // 4b. Crucial-chain liberty-delta heuristic (O(1), zero extra flood-fill).
+    if (c_libs < 99 && us == tctx.target_color) {
+      const int lib_delta = our_libs_cnt - c_libs;
+      if (lib_delta >= 2) {
+        score += 560;
+      } else if (lib_delta == 1) {
+        score += 260;
+      } else if (lib_delta < 0 && captured_count == 0 && post_true_eyes == 0 &&
+                 !splits_eye_cavity && !connects_distinct_friendly) {
+        score -= 220;
+      }
+    }
+
+    if (is_or_node && context.attacker_goal == SearchGoal::kToLive &&
+        (post_true_eyes > 0 || captured_count > 0 || score >= 2200)) {
+      const auto term = terminal_eval_.EvaluateTerminal(probe, context);
+      if (term.status == TerminalStatus::kWin) {
+        return MoveEvalMeta{58000, true, false, true};
+      }
+    }
+  }
+
+  return MoveEvalMeta{score, false, false, in_attention};
+}
+
+template <int N>
+std::pair<uint32_t, uint32_t> DfpnSolver<N>::ComputeInitialChildBounds(
+    size_t rank_idx, bool is_or_node, const MoveEvalMeta& meta,
+    int16_t move) const noexcept {
+  if (!config_.enable_fast_capture_ordering) {
+    return {1U, 1U};
+  }
+  const uint32_t r = static_cast<uint32_t>(rank_idx);
+  if (is_or_node) {
+    if (meta.immediate_win) return {1U, 10U};
+    if (meta.immediate_loss) return {180U, 1U};
+    if (move == kPassMove) return {220U, 1U};
+    if (!meta.in_attention) return {2400U + r * 16U, 1U};
+    uint32_t pn = 1U;
+    if (r == 0U) pn = 1U;
+    else if (r == 1U) pn = 4U;
+    else if (r == 2U) pn = 8U;
+    else if (r <= 5U) pn = 12U + (r - 3U) * 4U;
+    else if (r <= 10U) pn = 24U + (r - 5U) * 5U;
+    else pn = 50U + (r - 10U) * 6U;
+    if (meta.score < 0) pn += 24U;
+    return {pn, 1U};
+  } else {
+    if (meta.immediate_loss) return {10U, 1U};
+    if (move == kPassMove) {
+      if (r == 0U) return {1U, 1U};
+      return meta.score >= 3400 ? std::pair<uint32_t, uint32_t>{1U, 3U}
+                                : std::pair<uint32_t, uint32_t>{1U, 5U};
+    }
+    if (!meta.in_attention) return {1U, 96U + r * 4U};
+    uint32_t dn = 1U;
+    if (r == 0U) dn = 1U;
+    else if (r == 1U) dn = 4U;
+    else if (r == 2U) dn = 8U;
+    else if (r <= 5U) dn = 12U + (r - 3U) * 4U;
+    else if (r <= 10U) dn = 24U + (r - 5U) * 5U;
+    else dn = 50U + (r - 10U) * 6U;
+    if (meta.score < 0) dn += 16U;
+    return {1U, dn};
+  }
 }
 
 template <int N>
@@ -608,41 +1118,49 @@ void DfpnSolver<N>::MidSearch(
   auto frontier_it = node_frontier_cache_.find(node_path_id);
   if (frontier_it == node_frontier_cache_.end()) {
     CachedNodeFrontier fresh;
-    std::vector<int16_t> legal_moves = pos.GenerateLegalMoves(region_hint);
-    fresh.children.reserve(legal_moves.size());
+    const int parent_eye_like_count =
+        (!is_or_node && pos.ConsecutivePasses() == 0 &&
+         config_.enable_fast_capture_ordering)
+            ? EstimateParentEyeLikeCount(pos, context)
+            : 0;
     const NodeTacticalContext tctx =
         config_.enable_fast_capture_ordering
             ? BuildNodeTacticalContext(pos, context)
             : NodeTacticalContext{};
+    std::vector<int16_t> legal_moves = pos.GenerateLegalMoves(region_hint);
+
+    std::vector<std::pair<int16_t, MoveEvalMeta>> scored;
+    scored.reserve(legal_moves.size());
     for (int16_t mv : legal_moves) {
-      SearchChild ch;
-      ch.move = mv;
-      ch.child_path_id = next_path_id_++;
-      ch.tactical_score =
-          config_.enable_fast_capture_ordering
-              ? ScoreMoveFastCapture(pos, context, tctx, mv, is_or_node)
-              : 0;
-      fresh.children.push_back(ch);
+      MoveEvalMeta meta;
+      if (config_.enable_fast_capture_ordering) {
+        meta = EvaluateCandidateMove(pos, context, tctx, mv, is_or_node,
+                                     parent_eye_like_count);
+      }
+      scored.emplace_back(mv, meta);
     }
     if (config_.enable_fast_capture_ordering) {
       std::stable_sort(
-          fresh.children.begin(), fresh.children.end(),
-          [](const SearchChild& a, const SearchChild& b) {
-            return a.tactical_score > b.tactical_score;
+          scored.begin(), scored.end(),
+          [](const std::pair<int16_t, MoveEvalMeta>& a,
+             const std::pair<int16_t, MoveEvalMeta>& b) {
+            return a.second.score > b.second.score;
           });
-      for (size_t idx = 0; idx < fresh.children.size(); ++idx) {
-        const uint32_t rank_metric =
-            (idx == 0) ? 1U : (idx <= 2 ? 2U : static_cast<uint32_t>(idx + 1));
-        if (is_or_node) {
-          fresh.children[idx].pn =
-              (fresh.children[idx].move == kPassMove) ? 220U : rank_metric;
-          fresh.children[idx].dn = 1U;
-        } else {
-          fresh.children[idx].pn = 1U;
-          fresh.children[idx].dn =
-              (fresh.children[idx].move == kPassMove) ? 4U : rank_metric;
-        }
-      }
+    }
+
+    fresh.children.reserve(scored.size());
+    for (size_t idx = 0; idx < scored.size(); ++idx) {
+      const int16_t mv = scored[idx].first;
+      const MoveEvalMeta& meta = scored[idx].second;
+      const auto init_bounds =
+          ComputeInitialChildBounds(idx, is_or_node, meta, mv);
+      SearchChild ch;
+      ch.move = mv;
+      ch.child_path_id = next_path_id_++;
+      ch.tactical_score = meta.score;
+      ch.pn = init_bounds.first;
+      ch.dn = init_bounds.second;
+      fresh.children.push_back(ch);
     }
     node_frontier_cache_.emplace(node_path_id, std::move(fresh));
   }
@@ -658,141 +1176,246 @@ void DfpnSolver<N>::MidSearch(
     if (config_.enable_progressive_widening && frontier.widening_level < 6U) {
       const size_t base_k =
           is_or_node
-              ? static_cast<size_t>(config_.widening_base_k)
-              : std::max<size_t>(4U,
-                                 static_cast<size_t>(config_.widening_base_k) /
-                                     2U);
+              ? std::min<size_t>(static_cast<size_t>(config_.widening_base_k),
+                                 depth == 0U ? 4U : 3U)
+              : std::min<size_t>(
+                    std::max<size_t>(
+                        2U, static_cast<size_t>(config_.widening_base_k) / 2U),
+                    3U);
       const size_t cap = base_k << frontier.widening_level;
       if (cap < total_legal) window_size = cap;
     }
 
-    // FR-5.5: Try Outside-RZ null-move certificate pruning on undecided moves
-    // inside the active window (per-child stamp so newly widened moves are
-    // checked immediately without repeating failed revalidations).
-    if (config_.enable_rz_pruning && frontier.has_null_move_rz &&
-        frontier.representative_dag_id != kInvalidDagNodeId) {
-      const bool restricted_side =
-          (pos.ToPlay() == context.root_attacker &&
-           !context.attacker_allow_ko) ||
-          (pos.ToPlay() != context.root_attacker &&
-           !context.defender_allow_ko);
-      const bool rep_has_cap =
-          frontier.representative_dag_id < dag_has_capture_.size() &&
-          dag_has_capture_[frontier.representative_dag_id];
-      const int prev_opp_cnt =
-          pos.Stones(OppositeColor(pos.ToPlay())).Count();
+    const bool has_active_rz =
+        config_.enable_rz_pruning && frontier.has_null_move_rz &&
+        frontier.representative_dag_id != kInvalidDagNodeId;
+    const bool restricted_side =
+        (pos.ToPlay() == context.root_attacker &&
+         !context.attacker_allow_ko) ||
+        (pos.ToPlay() != context.root_attacker &&
+         !context.defender_allow_ko);
+    const bool rep_has_cap =
+        has_active_rz &&
+        frontier.representative_dag_id < dag_has_capture_.size() &&
+        dag_has_capture_[frontier.representative_dag_id];
+    const int prev_opp_cnt =
+        pos.Stones(OppositeColor(pos.ToPlay())).Count();
 
-      for (size_t i = 0; i < window_size; ++i) {
-        auto& ch = children[i];
-        if (ch.has_decisive_dag || ch.outcome != ProofOutcome::kUnknown ||
-            ch.checked_null_move_dag_id == frontier.representative_dag_id) {
-          continue;
+    // FR-5.5: Helper to run zero-trust OutsideRZRevalidated revalidation on a
+    // single candidate child (per-child stamp avoids repeated failed checks).
+    auto try_prune_child_outside_rz = [&](SearchChild& ch) -> bool {
+      if (!has_active_rz || ch.probed || ch.has_decisive_dag ||
+          ch.outcome != ProofOutcome::kUnknown ||
+          ch.checked_null_move_dag_id == frontier.representative_dag_id) {
+        return false;
+      }
+      ch.checked_null_move_dag_id = frontier.representative_dag_id;
+      if (!rz_engine_.IsOutsideRZCandidate(ch.move,
+                                           frontier.active_null_move_rz)) {
+        return false;
+      }
+      Position<N> next_pos = pos;
+      bool is_ko_cap = false;
+      if (!next_pos.PlayMove(ch.move, &is_ko_cap) ||
+          (is_ko_cap && restricted_side) ||
+          !RevalidateSourceProofOnQueryState(
+              next_pos, context, region_hint, frontier.representative_dag_id,
+              frontier.representative_outcome)) {
+        return false;
+      }
+      const bool did_cap =
+          next_pos.Stones(OppositeColor(pos.ToPlay())).Count() < prev_opp_cnt;
+      ProofDagNode<N> pruned_node;
+      pruned_node.node_id =
+          static_cast<uint32_t>(report_.proof_dag_nodes.size());
+      pruned_node.is_or_node = !is_or_node;
+      pruned_node.to_play = next_pos.ToPlay();
+      pruned_node.incoming_move = ch.move;
+      pruned_node.pn =
+          (frontier.representative_outcome == ProofOutcome::kProvenWin)
+              ? 0
+              : kPnDnSaturation;
+      pruned_node.dn =
+          (frontier.representative_outcome == ProofOutcome::kProvenWin)
+              ? kPnDnSaturation
+              : 0;
+      pruned_node.outcome = frontier.representative_outcome;
+      pruned_node.is_pruned_outside_rz = true;
+      pruned_node.source_proof_node_id = frontier.representative_dag_id;
+      pruned_node.proof_rz = frontier.active_null_move_rz;
+      pruned_node.disproof_rz = frontier.active_null_move_rz;
+      report_.proof_dag_nodes.push_back(pruned_node);
+      dag_has_capture_.push_back(did_cap || rep_has_cap);
+
+      ch.probed = true;
+      ch.has_decisive_dag = true;
+      ch.pruned_outside_rz = true;
+      ch.move_captured = did_cap;
+      ch.subtree_has_capture = rep_has_cap;
+      ch.outcome = frontier.representative_outcome;
+      ch.pn = pruned_node.pn;
+      ch.dn = pruned_node.dn;
+      ch.proof_rz = frontier.active_null_move_rz;
+      ch.disproof_rz = frontier.active_null_move_rz;
+      ch.dag_node_id = pruned_node.node_id;
+      ++report_.pruned_outside_rz_count;
+      return true;
+    };
+
+    // O(1) lazy outside-RZ predicate: an unprobed Unknown move strictly outside
+    // `active_null_move_rz` that has not failed revalidation is deferred until
+    // all in-RZ moves close (avoiding wasted DAG pushes on refuted internal
+    // nodes and artificial widen_trigger throttling from outer-moat moves).
+    auto is_lazy_outside_rz = [&](const SearchChild& ch) -> bool {
+      return has_active_rz && !ch.probed && !ch.has_decisive_dag &&
+             ch.outcome == ProofOutcome::kUnknown &&
+             ch.checked_null_move_dag_id != frontier.representative_dag_id &&
+             rz_engine_.IsOutsideRZCandidate(ch.move,
+                                             frontier.active_null_move_rz);
+    };
+
+    std::vector<size_t> active_indices;
+    active_indices.reserve(total_legal);
+    size_t lazy_outside_count = 0;
+    size_t unexpanded_u = 0;
+    int first_unexpanded_idx = -1;
+    uint32_t outside_witness_metric = kPnDnSaturation;
+
+    if (has_active_rz) {
+      for (size_t i = 0; i < total_legal; ++i) {
+        if (is_lazy_outside_rz(children[i])) {
+          ++lazy_outside_count;
+        } else {
+          active_indices.push_back(i);
         }
-        ch.checked_null_move_dag_id = frontier.representative_dag_id;
-        if (rz_engine_.IsOutsideRZCandidate(ch.move,
-                                            frontier.active_null_move_rz)) {
-          Position<N> next_pos = pos;
-          bool is_ko_cap = false;
-          if (next_pos.PlayMove(ch.move, &is_ko_cap) &&
-              !(is_ko_cap && restricted_side) &&
-              RevalidateSourceProofOnQueryState(
-                  next_pos, context, region_hint,
-                  frontier.representative_dag_id,
-                  frontier.representative_outcome)) {
-            const bool did_cap =
-                next_pos.Stones(OppositeColor(pos.ToPlay())).Count() <
-                prev_opp_cnt;
-            ProofDagNode<N> pruned_node;
-            pruned_node.node_id =
-                static_cast<uint32_t>(report_.proof_dag_nodes.size());
-            pruned_node.is_or_node = !is_or_node;
-            pruned_node.to_play = next_pos.ToPlay();
-            pruned_node.incoming_move = ch.move;
-            pruned_node.pn =
-                (frontier.representative_outcome == ProofOutcome::kProvenWin)
-                    ? 0
-                    : kPnDnSaturation;
-            pruned_node.dn =
-                (frontier.representative_outcome == ProofOutcome::kProvenWin)
-                    ? kPnDnSaturation
-                    : 0;
-            pruned_node.outcome = frontier.representative_outcome;
-            pruned_node.is_pruned_outside_rz = true;
-            pruned_node.source_proof_node_id = frontier.representative_dag_id;
-            pruned_node.proof_rz = frontier.active_null_move_rz;
-            pruned_node.disproof_rz = frontier.active_null_move_rz;
-            report_.proof_dag_nodes.push_back(pruned_node);
-            dag_has_capture_.push_back(rep_has_cap);
-
-            ch.probed = true;
-            ch.has_decisive_dag = true;
-            ch.pruned_outside_rz = true;
-            ch.move_captured = did_cap;
-            ch.subtree_has_capture = rep_has_cap;
-            ch.outcome = frontier.representative_outcome;
-            ch.pn = pruned_node.pn;
-            ch.dn = pruned_node.dn;
-            ch.proof_rz = frontier.active_null_move_rz;
-            ch.disproof_rz = frontier.active_null_move_rz;
-            ch.dag_node_id = pruned_node.node_id;
-            ++report_.pruned_outside_rz_count;
+      }
+    } else {
+      for (size_t i = 0; i < window_size; ++i) {
+        active_indices.push_back(i);
+      }
+      for (size_t i = window_size; i < total_legal; ++i) {
+        const auto& ch = children[i];
+        if (is_or_node) {
+          if (ch.pn == 0 && ch.outcome == ProofOutcome::kProvenWin &&
+              !ch.ko_dependent && ch.has_decisive_dag) {
+            outside_witness_metric = 0;
+          }
+          if (ch.dn > 0 || ch.outcome != ProofOutcome::kProvenLoss ||
+              !ch.has_decisive_dag) {
+            ++unexpanded_u;
+            if (first_unexpanded_idx < 0) {
+              first_unexpanded_idx = static_cast<int>(i);
+            }
+          }
+        } else {
+          if (ch.dn == 0 && ch.outcome == ProofOutcome::kProvenLoss &&
+              !ch.ko_dependent && ch.has_decisive_dag) {
+            outside_witness_metric = 0;
+          }
+          if (ch.pn > 0 || ch.outcome != ProofOutcome::kProvenWin ||
+              !ch.has_decisive_dag) {
+            ++unexpanded_u;
+            if (first_unexpanded_idx < 0) {
+              first_unexpanded_idx = static_cast<int>(i);
+            }
           }
         }
+      }
+      if (unexpanded_u == 0 && window_size < total_legal) {
+        for (size_t i = window_size; i < total_legal; ++i) {
+          active_indices.push_back(i);
+        }
+        window_size = total_legal;
       }
     }
 
     // FR-4.1: Frontier PN/DN aggregation without breadth-exploding sum inflation.
-    const size_t unexpanded_u =
-        (total_legal > window_size) ? (total_legal - window_size) : 0;
     const uint32_t widen_trigger =
-        (unexpanded_u > 0)
-            ? std::max(is_or_node ? children[window_size].pn
-                                  : children[window_size].dn,
-                       (is_or_node ? 14U : 10U) *
-                           (frontier.widening_level + 1U))
+        (unexpanded_u > 0 && first_unexpanded_idx >= 0)
+            ? std::max(
+                  is_or_node
+                      ? children[static_cast<size_t>(first_unexpanded_idx)].pn
+                      : children[static_cast<size_t>(first_unexpanded_idx)].dn,
+                  (is_or_node ? 20U : 16U) * (frontier.widening_level + 1U))
             : kPnDnSaturation;
     uint32_t cur_pn = 1;
     uint32_t cur_dn = 1;
     int force_expand_pass_idx = -1;
 
     if (is_or_node) {
-      uint32_t min_pn = kPnDnSaturation;
+      uint32_t min_pn = outside_witness_metric;
       uint64_t sum_dn = 0;
-      for (size_t i = 0; i < window_size; ++i) {
-        min_pn = std::min(min_pn, children[i].pn);
-        sum_dn += children[i].dn;
+      for (size_t idx : active_indices) {
+        min_pn = std::min(min_pn, children[idx].pn);
+        sum_dn += children[idx].dn;
+      }
+      if (has_active_rz && min_pn >= 48U && min_pn < kPnDnSaturation) {
+        // Just-in-time relaxation: all sharp in-RZ moves are closed; relax
+        // stale !in_attention unprobed in-RZ obligations to close cleanly.
+        bool relaxed = false;
+        for (size_t idx : active_indices) {
+          auto& ch = children[idx];
+          if (!ch.probed && ch.outcome == ProofOutcome::kUnknown &&
+              !ch.ko_dependent && ch.pn >= 48U) {
+            ch.pn = 8U;
+            relaxed = true;
+          }
+        }
+        if (relaxed) continue;
       }
       if (unexpanded_u > 0) {
         min_pn = std::min(min_pn, widen_trigger);
       }
-      if (sum_dn == 0 && window_size < total_legal) {
-        frontier.widening_level =
-            frontier.has_null_move_rz ? 6U : (frontier.widening_level + 1U);
+      if (min_pn > 0 && sum_dn == 0 && lazy_outside_count > 0) {
+        for (size_t i = 0; i < total_legal; ++i) {
+          if (is_lazy_outside_rz(children[i])) {
+            try_prune_child_outside_rz(children[i]);
+          }
+        }
+        continue;
+      }
+      if (min_pn > 0 && sum_dn == 0 && unexpanded_u > 0) {
+        ++frontier.widening_level;
         ++report_.widening_upgrades;
         continue;
       }
       cur_pn = min_pn;
-      cur_dn = ClampSat(sum_dn + (unexpanded_u > 0 ? 1ULL : 0ULL));
+      cur_dn = ClampSat(
+          sum_dn + ((unexpanded_u > 0 || lazy_outside_count > 0) ? 1ULL : 0ULL));
     } else {
       uint64_t sum_pn = 0;
-      uint32_t min_dn = kPnDnSaturation;
-      for (size_t i = 0; i < window_size; ++i) {
-        sum_pn += children[i].pn;
-        min_dn = std::min(min_dn, children[i].dn);
+      uint32_t min_dn = outside_witness_metric;
+      for (size_t idx : active_indices) {
+        sum_pn += children[idx].pn;
+        min_dn = std::min(min_dn, children[idx].dn);
       }
-      // Also honor any already-probed PASS outside the current window that
-      // produced a decisive refutation (dn == 0).
-      for (size_t i = window_size; i < total_legal; ++i) {
-        if (children[i].has_decisive_dag && !children[i].ko_dependent &&
-            children[i].dn == 0) {
-          min_dn = 0;
-          break;
+      if (has_active_rz && min_dn >= 48U && min_dn < kPnDnSaturation) {
+        // Just-in-time relaxation: all sharp in-RZ defenses are proven; relax
+        // stale !in_attention unprobed in-RZ defenses (dn=96+) to dn=4 so
+        // ancestor dn does not spike and bounce out of a nearly closed subtree.
+        bool relaxed = false;
+        for (size_t idx : active_indices) {
+          auto& ch = children[idx];
+          if (!ch.probed && ch.outcome == ProofOutcome::kUnknown &&
+              !ch.ko_dependent && ch.dn >= 48U) {
+            ch.dn = 4U;
+            relaxed = true;
+          }
         }
+        if (relaxed) continue;
       }
       if (unexpanded_u > 0) {
         min_dn = std::min(min_dn, widen_trigger);
       }
-      if (min_dn > 0 && sum_pn == 0 && window_size < total_legal) {
+      if (min_dn > 0 && sum_pn == 0 && lazy_outside_count > 0) {
+        for (size_t i = 0; i < total_legal; ++i) {
+          if (is_lazy_outside_rz(children[i])) {
+            try_prune_child_outside_rz(children[i]);
+          }
+        }
+        continue;
+      }
+      if (min_dn > 0 && sum_pn == 0 && unexpanded_u > 0) {
         // Before widening across the full region, probe PASS once if unprobed
         // so active_null_move_rz carries a stone-free tenuki certificate.
         int pass_idx = -1;
@@ -812,13 +1435,14 @@ void DfpnSolver<N>::MidSearch(
           cur_pn = 1U;
           cur_dn = std::max(1U, children[static_cast<size_t>(pass_idx)].dn);
         } else {
-          frontier.widening_level =
-              frontier.has_null_move_rz ? 6U : (frontier.widening_level + 1U);
+          ++frontier.widening_level;
           ++report_.widening_upgrades;
           continue;
         }
       } else {
-        cur_pn = ClampSat(sum_pn + (unexpanded_u > 0 ? 1ULL : 0ULL));
+        cur_pn = ClampSat(
+            sum_pn +
+            ((unexpanded_u > 0 || lazy_outside_count > 0) ? 1ULL : 0ULL));
         cur_dn = min_dn;
       }
     }
@@ -827,9 +1451,17 @@ void DfpnSolver<N>::MidSearch(
     if (cur_pn == 0 || cur_dn == 0) {
       // Full coverage required for OR->Loss (cur_dn == 0) and AND->Win (cur_pn == 0).
       if (((is_or_node && cur_dn == 0) || (!is_or_node && cur_pn == 0)) &&
-          window_size < total_legal) {
-        ++frontier.widening_level;
-        ++report_.widening_upgrades;
+          (unexpanded_u > 0 || lazy_outside_count > 0)) {
+        if (lazy_outside_count > 0) {
+          for (size_t i = 0; i < total_legal; ++i) {
+            if (is_lazy_outside_rz(children[i])) {
+              try_prune_child_outside_rz(children[i]);
+            }
+          }
+        } else {
+          ++frontier.widening_level;
+          ++report_.widening_upgrades;
+        }
         continue;
       }
 
@@ -983,20 +1615,20 @@ void DfpnSolver<N>::MidSearch(
     // (`!frontier.pass_probed`) to seed OutsideRZRevalidated pruning, then
     // immediately resume normal df-pn scheduling if inconclusive.
     if (force_expand_pass_idx < 0 && config_.enable_rz_pruning && !is_or_node &&
-        window_size == total_legal && pos.ConsecutivePasses() == 0 &&
+        unexpanded_u == 0 && pos.ConsecutivePasses() == 0 &&
         !frontier.has_null_move_rz && !frontier.pass_probed &&
         children.size() > 1U) {
-      for (size_t i = 0; i < window_size; ++i) {
-        if (children[i].move == kPassMove && !children[i].probed &&
-            !children[i].ko_dependent &&
-            children[i].outcome == ProofOutcome::kUnknown) {
-          force_expand_pass_idx = static_cast<int>(i);
+      for (size_t idx : active_indices) {
+        if (children[idx].move == kPassMove && !children[idx].probed &&
+            !children[idx].ko_dependent &&
+            children[idx].outcome == ProofOutcome::kUnknown) {
+          force_expand_pass_idx = static_cast<int>(idx);
           break;
         }
       }
     }
 
-    // Select most-proving child within current window (skipping ko_dependent barriers).
+    // Select most-proving child within active set (skipping ko_dependent barriers).
     int best_idx = -1;
     uint32_t best_metric = kPnDnSaturation;
     uint32_t second_best_metric = kPnDnSaturation;
@@ -1006,13 +1638,13 @@ void DfpnSolver<N>::MidSearch(
       best_metric = children[static_cast<size_t>(best_idx)].dn;
       second_best_metric = kPnDnSaturation;
     } else {
-      for (size_t i = 0; i < window_size; ++i) {
-        if (children[i].ko_dependent) continue;
-        const uint32_t m = is_or_node ? children[i].pn : children[i].dn;
+      for (size_t idx : active_indices) {
+        if (children[idx].ko_dependent) continue;
+        const uint32_t m = is_or_node ? children[idx].pn : children[idx].dn;
         if (m < best_metric) {
           second_best_metric = best_metric;
           best_metric = m;
-          best_idx = static_cast<int>(i);
+          best_idx = static_cast<int>(idx);
         } else if (m < second_best_metric) {
           second_best_metric = m;
         }
@@ -1047,9 +1679,12 @@ void DfpnSolver<N>::MidSearch(
     const uint32_t chosen_dn = children[static_cast<size_t>(best_idx)].dn;
     if (depth == 0) report_.best_move = chosen_move;
 
+    // 1+epsilon df-pn with >= +4 & 1.65x margin so child thresholds sustain
+    // deep tactical reading without bouncing at depths 2..4.
     const uint32_t eps_bound = ClampSat(std::max<uint64_t>(
-        static_cast<uint64_t>(second_best_metric) + 1ULL,
-        static_cast<uint64_t>(second_best_metric) * 5ULL / 4ULL + 2ULL));
+        static_cast<uint64_t>(second_best_metric) + 4ULL,
+        (static_cast<uint64_t>(second_best_metric) * 165ULL + 99ULL) / 100ULL +
+            4ULL));
     uint32_t child_th_pn = th_pn;
     uint32_t child_th_dn = th_dn;
     if (is_or_node) {
@@ -1121,10 +1756,8 @@ void DfpnSolver<N>::MidSearch(
       post_frontier.pass_probed = true;
     }
 
-    // FR-5.7: KoDependent witness barrier check (propagates child_ko_dep too!).
-    const bool restricted_side =
-        (pos.ToPlay() == context.root_attacker && !context.attacker_allow_ko) ||
-        (pos.ToPlay() != context.root_attacker && !context.defender_allow_ko);
+    // FR-5.7: KoDependent witness barrier check (propagates child_ko_dep too;
+    // reuses loop-scoped `restricted_side`).
     if ((is_ko_capture || child_ko_dep) && restricted_side &&
         ((is_or_node && mpc.pn == 0) || (!is_or_node && mpc.dn == 0))) {
       mpc.ko_dependent = true;

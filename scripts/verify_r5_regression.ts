@@ -195,21 +195,26 @@ runSection('1. Core Benchmarks (p001..p007) & p042', () => {
     `got=${rep42.rootStatus}, nodes=${rep42.numNodes}`
   );
   check(
-    rep42.numNodes <= 1300,
-    'p042 search nodes stay optimized (<= 1300)',
-    `nodes=${rep42.numNodes}`
+    rep42.numNodes <= 600 && rep42.prunedOutsideRzCount > 0,
+    'p042 search nodes stay optimized (<= 600) with RZ pruning',
+    `nodes=${rep42.numNodes}, pruned=${rep42.prunedOutsideRzCount}`
   );
+  const mem42 = checker.verifyProofDag(pos42, ctx42, rep42, {
+    verifiedScope: 'original_root',
+  });
   const ver42 = checker.verifySerializedLProofJson(rep42.lproofJson, {
     problem: p042,
     scope: 'original_root',
   });
   check(
-    ver42.passed,
-    'p042 standalone file verification PASS',
-    `code=${ver42.errorCode}`
+    mem42.passed &&
+      ver42.passed &&
+      mem42.canonicalDagChecksum === ver42.canonicalDagChecksum,
+    'p042 memory & standalone file verification PASS with matching canonicalDagChecksum',
+    `mem=${mem42.errorCode}, file=${ver42.errorCode}`
   );
   console.log(
-    `  [INFO] p042: outcome=${rep42.rootStatus}, nodes=${rep42.numNodes}, dag=${rep42.proofDagNodes.length}, timeMs=${rep42.timeMs.toFixed(1)}`
+    `  [INFO] p042: outcome=${rep42.rootStatus}, nodes=${rep42.numNodes}, dag=${rep42.proofDagNodes.length}, pruned=${rep42.prunedOutsideRzCount}, timeMs=${rep42.timeMs.toFixed(1)}`
   );
 });
 
@@ -1092,6 +1097,68 @@ runSection('Section 6: R8 Problem Contract, Reverse-Witness & Contradictory Regi
       !badTypeVer.passed && badTypeVer.errorCode === 'LP-J02',
       `R8 §3 non-boolean problemSetup.hasRegionHint=${JSON.stringify(badVal)} rejected -> LP-J02`,
       `code=${badTypeVer.errorCode}`
+    );
+  }
+});
+
+// =============================================================================
+// Section 7: Real-Problem Solver Breakthrough (p031 Proven + Zero-Leaf Barrier)
+// =============================================================================
+runSection('Section 7: Real-Problem Solver Breakthrough (p031 + Zero-Leaf Guardrails)', () => {
+  const realCfg: SolverConfig = {
+    ...defaultConfig(3500),
+    maxDepth: 48,
+    memoryBudgetMb: 512,
+    useProblemDefaultKo: true,
+  };
+
+  // p031: full unmodified region, original_root PROVEN_WIN with B[sr] & verified certificate
+  const p031 = getSpec('chao_vol1_p031');
+  const ctx31 = DfpnSolver.buildProofContext(p031, realCfg);
+  const pos31 = DfpnSolver.buildInitialPosition(p031, ctx31);
+  const rep31 = new DfpnSolver(realCfg).solveFromPosition(p031, pos31, ctx31);
+  check(
+    rep31.rootStatus === ProofOutcome.ProvenWin && rep31.bestMoveSgf === 'sr',
+    'p031 solves to PROVEN_WIN with bestMove=sr under 3500-node budget',
+    `status=${rep31.rootStatus}, best=${rep31.bestMoveSgf}, nodes=${rep31.numNodes}`
+  );
+  check(
+    rep31.numNodes <= 2800 && rep31.prunedOutsideRzCount > 0,
+    'p031 stays within <= 2800 nodes with active OutsideRZRevalidated pruning',
+    `nodes=${rep31.numNodes}, pruned=${rep31.prunedOutsideRzCount}`
+  );
+  const mem31 = checker.verifyProofDag(pos31, ctx31, rep31, {
+    verifiedScope: 'original_root',
+  });
+  const file31 = checker.verifySerializedLProofJson(rep31.lproofJson, {
+    problem: p031,
+    scope: 'original_root',
+  });
+  check(
+    mem31.passed &&
+      file31.passed &&
+      mem31.canonicalDagChecksum === file31.canonicalDagChecksum,
+    'p031 passes memory & external-bound original_root verification with matching canonicalDagChecksum',
+    `mem=${mem31.errorCode}, file=${file31.errorCode}`
+  );
+  console.log(
+    `  [INFO] p031: outcome=${rep31.rootStatus}, best=${rep31.bestMoveSgf}, nodes=${rep31.numNodes}, dag=${rep31.proofDagNodes.length}, pruned=${rep31.prunedOutsideRzCount}, timeMs=${rep31.timeMs.toFixed(1)}`
+  );
+
+  // Zero-leaf barrier guardrails: previously 0-leaf breadth-stalled real problems must reach terminal leaves
+  for (const idPrefix of ['chao_vol1_p057', 'chao_vol1_p060', 'chao_vol2_p162']) {
+    const spec = getSpec(idPrefix);
+    const rep = new DfpnSolver(realCfg).solveProblem(spec);
+    const leafCount = rep.proofDagNodes.filter(
+      (n) =>
+        n.terminalEvidence === 'BENSON_UCA' ||
+        n.terminalEvidence === 'TOKENS_CAPTURED' ||
+        n.terminalEvidence === 'DOUBLE_PASS_RESOLUTION'
+    ).length;
+    check(
+      leafCount > 0,
+      `${idPrefix} breaks zero-leaf barrier within 3500 nodes`,
+      `leaves=${leafCount}, dag=${rep.proofDagNodes.length}, pruned=${rep.prunedOutsideRzCount}`
     );
   }
 });

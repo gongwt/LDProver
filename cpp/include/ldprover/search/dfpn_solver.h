@@ -10,11 +10,13 @@
 #ifndef LDPROVER_SEARCH_DFPN_SOLVER_H_
 #define LDPROVER_SEARCH_DFPN_SOLVER_H_
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "ldprover/core/position.h"
@@ -99,6 +101,13 @@ class DfpnSolver {
                        const std::string& problem_id = "");
 
  private:
+  struct MoveEvalMeta {
+    int32_t score = 0;
+    bool immediate_win = false;
+    bool immediate_loss = false;
+    bool in_attention = true;
+  };
+
   struct SearchChild {
     int16_t move = kPassMove;
     int32_t tactical_score = 0;
@@ -130,16 +139,34 @@ class DfpnSolver {
   };
 
   struct NodeTacticalContext {
-    std::vector<int> crucial_lib_bonus;
-    std::vector<int> enemy_min_lib;
-    std::vector<int> friendly_min_lib;
-    BitBoard<N> target_coords{};
+    std::array<int16_t, N * N> chain_id_at{};
+    std::vector<int16_t> chain_libs;
+    std::vector<uint8_t> chain_is_immortal;
+    std::vector<uint8_t> chain_is_cutting_enemy;
+    BitBoard<N> crucial_stone_mask{};
+    std::array<uint8_t, N * N> crucial_lib_min_libs{};
+    Color target_color = Color::kBlack;
   };
 
   bool IsMemoryBudgetExceeded(uint32_t active_depth) const noexcept;
 
   NodeTacticalContext BuildNodeTacticalContext(
       const Position<N>& pos, const ProofContext& context) const;
+
+  int EstimateParentEyeLikeCount(const Position<N>& pos,
+                                 const ProofContext& context) const;
+
+  // FR-4.10: Deterministic FastCapture tactical move evaluation with dynamic
+  // tactical attention, 1-ply Benson UCA detection, and crucial liberty delta.
+  MoveEvalMeta EvaluateCandidateMove(const Position<N>& pos,
+                                     const ProofContext& context,
+                                     const NodeTacticalContext& tctx,
+                                     int16_t move, bool is_or_node,
+                                     int parent_eye_like_count) const;
+
+  std::pair<uint32_t, uint32_t> ComputeInitialChildBounds(
+      size_t rank_idx, bool is_or_node, const MoveEvalMeta& meta,
+      int16_t move) const noexcept;
 
   void MidSearch(Position<N>& pos, const ProofContext& context,
                  const std::optional<BitBoard<N>>& region_hint,
@@ -153,12 +180,6 @@ class DfpnSolver {
                  ProofCertificateRZ<N>* out_disproof_rz,
                  uint32_t* out_dag_node_id,
                  int16_t incoming_move);
-
-  // FR-4.10: Deterministic FastCapture tactical move ordering.
-  int32_t ScoreMoveFastCapture(const Position<N>& pos,
-                               const ProofContext& context,
-                               const NodeTacticalContext& tctx,
-                               int16_t move, bool is_or_node) const;
 
   // FR-5.5: Revalidate source proof under QueryState + HistorySet (both witness
   // and full-coverage AND/OR nodes) before materializing OutsideRZRevalidated.
