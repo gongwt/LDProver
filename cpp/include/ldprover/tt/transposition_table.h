@@ -106,6 +106,9 @@ class TranspositionStore {
     return pattern_proof_reusable_hits_;
   }
   uint64_t GhiRejectedCount() const noexcept { return ghi_rejected_count_; }
+  size_t EstimatedEntryCount() const noexcept {
+    return board_buckets_.size() + pattern_entries_.size();
+  }
 
  private:
   struct RadixNode {

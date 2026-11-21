@@ -29,16 +29,13 @@ struct ZobristTable {
   uint64_t white_to_play_key = 0;
 
   constexpr ZobristTable() noexcept {
-    uint64_t seq = 1001ULL;
-    for (int c = 1; c <= 2; ++c) {
-      for (int p = 0; p < kMaxBoardPoints; ++p) {
-        stone_keys[c][p] = SplitMix64(seq++);
-      }
-    }
+    // Aligned 1:1 with TypeScript src/engine/position.ts Zobrist table (R3 F5).
     for (int p = 0; p < kMaxBoardPoints; ++p) {
-      ko_keys[p] = SplitMix64(seq++);
+      stone_keys[1][p] = SplitMix64(1000ULL + static_cast<uint64_t>(p));
+      stone_keys[2][p] = SplitMix64(2000ULL + static_cast<uint64_t>(p));
+      ko_keys[p] = SplitMix64(3000ULL + static_cast<uint64_t>(p));
     }
-    white_to_play_key = SplitMix64(seq++);
+    white_to_play_key = SplitMix64(9999ULL);
   }
 };
 
@@ -71,6 +68,10 @@ void Position<N>::Clear(const ProofContext& context) noexcept {
   }
   history_snapshots_.clear();
   undo_stack_.clear();
+  origin_black_.Clear();
+  origin_white_.Clear();
+  origin_to_play_ = Color::kBlack;
+  played_move_trace_.clear();
   zobrist_hash_ = ComputeZobrist();
 }
 
@@ -88,6 +89,17 @@ void Position<N>::FinalizeInitialPosition(Color first_to_play) noexcept {
   to_play_ = first_to_play;
   ko_point_ = kNullMove;
   consecutive_passes_ = 0;
+  surviving_target_tokens_mask_ = 0;
+  for (size_t i = 0; i < context_.initial_tokens.size() && i < 64; ++i) {
+    const auto& tok = context_.initial_tokens[i];
+    if (StoneAt(tok.initial_coord) == tok.stone_color) {
+      surviving_target_tokens_mask_ |= (1ULL << i);
+    }
+  }
+  origin_black_ = black_stones_;
+  origin_white_ = white_stones_;
+  origin_to_play_ = first_to_play;
+  played_move_trace_.clear();
   zobrist_hash_ = ComputeZobrist();
   history_snapshots_.clear();
   history_snapshots_.push_back(CurrentCanonicalSnapshot());
@@ -218,6 +230,7 @@ bool Position<N>::PlayMove(int16_t move, bool* out_is_ko_capture) noexcept {
     to_play_ = OppositeColor(to_play_);
     zobrist_hash_ = ComputeZobrist();
     undo_stack_.push_back(undo);
+    played_move_trace_.push_back(kPassMove);
     history_snapshots_.push_back(CurrentCanonicalSnapshot());
     return true;
   }
@@ -304,6 +317,7 @@ bool Position<N>::PlayMove(int16_t move, bool* out_is_ko_capture) noexcept {
   }
 
   undo_stack_.push_back(undo);
+  played_move_trace_.push_back(move);
   history_snapshots_.push_back(CurrentCanonicalSnapshot());
   return true;
 }
@@ -313,6 +327,7 @@ void Position<N>::UndoMove() noexcept {
   if (undo_stack_.empty()) return;
   const UndoRecord<N> rec = undo_stack_.back();
   undo_stack_.pop_back();
+  if (!played_move_trace_.empty()) played_move_trace_.pop_back();
   if (!history_snapshots_.empty()) history_snapshots_.pop_back();
 
   black_stones_ = rec.prev_black;

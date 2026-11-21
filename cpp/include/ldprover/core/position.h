@@ -88,6 +88,13 @@ class Position {
                                 zobrist_hash_};
   }
 
+  const BitBoard<N>& OriginBlack() const noexcept { return origin_black_; }
+  const BitBoard<N>& OriginWhite() const noexcept { return origin_white_; }
+  Color OriginToPlay() const noexcept { return origin_to_play_; }
+  const std::vector<int16_t>& PlayedMoveTrace() const noexcept {
+    return played_move_trace_;
+  }
+
   std::vector<int> OrthogonalNeighbors(int coord) const;
   std::vector<int> DiagonalNeighbors(int coord) const;
   BitBoard<N> FloodFillChain(int start_coord, BitBoard<N>* out_liberties) const;
@@ -106,6 +113,10 @@ class Position {
   uint64_t surviving_target_tokens_mask_ = 0;
   std::vector<CanonicalSnapshot<N>> history_snapshots_;
   std::vector<UndoRecord<N>> undo_stack_;
+  BitBoard<N> origin_black_{};
+  BitBoard<N> origin_white_{};
+  Color origin_to_play_ = Color::kBlack;
+  std::vector<int16_t> played_move_trace_;
 };
 
 }  // namespace ldprover

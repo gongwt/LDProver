@@ -10,6 +10,7 @@
 
 #include <cctype>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -78,52 +79,364 @@ void ExtractSgfPropertyCoords(const std::string& sgf, const std::string& prop,
   }
 }
 
-bool ExtractJsonStringField(const std::string& json, const std::string& key,
-                            std::string* out_val) {
-  const std::string needle = "\"" + key + "\"";
-  size_t pos = 0;
-  while ((pos = json.find(needle, pos)) != std::string::npos) {
-    size_t cur = pos + needle.size();
-    while (cur < json.size() &&
-           std::isspace(static_cast<unsigned char>(json[cur]))) {
-      ++cur;
-    }
-    if (cur >= json.size() || json[cur] != ':') {
-      pos = cur;
+bool ValidateSgfStructureAndSize(const std::string& sgf, int expected_size,
+                                 std::string* out_err_code,
+                                 std::string* out_err_msg) {
+  const std::string trimmed = TrimAscii(sgf);
+  if (trimmed.size() < 3U || trimmed.substr(0U, 2U) != "(;" ||
+      trimmed.back() != ')') {
+    *out_err_code = "FR1-INVALID-SGF";
+    *out_err_msg = "masked_sgf_str must start with '(;' and end with ')'.";
+    return false;
+  }
+  int paren_depth = 0;
+  bool in_bracket = false;
+  bool escaped = false;
+  for (size_t i = 0; i < trimmed.size(); ++i) {
+    const char ch = trimmed[i];
+    if (in_bracket) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch == '\\') {
+        escaped = true;
+      } else if (ch == ']') {
+        in_bracket = false;
+      }
       continue;
     }
-    ++cur;
-    while (cur < json.size() &&
-           std::isspace(static_cast<unsigned char>(json[cur]))) {
-      ++cur;
+    if (ch == '[') {
+      in_bracket = true;
+    } else if (ch == ']') {
+      *out_err_code = "FR1-INVALID-SGF";
+      *out_err_msg = "Unmatched ']' in masked_sgf_str.";
+      return false;
+    } else if (ch == '(') {
+      ++paren_depth;
+    } else if (ch == ')') {
+      --paren_depth;
+      if (paren_depth < 0) {
+        *out_err_code = "FR1-INVALID-SGF";
+        *out_err_msg = "Unbalanced parentheses in masked_sgf_str.";
+        return false;
+      }
     }
-    if (cur >= json.size() || json[cur] != '"') return false;
-    ++cur;
-    std::string val;
-    while (cur < json.size()) {
-      const char ch = json[cur++];
-      if (ch == '\\' && cur < json.size()) {
-        const char esc = json[cur++];
-        if (esc == 'n') {
-          val.push_back('\n');
-        } else if (esc == 'r') {
-          val.push_back('\r');
-        } else if (esc == 't') {
-          val.push_back('\t');
-        } else {
-          val.push_back(esc);
+  }
+  if (in_bracket || paren_depth != 0) {
+    *out_err_code = "FR1-INVALID-SGF";
+    *out_err_msg = "Unclosed bracket or parenthesis in masked_sgf_str.";
+    return false;
+  }
+
+  // Validate SZ[...] if present matches expected board size N.
+  size_t sz_pos = 0;
+  while ((sz_pos = trimmed.find("SZ[", sz_pos)) != std::string::npos) {
+    if (sz_pos > 0 &&
+        std::isupper(static_cast<unsigned char>(trimmed[sz_pos - 1U]))) {
+      sz_pos += 3U;
+      continue;
+    }
+    const size_t close = trimmed.find(']', sz_pos + 3U);
+    if (close == std::string::npos) {
+      *out_err_code = "FR1-INVALID-SGF";
+      *out_err_msg = "Unclosed SZ[...] property in masked_sgf_str.";
+      return false;
+    }
+    const std::string sz_str = TrimAscii(trimmed.substr(sz_pos + 3U, close - sz_pos - 3U));
+    if (sz_str.empty()) {
+      *out_err_code = "FR1-INVALID-BOARD-SIZE";
+      *out_err_msg = "Empty SZ[] property in masked_sgf_str.";
+      return false;
+    }
+    int parsed_sz = 0;
+    for (char ch : sz_str) {
+      if (!std::isdigit(static_cast<unsigned char>(ch))) {
+        *out_err_code = "FR1-INVALID-BOARD-SIZE";
+        *out_err_msg = "Non-numeric SZ property: " + sz_str;
+        return false;
+      }
+      parsed_sz = parsed_sz * 10 + static_cast<int>(ch - '0');
+    }
+    if (parsed_sz != expected_size) {
+      *out_err_code = "FR1-BOARD-SIZE-MISMATCH";
+      *out_err_msg = "SGF SZ[" + sz_str + "] does not match solver board size " +
+                     std::to_string(expected_size) + ".";
+      return false;
+    }
+    break;
+  }
+
+  // Validate AB[...] and AW[...] coordinate tokens fall within expected_size.
+  for (const std::string& prop : {std::string("AB"), std::string("AW")}) {
+    size_t p = 0;
+    while (p < trimmed.size()) {
+      const size_t found = trimmed.find(prop + "[", p);
+      if (found == std::string::npos) break;
+      if (found > 0 &&
+          std::isupper(static_cast<unsigned char>(trimmed[found - 1U]))) {
+        p = found + prop.size();
+        continue;
+      }
+      size_t cur = found + prop.size();
+      while (cur < trimmed.size()) {
+        while (cur < trimmed.size() &&
+               std::isspace(static_cast<unsigned char>(trimmed[cur]))) {
+          ++cur;
         }
-      } else if (ch == '"') {
-        *out_val = val;
+        if (cur >= trimmed.size() || trimmed[cur] != '[') break;
+        const size_t close = trimmed.find(']', cur + 1U);
+        if (close == std::string::npos) {
+          *out_err_code = "FR1-INVALID-SGF";
+          *out_err_msg = "Unclosed " + prop + "[...] property in masked_sgf_str.";
+          return false;
+        }
+        const std::string inner =
+            TrimAscii(trimmed.substr(cur + 1U, close - cur - 1U));
+        if (ParseSgfCoord(inner, expected_size) < 0) {
+          *out_err_code = "FR1-INVALID-SGF";
+          *out_err_msg = "Invalid or out-of-bounds " + prop + " coordinate [" +
+                         inner + "] for board size " +
+                         std::to_string(expected_size) + ".";
+          return false;
+        }
+        cur = close + 1U;
+      }
+      p = cur;
+    }
+  }
+  return true;
+}
+
+// Strict RFC 8259 recursive-descent JSON parser for top-level problem objects (R3 F6.2).
+class StrictProblemJsonParser {
+ public:
+  explicit StrictProblemJsonParser(const std::string& src) : src_(src) {}
+
+  bool ParseTopLevelObject(std::map<std::string, std::string>* out_str_fields) {
+    SkipWs();
+    if (pos_ >= src_.size() || src_[pos_] != '{') return false;
+    if (!ParseObject(out_str_fields, true)) return false;
+    SkipWs();
+    return pos_ == src_.size();
+  }
+
+ private:
+  void SkipWs() {
+    while (pos_ < src_.size() &&
+           std::isspace(static_cast<unsigned char>(src_[pos_]))) {
+      ++pos_;
+    }
+  }
+
+  bool ParseString(std::string* out) {
+    if (pos_ >= src_.size() || src_[pos_] != '"') return false;
+    ++pos_;
+    std::string res;
+    while (pos_ < src_.size()) {
+      const unsigned char uch = static_cast<unsigned char>(src_[pos_++]);
+      if (uch < 0x20U) return false;  // Unescaped control char illegal in RFC 8259
+      if (uch == '"') {
+        if (out != nullptr) *out = std::move(res);
         return true;
+      }
+      if (uch == '\\') {
+        if (pos_ >= src_.size()) return false;
+        const char esc = src_[pos_++];
+        switch (esc) {
+          case '"':
+          case '\\':
+          case '/':
+            res.push_back(esc);
+            break;
+          case 'b':
+            res.push_back('\b');
+            break;
+          case 'f':
+            res.push_back('\f');
+            break;
+          case 'n':
+            res.push_back('\n');
+            break;
+          case 'r':
+            res.push_back('\r');
+            break;
+          case 't':
+            res.push_back('\t');
+            break;
+          case 'u': {
+            if (pos_ + 4U > src_.size()) return false;
+            uint32_t cp = 0;
+            for (int k = 0; k < 4; ++k) {
+              const char hc = src_[pos_++];
+              cp <<= 4U;
+              if (hc >= '0' && hc <= '9') cp |= static_cast<uint32_t>(hc - '0');
+              else if (hc >= 'a' && hc <= 'f') cp |= static_cast<uint32_t>(hc - 'a' + 10);
+              else if (hc >= 'A' && hc <= 'F') cp |= static_cast<uint32_t>(hc - 'A' + 10);
+              else return false;
+            }
+            if (cp < 0x80U) {
+              res.push_back(static_cast<char>(cp));
+            } else if (cp < 0x800U) {
+              res.push_back(static_cast<char>(0xC0U | (cp >> 6U)));
+              res.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
+            } else {
+              res.push_back(static_cast<char>(0xE0U | (cp >> 12U)));
+              res.push_back(static_cast<char>(0x80U | ((cp >> 6U) & 0x3FU)));
+              res.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
+            }
+            break;
+          }
+          default:
+            return false;
+        }
       } else {
-        val.push_back(ch);
+        res.push_back(static_cast<char>(uch));
       }
     }
     return false;
   }
-  return false;
-}
+
+  bool ParseNumber() {
+    if (pos_ < src_.size() && src_[pos_] == '-') ++pos_;
+    if (pos_ >= src_.size()) return false;
+    if (src_[pos_] == '0') {
+      ++pos_;
+    } else if (src_[pos_] >= '1' && src_[pos_] <= '9') {
+      while (pos_ < src_.size() &&
+             std::isdigit(static_cast<unsigned char>(src_[pos_]))) {
+        ++pos_;
+      }
+    } else {
+      return false;
+    }
+    if (pos_ < src_.size() && src_[pos_] == '.') {
+      ++pos_;
+      if (pos_ >= src_.size() ||
+          !std::isdigit(static_cast<unsigned char>(src_[pos_]))) {
+        return false;
+      }
+      while (pos_ < src_.size() &&
+             std::isdigit(static_cast<unsigned char>(src_[pos_]))) {
+        ++pos_;
+      }
+    }
+    if (pos_ < src_.size() && (src_[pos_] == 'e' || src_[pos_] == 'E')) {
+      ++pos_;
+      if (pos_ < src_.size() && (src_[pos_] == '+' || src_[pos_] == '-')) {
+        ++pos_;
+      }
+      if (pos_ >= src_.size() ||
+          !std::isdigit(static_cast<unsigned char>(src_[pos_]))) {
+        return false;
+      }
+      while (pos_ < src_.size() &&
+             std::isdigit(static_cast<unsigned char>(src_[pos_]))) {
+        ++pos_;
+      }
+    }
+    return true;
+  }
+
+  bool ParseValue(std::string* out_if_string, bool* out_is_string) {
+    if (out_is_string != nullptr) *out_is_string = false;
+    SkipWs();
+    if (pos_ >= src_.size()) return false;
+    const char c = src_[pos_];
+    if (c == '"') {
+      std::string s;
+      if (!ParseString(&s)) return false;
+      if (out_if_string != nullptr) *out_if_string = std::move(s);
+      if (out_is_string != nullptr) *out_is_string = true;
+      return true;
+    }
+    if (c == '{') return ParseObject(nullptr, false);
+    if (c == '[') return ParseArray();
+    if (c == 't') {
+      if (src_.compare(pos_, 4U, "true") != 0) return false;
+      pos_ += 4U;
+      return true;
+    }
+    if (c == 'f') {
+      if (src_.compare(pos_, 5U, "false") != 0) return false;
+      pos_ += 5U;
+      return true;
+    }
+    if (c == 'n') {
+      if (src_.compare(pos_, 4U, "null") != 0) return false;
+      pos_ += 4U;
+      return true;
+    }
+    if (c == '-' || std::isdigit(static_cast<unsigned char>(c))) {
+      return ParseNumber();
+    }
+    return false;
+  }
+
+  bool ParseArray() {
+    if (pos_ >= src_.size() || src_[pos_] != '[') return false;
+    ++pos_;
+    SkipWs();
+    if (pos_ < src_.size() && src_[pos_] == ']') {
+      ++pos_;
+      return true;
+    }
+    while (pos_ < src_.size()) {
+      if (!ParseValue(nullptr, nullptr)) return false;
+      SkipWs();
+      if (pos_ < src_.size() && src_[pos_] == ',') {
+        ++pos_;
+        continue;
+      }
+      if (pos_ < src_.size() && src_[pos_] == ']') {
+        ++pos_;
+        return true;
+      }
+      return false;
+    }
+    return false;
+  }
+
+  bool ParseObject(std::map<std::string, std::string>* out_str_fields,
+                   bool collect_strings) {
+    if (pos_ >= src_.size() || src_[pos_] != '{') return false;
+    ++pos_;
+    SkipWs();
+    if (pos_ < src_.size() && src_[pos_] == '}') {
+      ++pos_;
+      return true;
+    }
+    while (pos_ < src_.size()) {
+      SkipWs();
+      std::string key;
+      if (!ParseString(&key)) return false;
+      SkipWs();
+      if (pos_ >= src_.size() || src_[pos_] != ':') return false;
+      ++pos_;
+      std::string str_val;
+      bool is_str = false;
+      if (!ParseValue(collect_strings ? &str_val : nullptr,
+                      collect_strings ? &is_str : nullptr)) {
+        return false;
+      }
+      if (collect_strings && out_str_fields != nullptr && is_str) {
+        (*out_str_fields)[key] = std::move(str_val);
+      }
+      SkipWs();
+      if (pos_ < src_.size() && src_[pos_] == ',') {
+        ++pos_;
+        continue;
+      }
+      if (pos_ < src_.size() && src_[pos_] == '}') {
+        ++pos_;
+        return true;
+      }
+      return false;
+    }
+    return false;
+  }
+
+  const std::string& src_;
+  size_t pos_ = 0;
+};
 
 bool HasMixedLogicalOps(const std::string& expr) {
   const bool has_and = expr.find('&') != std::string::npos;
@@ -170,6 +483,12 @@ ParsedProblem<N> ProblemContractParser<N>::ParseTsumegoJson(
     out.error_code = "FR1-MISSING-REQUIRED";
     out.error_message =
         "Required fields masked_sgf_str or winning_color missing.";
+    return out;
+  }
+
+  if (!ValidateSgfStructureAndSize(masked_sgf_str, N, &out.error_code,
+                                   &out.error_message)) {
+    out.valid = false;
     return out;
   }
 
@@ -371,44 +690,43 @@ template <int N>
 ParsedProblem<N> ProblemContractParser<N>::ParseTsumegoJsonObject(
     const std::string& problem_id, const std::string& raw_json_text,
     TurnConflictPolicy conflict_policy) const {
-  std::string masked_sgf_str;
-  std::string winning_color;
-  std::string black_search_goal;
-  std::string white_search_goal;
-  std::string black_crucial_stone;
-  std::string white_crucial_stone;
-  std::string turn_color;
-  std::string region_str;
-  std::string black_ko_rule;
-  std::string white_ko_rule;
-
-  const bool has_sgf =
-      ExtractJsonStringField(raw_json_text, "masked_sgf_str", &masked_sgf_str);
-  const bool has_win =
-      ExtractJsonStringField(raw_json_text, "winning_color", &winning_color);
-  if (!has_sgf || !has_win) {
+  std::map<std::string, std::string> fields;
+  StrictProblemJsonParser parser(raw_json_text);
+  if (!parser.ParseTopLevelObject(&fields)) {
     ParsedProblem<N> err;
     err.problem_id = problem_id;
     err.valid = false;
     err.error_code = "FR1-INVALID-JSON";
     err.error_message =
-        "Malformed JSON or missing required string fields masked_sgf_str / "
-        "winning_color.";
+        "Malformed or truncated JSON document (strict RFC 8259 check failed).";
     return err;
   }
 
-  ExtractJsonStringField(raw_json_text, "black_search_goal",
-                         &black_search_goal);
-  ExtractJsonStringField(raw_json_text, "white_search_goal",
-                         &white_search_goal);
-  ExtractJsonStringField(raw_json_text, "black_crucial_stone",
-                         &black_crucial_stone);
-  ExtractJsonStringField(raw_json_text, "white_crucial_stone",
-                         &white_crucial_stone);
-  ExtractJsonStringField(raw_json_text, "turn_color", &turn_color);
-  ExtractJsonStringField(raw_json_text, "region", &region_str);
-  ExtractJsonStringField(raw_json_text, "black_ko_rule", &black_ko_rule);
-  ExtractJsonStringField(raw_json_text, "white_ko_rule", &white_ko_rule);
+  auto get_field = [&](const std::string& key) -> std::string {
+    const auto it = fields.find(key);
+    return (it == fields.end()) ? std::string{} : it->second;
+  };
+
+  const std::string masked_sgf_str = get_field("masked_sgf_str");
+  const std::string winning_color = get_field("winning_color");
+  if (masked_sgf_str.empty() || winning_color.empty()) {
+    ParsedProblem<N> err;
+    err.problem_id = problem_id;
+    err.valid = false;
+    err.error_code = "FR1-MISSING-REQUIRED";
+    err.error_message =
+        "Missing required string fields masked_sgf_str / winning_color.";
+    return err;
+  }
+
+  const std::string black_search_goal = get_field("black_search_goal");
+  const std::string white_search_goal = get_field("white_search_goal");
+  const std::string black_crucial_stone = get_field("black_crucial_stone");
+  const std::string white_crucial_stone = get_field("white_crucial_stone");
+  const std::string turn_color = get_field("turn_color");
+  const std::string region_str = get_field("region");
+  const std::string black_ko_rule = get_field("black_ko_rule");
+  const std::string white_ko_rule = get_field("white_ko_rule");
 
   const bool win_is_white = (UpperAscii(TrimAscii(winning_color)) == "W");
   const bool black_allow_ko = (TrimAscii(black_ko_rule) == "allow_ko");

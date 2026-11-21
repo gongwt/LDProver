@@ -667,13 +667,123 @@ export function validateStudyLdRzContract(
   raw: Partial<RawStudyLdRzProblemJson>,
   conflictPolicy: 'strict' | 'warn_ignore' = 'strict'
 ): ContractValidationResult {
-  if (!raw.masked_sgf_str || !raw.winning_color) {
+  if (
+    !raw ||
+    typeof raw !== 'object' ||
+    typeof raw.masked_sgf_str !== 'string' ||
+    !raw.masked_sgf_str.trim() ||
+    typeof raw.winning_color !== 'string' ||
+    !raw.winning_color.trim()
+  ) {
     return {
       valid: false,
       warning: false,
       code: 'FR1-MISSING-REQUIRED (ExitCode=2)',
       summary: '拒题保护触发（FR-1.1）：缺少必填字段 masked_sgf_str 或 winning_color。',
     };
+  }
+
+  // Strict SGF structural integrity check BEFORE any warning/early-return branch (R3 F6)
+  const sgfTrimmed = raw.masked_sgf_str.trim();
+  if (!sgfTrimmed.startsWith('(;') || !sgfTrimmed.endsWith(')')) {
+    return {
+      valid: false,
+      warning: false,
+      code: 'FR1-INVALID-SGF (ExitCode=2)',
+      summary:
+        '拒题保护触发（FR-1.1）：masked_sgf_str 不符合标准 SGF 根节点语法（必须以 "(;" 起始并以 ")" 结束）。',
+    };
+  }
+
+  let parenDepth = 0;
+  let inBracket = false;
+  let escaped = false;
+  for (let i = 0; i < sgfTrimmed.length; i++) {
+    const ch = sgfTrimmed[i];
+    if (inBracket) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === ']') {
+        inBracket = false;
+      }
+      continue;
+    }
+    if (ch === '[') {
+      inBracket = true;
+    } else if (ch === ']') {
+      return {
+        valid: false,
+        warning: false,
+        code: 'FR1-INVALID-SGF (ExitCode=2)',
+        summary: '拒题保护触发（FR-1.1）：masked_sgf_str 包含未匹配的 "]"。',
+      };
+    } else if (ch === '(') {
+      parenDepth++;
+    } else if (ch === ')') {
+      parenDepth--;
+      if (parenDepth < 0) {
+        return {
+          valid: false,
+          warning: false,
+          code: 'FR1-INVALID-SGF (ExitCode=2)',
+          summary: '拒题保护触发（FR-1.1）：masked_sgf_str 括号层级不匹配。',
+        };
+      }
+    }
+  }
+  if (inBracket || parenDepth !== 0) {
+    return {
+      valid: false,
+      warning: false,
+      code: 'FR1-INVALID-SGF (ExitCode=2)',
+      summary: '拒题保护触发（FR-1.1）：masked_sgf_str 存在未闭合的括号或方括号。',
+    };
+  }
+
+  // Validate SGF board size SZ[...] and ensure all AB/AW/region/crucial coordinates fit inside SZ
+  const szMatch = sgfTrimmed.match(/(?:^|[^A-Z])SZ\[([^\]]*)\]/);
+  let declaredBoardSize = 19;
+  if (szMatch) {
+    const szRaw = szMatch[1].trim();
+    if (!/^\d+$/.test(szRaw)) {
+      return {
+        valid: false,
+        warning: false,
+        code: 'FR1-INVALID-BOARD-SIZE (ExitCode=2)',
+        summary: `拒题保护触发（FR-1.1）：非法棋盘尺寸 SZ[${szRaw}]。`,
+      };
+    }
+    declaredBoardSize = Number.parseInt(szRaw, 10);
+    if (declaredBoardSize !== 19) {
+      return {
+        valid: false,
+        warning: false,
+        code: 'FR1-BOARD-SIZE-MISMATCH (ExitCode=2)',
+        summary: `拒题保护触发（FR-1.1）：StudyLD-RZ 契约要求 19x19 棋盘，但 SGF 声明 SZ[${declaredBoardSize}]。`,
+      };
+    }
+  }
+
+  // Validate every AB/AW coordinate token inside SGF against declaredBoardSize
+  const propRegex = /(?:^|[^A-Z])(AB|AW)((?:\s*\[[^\]]*\])+)/g;
+  let propMatch: RegExpExecArray | null;
+  while ((propMatch = propRegex.exec(sgfTrimmed)) !== null) {
+    const valBlock = propMatch[2];
+    const itemRegex = /\[([^\]]*)\]/g;
+    let itemMatch: RegExpExecArray | null;
+    while ((itemMatch = itemRegex.exec(valBlock)) !== null) {
+      const tok = itemMatch[1].trim().toLowerCase();
+      if (tok.length !== 2 || sgfToCoord(tok, declaredBoardSize) < 0) {
+        return {
+          valid: false,
+          warning: false,
+          code: 'FR1-INVALID-SGF-COORD (ExitCode=2)',
+          summary: `拒题保护触发（FR-1.1）：SGF ${propMatch[1]}[${itemMatch[1]}] 坐标非法或超出 ${declaredBoardSize}x${declaredBoardSize} 范围。`,
+        };
+      }
+    }
   }
 
   const winCol = raw.winning_color.trim().toUpperCase();
@@ -686,7 +796,7 @@ export function validateStudyLdRzContract(
     };
   }
 
-  const plMatch = raw.masked_sgf_str.match(/PL\[([BW])\]/i);
+  const plMatch = sgfTrimmed.match(/PL\[([BW])\]/i);
   const sgfPl = plMatch ? plMatch[1].toUpperCase() : null;
   const metaTurn = raw.turn_color ? raw.turn_color.trim().toUpperCase() : null;
 
@@ -750,7 +860,7 @@ export function validateStudyLdRzContract(
     };
   }
 
-  const { blackCoords, whiteCoords } = parseSgfInitialStones(raw.masked_sgf_str);
+  const { blackCoords, whiteCoords } = parseSgfInitialStones(sgfTrimmed);
   const expectedStoneIsBlack =
     (winCol === 'B' && activeGoal === 'TOLIVE') ||
     (winCol === 'W' && activeGoal === 'TOKILL');
@@ -769,13 +879,13 @@ export function validateStudyLdRzContract(
         summary: `拒题保护触发（FR-1.3）：关键子坐标 "${tok}" 格式非法。`,
       };
     }
-    const coord = sgfToCoord(tok, 19);
+    const coord = sgfToCoord(tok, declaredBoardSize);
     if (coord < 0) {
       return {
         valid: false,
         warning: false,
         code: 'FR1-OUT-OF-RANGE-CRUCIAL (ExitCode=2)',
-        summary: `拒题保护触发（FR-1.3）：关键子坐标 "${tok}" 超出 19x19 棋盘范围。`,
+        summary: `拒题保护触发（FR-1.3）：关键子坐标 "${tok}" 超出 ${declaredBoardSize}x${declaredBoardSize} 棋盘范围。`,
       };
     }
     const presentCorrectColor = expectedStoneIsBlack
@@ -795,7 +905,9 @@ export function validateStudyLdRzContract(
     valid: true,
     warning: Boolean(sgfPl && metaTurn && sgfPl !== metaTurn),
     code: 'FR1-OK',
-    summary: `契约解析通过：PL[${sgfPl ?? metaTurn ?? 'B'}] 与 turn_color="${
+    summary: `契约解析通过：SZ[${declaredBoardSize}]、PL[${
+      sgfPl ?? metaTurn ?? 'B'
+    }] 与 turn_color="${
       metaTurn ?? sgfPl ?? 'B'
     }" 一致，胜方 ${winCol} (${activeGoal}) 关键子 "${activeCrucial}" 共 ${
       tokens.length

@@ -231,9 +231,9 @@ export const SRS_BENCHMARK_PROBLEMS_CATALOG: TsumegoProblemSpec[] = [
       c(2, 6),
     ],
     description:
-      '根局面为白先（AND 节点，验证黑棋 TOLIVE 命题，根终局为 NonTerminal）。黑左块拥角眼 A19 (aa)、右块拥边眼 E19 (ea)，各自仅单眼未活，中间由 C19 (ca) 与 C18 (cb) 双见合联络。白棋测试内部点或 PASS 后生成紧凑角部 ProofCertificateRZ，外围 (3,4)、(3,5)、(4,4)、(4,5) 共 4 个脱先应手全部触发 OutsideRZRevalidated 证书剪枝并经独立语义重放验证！',
+      '根局面为白先（AND 节点，验证黑棋 TOLIVE 命题，根终局为 NonTerminal）。黑左块拥角眼 A19 (aa)、右块拥边眼 E19 (ea)，各自仅单眼未活，中间由 C19 (ca) 与 C18 (cb) 双见合联络。白棋测试首枚脱先/内部应手或 PASS 生成紧凑角部 ProofCertificateRZ 后，其余位于 RZ 之外的外围脱先应手自动触发 OutsideRZRevalidated 证书剪枝并经独立语义重放验证。',
     expectedOutcome: ProofOutcome.ProvenWin,
-    expectedBestMoveSgf: 'ca',
+    expectedBestMoveSgf: 'pass',
   },
   {
     id: 'p005_ko_dependent_barrier',

@@ -8,6 +8,7 @@
 
 #include "ldprover/proof/proof_checker.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdint>
@@ -419,9 +420,39 @@ class JsonParser {
           case 't':
             res.push_back('\t');
             break;
+          case 'u': {
+            if (pos_ + 4U > src_.size()) return false;
+            uint32_t code = 0;
+            for (int k = 0; k < 4; ++k) {
+              const char hc = src_[pos_++];
+              code <<= 4U;
+              if (hc >= '0' && hc <= '9') {
+                code |= static_cast<uint32_t>(hc - '0');
+              } else if (hc >= 'a' && hc <= 'f') {
+                code |= static_cast<uint32_t>(hc - 'a' + 10);
+              } else if (hc >= 'A' && hc <= 'F') {
+                code |= static_cast<uint32_t>(hc - 'A' + 10);
+              } else {
+                return false;
+              }
+            }
+            if (code < 0x80U) {
+              res.push_back(static_cast<char>(code));
+            } else if (code < 0x800U) {
+              res.push_back(static_cast<char>(0xC0U | (code >> 6U)));
+              res.push_back(static_cast<char>(0x80U | (code & 0x3FU)));
+            } else {
+              res.push_back(static_cast<char>(0xE0U | (code >> 12U)));
+              res.push_back(static_cast<char>(0x80U | ((code >> 6U) & 0x3FU)));
+              res.push_back(static_cast<char>(0x80U | (code & 0x3FU)));
+            }
+            break;
+          }
           default:
             return false;
         }
+      } else if (static_cast<unsigned char>(ch) < 0x20U) {
+        return false;
       } else {
         res.push_back(ch);
       }
@@ -437,6 +468,10 @@ class JsonParser {
     }
     if (pos_ >= src_.size() ||
         !std::isdigit(static_cast<unsigned char>(src_[pos_]))) {
+      return false;
+    }
+    if (src_[pos_] == '0' && pos_ + 1U < src_.size() &&
+        std::isdigit(static_cast<unsigned char>(src_[pos_ + 1U]))) {
       return false;
     }
     int64_t val = 0;
@@ -556,6 +591,210 @@ std::string CoordToSgf(int16_t move, int board_size) {
   return s;
 }
 
+std::string MoveToSgfLabel(int16_t move, int board_size) {
+  if (move == kPassMove) return "pass";
+  return CoordToSgf(move, board_size);
+}
+
+std::string LogicalOpToStr(LogicalOp op) {
+  switch (op) {
+    case LogicalOp::kSingle:
+      return "SINGLE";
+    case LogicalOp::kConjunction:
+      return "AND";
+    case LogicalOp::kDisjunction:
+      return "OR";
+  }
+  return "SINGLE";
+}
+
+bool ParseLogicalOp(const JsonValue& v, LogicalOp* out) {
+  if (v.kind == JsonValue::Kind::kString) {
+    if (v.str_val == "SINGLE") {
+      *out = LogicalOp::kSingle;
+      return true;
+    }
+    if (v.str_val == "AND") {
+      *out = LogicalOp::kConjunction;
+      return true;
+    }
+    if (v.str_val == "OR") {
+      *out = LogicalOp::kDisjunction;
+      return true;
+    }
+    return false;
+  }
+  if (v.kind == JsonValue::Kind::kInt && v.int_val >= 0 && v.int_val <= 2) {
+    *out = static_cast<LogicalOp>(static_cast<uint8_t>(v.int_val));
+    return true;
+  }
+  return false;
+}
+
+std::string KoRuleToStr(KoRule rule) {
+  switch (rule) {
+    case KoRule::kSituationalSuperko:
+      return "SSK";
+    case KoRule::kPositionalSuperko:
+      return "PSK";
+    case KoRule::kSimpleKoOnly:
+      return "SIMPLE";
+  }
+  return "SSK";
+}
+
+bool ParseKoRule(const JsonValue& v, KoRule* out) {
+  if (v.kind == JsonValue::Kind::kString) {
+    if (v.str_val == "SSK") {
+      *out = KoRule::kSituationalSuperko;
+      return true;
+    }
+    if (v.str_val == "PSK") {
+      *out = KoRule::kPositionalSuperko;
+      return true;
+    }
+    if (v.str_val == "SIMPLE") {
+      *out = KoRule::kSimpleKoOnly;
+      return true;
+    }
+    return false;
+  }
+  if (v.kind == JsonValue::Kind::kInt && v.int_val >= 0 && v.int_val <= 2) {
+    *out = static_cast<KoRule>(static_cast<uint8_t>(v.int_val));
+    return true;
+  }
+  return false;
+}
+
+template <int N>
+std::string EvidenceKindToStr(const ProofDagNode<N>& n) {
+  switch (n.terminal_evidence) {
+    case EvidenceKind::kBensonUca:
+      return "BENSON_UCA";
+    case EvidenceKind::kTokensCaptured:
+      return "TOKENS_CAPTURED";
+    case EvidenceKind::kDoublePassResolution:
+      return "DOUBLE_PASS_RESOLUTION";
+    case EvidenceKind::kEmptyTargetConstantFalse:
+      return "EMPTY_TARGET_CONSTANT_FALSE";
+    case EvidenceKind::kNone:
+      if (n.is_pruned_outside_rz) return "OUTSIDE_RZ_REVALIDATED";
+      if (n.is_tt_hit) return "TT_REVALIDATED_REUSE";
+      if (!n.child_node_ids.empty()) return "INTERNAL_AGGREGATION";
+      return "NONE";
+  }
+  return "NONE";
+}
+
+bool ParseEvidenceKind(const JsonValue& v, EvidenceKind* out) {
+  if (v.kind == JsonValue::Kind::kString) {
+    if (v.str_val == "BENSON_UCA") {
+      *out = EvidenceKind::kBensonUca;
+      return true;
+    }
+    if (v.str_val == "TOKENS_CAPTURED") {
+      *out = EvidenceKind::kTokensCaptured;
+      return true;
+    }
+    if (v.str_val == "DOUBLE_PASS_RESOLUTION") {
+      *out = EvidenceKind::kDoublePassResolution;
+      return true;
+    }
+    if (v.str_val == "EMPTY_TARGET_CONSTANT_FALSE") {
+      *out = EvidenceKind::kEmptyTargetConstantFalse;
+      return true;
+    }
+    if (v.str_val == "NONE" || v.str_val == "OUTSIDE_RZ_REVALIDATED" ||
+        v.str_val == "TT_REVALIDATED_REUSE" ||
+        v.str_val == "INTERNAL_AGGREGATION") {
+      *out = EvidenceKind::kNone;
+      return true;
+    }
+    return false;
+  }
+  if (v.kind == JsonValue::Kind::kInt && v.int_val >= 0 && v.int_val <= 4) {
+    *out = static_cast<EvidenceKind>(static_cast<uint8_t>(v.int_val));
+    return true;
+  }
+  return false;
+}
+
+bool ParseColorValue(const JsonValue& v, Color* out) {
+  if (v.kind == JsonValue::Kind::kString) {
+    if (v.str_val == "B" || v.str_val == "b") {
+      *out = Color::kBlack;
+      return true;
+    }
+    if (v.str_val == "W" || v.str_val == "w") {
+      *out = Color::kWhite;
+      return true;
+    }
+    return false;
+  }
+  if (v.kind == JsonValue::Kind::kInt) {
+    if (v.int_val == 1) {
+      *out = Color::kBlack;
+      return true;
+    }
+    if (v.int_val == 2) {
+      *out = Color::kWhite;
+      return true;
+    }
+  }
+  return false;
+}
+
+JsonValue EncodeSatJson(uint32_t val) {
+  if (val >= kPnDnSaturation) return JsonValue::MakeStr("SAT");
+  return JsonValue::MakeInt(static_cast<int64_t>(val));
+}
+
+bool ParseSatU32(const JsonValue& v, uint32_t* out) {
+  if (v.kind == JsonValue::Kind::kString && v.str_val == "SAT") {
+    *out = kPnDnSaturation;
+    return true;
+  }
+  if (v.kind == JsonValue::Kind::kInt && v.int_val >= 0 &&
+      v.int_val <= static_cast<int64_t>(kPnDnSaturation)) {
+    *out = static_cast<uint32_t>(v.int_val);
+    return true;
+  }
+  return false;
+}
+
+template <int N>
+bool IsMoveInAllowedRegion(int16_t mv,
+                           const std::optional<BitBoard<N>>& region_hint) {
+  if (mv == kPassMove) return true;
+  if (!region_hint.has_value()) return true;
+  return mv >= 0 && mv < N * N && region_hint->Get(mv);
+}
+
+bool TargetTokensEqual(const std::vector<TargetToken>& a,
+                       const std::vector<TargetToken>& b) {
+  if (a.size() != b.size()) return false;
+  auto sa = a;
+  auto sb = b;
+  auto cmp = [](const TargetToken& x, const TargetToken& y) {
+    if (x.initial_coord != y.initial_coord) {
+      return x.initial_coord < y.initial_coord;
+    }
+    if (x.group_index != y.group_index) return x.group_index < y.group_index;
+    return static_cast<uint8_t>(x.stone_color) <
+           static_cast<uint8_t>(y.stone_color);
+  };
+  std::sort(sa.begin(), sa.end(), cmp);
+  std::sort(sb.begin(), sb.end(), cmp);
+  for (size_t i = 0; i < sa.size(); ++i) {
+    if (sa[i].initial_coord != sb[i].initial_coord ||
+        sa[i].group_index != sb[i].group_index ||
+        sa[i].stone_color != sb[i].stone_color) {
+      return false;
+    }
+  }
+  return true;
+}
+
 template <int N>
 bool ReplaySourceSubgraphOnQueryState(
     const Position<N>& query_pos, const ProofContext& context,
@@ -616,9 +855,11 @@ bool ReplaySourceSubgraphOnQueryState(
       const uint32_t cid = src.child_node_ids[i];
       if (cid >= src.node_id || cid >= dag_nodes.size()) continue;
       if (dag_nodes[cid].outcome != expected_outcome) continue;
+      const int16_t mv = src.child_moves[i];
+      if (!IsMoveInAllowedRegion<N>(mv, region_hint)) continue;
       Position<N> next_pos = query_pos;
       bool is_ko_cap = false;
-      if (!next_pos.PlayMove(src.child_moves[i], &is_ko_cap)) continue;
+      if (!next_pos.PlayMove(mv, &is_ko_cap)) continue;
       if (is_ko_cap && restricted_side) continue;
       if (ReplaySourceSubgraphOnQueryState<N>(
               next_pos, context, region_hint, dag_nodes, cid, expected_outcome,
@@ -720,9 +961,17 @@ bool VerifySubgraphRecursive(const Position<N>& pos,
     return true;
   }
 
-  // Every recorded child edge must be legal on the authentic reachable `pos`.
+  // Every recorded child edge must be legal AND inside declared `region_hint`.
   for (size_t i = 0; i < node.child_moves.size(); ++i) {
-    if (!pos.IsLegalMove(node.child_moves[i])) {
+    const int16_t mv = node.child_moves[i];
+    if (!IsMoveInAllowedRegion<N>(mv, report.region_hint)) {
+      ver->failed_node_id = static_cast<int32_t>(node_id);
+      ver->error_code = "LP-S11";
+      ver->message =
+          "Proof edge plays outside the declared regionCoords search domain.";
+      return false;
+    }
+    if (!pos.IsLegalMove(mv)) {
       ver->failed_node_id = static_cast<int32_t>(node_id);
       ver->error_code = "LP-S09";
       ver->message = "Illegal child move recorded in reachable ProofDagNode.";
@@ -742,9 +991,17 @@ bool VerifySubgraphRecursive(const Position<N>& pos,
     for (size_t i = 0; i < node.child_node_ids.size(); ++i) {
       const uint32_t cid = node.child_node_ids[i];
       if (report.proof_dag_nodes[cid].outcome != node.outcome) continue;
+      const int16_t mv = node.child_moves[i];
+      if (!IsMoveInAllowedRegion<N>(mv, report.region_hint)) {
+        ver->failed_node_id = static_cast<int32_t>(node_id);
+        ver->error_code = "LP-S11";
+        ver->message =
+            "Existential witness plays outside declared regionCoords.";
+        return false;
+      }
       Position<N> next_pos = pos;
       bool is_ko_cap = false;
-      if (!next_pos.PlayMove(node.child_moves[i], &is_ko_cap)) {
+      if (!next_pos.PlayMove(mv, &is_ko_cap)) {
         ver->failed_node_id = static_cast<int32_t>(node_id);
         ver->error_code = "LP-S09";
         ver->message = "Illegal witness move in ProofDagNode.";
@@ -760,7 +1017,8 @@ bool VerifySubgraphRecursive(const Position<N>& pos,
     ver->failed_node_id = static_cast<int32_t>(node_id);
     ver->error_code = "LP-N21";
     ver->message =
-        "Existential node lacks a legal, ko-compliant verified witness child.";
+        "Existential node lacks a legal, region-valid, ko-compliant verified "
+        "witness child.";
     return false;
   }
 
@@ -813,8 +1071,8 @@ std::string ProofArtifactManager<N>::SerializeLProofJson(
     const Position<N>& initial_pos, const ProofContext& context,
     const SolveReport<N>& report, std::string* out_checksum) const {
   JsonValue root = JsonValue::MakeObj();
-  root.obj_val["boardSize"] = JsonValue::MakeInt(N);
   root.obj_val["magic"] = JsonValue::MakeStr("lproof/1");
+  root.obj_val["problemId"] = JsonValue::MakeStr(report.problem_id);
 
   JsonValue ctx_obj = JsonValue::MakeObj();
   ctx_obj.obj_val["attackerAllowKo"] =
@@ -822,12 +1080,11 @@ std::string ProofArtifactManager<N>::SerializeLProofJson(
   ctx_obj.obj_val["attackerGoal"] = JsonValue::MakeStr(
       context.attacker_goal == SearchGoal::kToKill ? "TOKILL" : "TOLIVE");
   ctx_obj.obj_val["contextId"] = JsonValue::MakeStr(HexU64(context.context_id));
-  ctx_obj.obj_val["crucialStoneOp"] = JsonValue::MakeInt(
-      static_cast<int64_t>(context.crucial_stone_op));
+  ctx_obj.obj_val["crucialStoneOp"] =
+      JsonValue::MakeStr(LogicalOpToStr(context.crucial_stone_op));
   ctx_obj.obj_val["defenderAllowKo"] =
       JsonValue::MakeBool(context.defender_allow_ko);
-  ctx_obj.obj_val["koRule"] =
-      JsonValue::MakeInt(static_cast<int64_t>(context.ko_rule));
+  ctx_obj.obj_val["koRule"] = JsonValue::MakeStr(KoRuleToStr(context.ko_rule));
   ctx_obj.obj_val["rootAttacker"] = JsonValue::MakeStr(
       context.root_attacker == Color::kWhite ? "W" : "B");
 
@@ -844,31 +1101,63 @@ std::string ProofArtifactManager<N>::SerializeLProofJson(
   ctx_obj.obj_val["initialTokens"] = std::move(tok_arr);
   root.obj_val["context"] = std::move(ctx_obj);
 
+  const bool is_traced = !initial_pos.PlayedMoveTrace().empty();
+  const std::vector<int> region_coords =
+      report.region_hint.has_value() ? report.region_hint->ToCoords()
+                                     : std::vector<int>{};
+
   JsonValue setup = JsonValue::MakeObj();
-  setup.obj_val["blackInitialCoords"] =
-      MakeIntArray(initial_pos.Stones(Color::kBlack).ToCoords());
+  setup.obj_val["boardSize"] = JsonValue::MakeInt(N);
+  setup.obj_val["rootKind"] =
+      JsonValue::MakeStr(is_traced ? "traced_subposition" : "initial");
   setup.obj_val["firstToPlay"] =
       JsonValue::MakeStr(initial_pos.ToPlay() == Color::kWhite ? "W" : "B");
-  setup.obj_val["hasRegionHint"] =
-      JsonValue::MakeBool(report.region_hint.has_value());
-  setup.obj_val["immortalWallCoords"] =
-      MakeIntArray(initial_pos.ImmortalWall().ToCoords());
-  setup.obj_val["inputHash"] = JsonValue::MakeStr(HexU64(report.input_hash));
-  setup.obj_val["regionCoords"] = MakeIntArray(
-      report.region_hint.has_value() ? report.region_hint->ToCoords()
-                                     : std::vector<int>{});
-  setup.obj_val["whiteInitialCoords"] =
-      MakeIntArray(initial_pos.Stones(Color::kWhite).ToCoords());
+  setup.obj_val["koPoint"] = JsonValue::MakeInt(initial_pos.KoPoint());
+  setup.obj_val["consecutivePasses"] =
+      JsonValue::MakeInt(initial_pos.ConsecutivePasses());
+  setup.obj_val["survivingTokensMask"] = JsonValue::MakeInt(
+      static_cast<int64_t>(initial_pos.SurvivingTargetTokensMask()));
   setup.obj_val["zobristHex"] =
       JsonValue::MakeStr(HexU64(initial_pos.ZobristHash()));
+  setup.obj_val["inputHash"] = JsonValue::MakeStr(HexU64(report.input_hash));
+  setup.obj_val["blackInitialCoords"] =
+      MakeIntArray(initial_pos.Stones(Color::kBlack).ToCoords());
+  setup.obj_val["whiteInitialCoords"] =
+      MakeIntArray(initial_pos.Stones(Color::kWhite).ToCoords());
+  setup.obj_val["immortalWallCoords"] =
+      MakeIntArray(initial_pos.ImmortalWall().ToCoords());
+  setup.obj_val["hasRegionHint"] =
+      JsonValue::MakeBool(report.region_hint.has_value());
+  setup.obj_val["regionCoords"] = MakeIntArray(region_coords);
+  setup.obj_val["rawRegionPointCount"] =
+      JsonValue::MakeInt(static_cast<int64_t>(region_coords.size()));
+  setup.obj_val["isFullRegionSearch"] = JsonValue::MakeBool(true);
+  if (is_traced) {
+    setup.obj_val["originFirstToPlay"] = JsonValue::MakeStr(
+        initial_pos.OriginToPlay() == Color::kWhite ? "W" : "B");
+    setup.obj_val["originBlackCoords"] =
+        MakeIntArray(initial_pos.OriginBlack().ToCoords());
+    setup.obj_val["originWhiteCoords"] =
+        MakeIntArray(initial_pos.OriginWhite().ToCoords());
+    JsonValue trace_arr = JsonValue::MakeArr();
+    for (int16_t mv : initial_pos.PlayedMoveTrace()) {
+      trace_arr.arr_val.push_back(JsonValue::MakeInt(mv));
+    }
+    setup.obj_val["initialTraceMoves"] = std::move(trace_arr);
+  }
   root.obj_val["problemSetup"] = std::move(setup);
 
-  root.obj_val["bestMove"] = JsonValue::MakeInt(report.best_move);
-  root.obj_val["rootDn"] = JsonValue::MakeInt(report.root_dn);
-  root.obj_val["rootNode"] = JsonValue::MakeInt(report.root_dag_node_id);
+  root.obj_val["rootNode"] =
+      (report.root_dag_node_id == kInvalidDagNodeId)
+          ? JsonValue::MakeInt(-1)
+          : JsonValue::MakeInt(report.root_dag_node_id);
   root.obj_val["rootOutcome"] =
       JsonValue::MakeStr(OutcomeToStr(report.root_status));
-  root.obj_val["rootPn"] = JsonValue::MakeInt(report.root_pn);
+  root.obj_val["rootPn"] = EncodeSatJson(report.root_pn);
+  root.obj_val["rootDn"] = EncodeSatJson(report.root_dn);
+  root.obj_val["bestMove"] = JsonValue::MakeInt(report.best_move);
+  root.obj_val["bestMoveSgf"] =
+      JsonValue::MakeStr(MoveToSgfLabel(report.best_move, N));
 
   JsonValue nodes_arr = JsonValue::MakeArr();
   nodes_arr.arr_val.reserve(report.proof_dag_nodes.size());
@@ -884,20 +1173,28 @@ std::string ProofArtifactManager<N>::SerializeLProofJson(
     nj.obj_val["childNodeIds"] = std::move(ci);
     nj.obj_val["disproofRzCoords"] =
         MakeIntArray(n.disproof_rz.Bits().ToCoords());
-    nj.obj_val["dn"] = JsonValue::MakeInt(n.dn);
+    nj.obj_val["dn"] = EncodeSatJson(n.dn);
     nj.obj_val["incomingMove"] = JsonValue::MakeInt(n.incoming_move);
+    nj.obj_val["incomingMoveSgf"] =
+        JsonValue::MakeStr(MoveToSgfLabel(n.incoming_move, N));
+    nj.obj_val["isKoDependentBarrier"] = JsonValue::MakeBool(false);
     nj.obj_val["isOrNode"] = JsonValue::MakeBool(n.is_or_node);
     nj.obj_val["isPrunedOutsideRz"] =
         JsonValue::MakeBool(n.is_pruned_outside_rz);
     nj.obj_val["isTtHit"] = JsonValue::MakeBool(n.is_tt_hit);
     nj.obj_val["nodeId"] = JsonValue::MakeInt(n.node_id);
     nj.obj_val["outcome"] = JsonValue::MakeStr(OutcomeToStr(n.outcome));
-    nj.obj_val["pn"] = JsonValue::MakeInt(n.pn);
+    nj.obj_val["pn"] = EncodeSatJson(n.pn);
     nj.obj_val["proofRzCoords"] = MakeIntArray(n.proof_rz.Bits().ToCoords());
-    nj.obj_val["sourceProofNodeId"] =
-        JsonValue::MakeInt(n.source_proof_node_id);
-    nj.obj_val["terminalEvidence"] =
-        JsonValue::MakeInt(static_cast<int64_t>(n.terminal_evidence));
+    nj.obj_val["prunedCertificate"] = JsonValue::MakeNull();
+    if ((n.is_pruned_outside_rz || n.is_tt_hit) &&
+        n.source_proof_node_id != kInvalidDagNodeId) {
+      nj.obj_val["sourceProofNodeId"] =
+          JsonValue::MakeInt(n.source_proof_node_id);
+    } else {
+      nj.obj_val["sourceProofNodeId"] = JsonValue::MakeNull();
+    }
+    nj.obj_val["terminalEvidence"] = JsonValue::MakeStr(EvidenceKindToStr(n));
     nj.obj_val["toPlay"] =
         JsonValue::MakeStr(n.to_play == Color::kWhite ? "W" : "B");
     nodes_arr.arr_val.push_back(std::move(nj));
@@ -1095,28 +1392,29 @@ VerificationReport ProofArtifactManager<N>::VerifyProofDag(
 
 template <int N>
 VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
-    const std::string& json_text) const {
+    const std::string& json_text,
+    const ParsedProblem<N>* expected_problem) const {
   VerificationReport ver;
   JsonValue root;
   JsonParser parser(json_text);
   if (!parser.ParseDocument(&root) || root.kind != JsonValue::Kind::kObject) {
     ver.passed = false;
     ver.error_code = "LP-J01";
-    ver.message = "Malformed JSON syntax in standalone lproof/1 file.";
+    ver.message = "Malformed JSON syntax or non-object root in standalone lproof/1 file.";
     return ver;
   }
 
   const auto it_magic = root.obj_val.find("magic");
   const auto it_chk = root.obj_val.find("checksum");
-  const auto it_bs = root.obj_val.find("boardSize");
   const auto it_ctx = root.obj_val.find("context");
   const auto it_setup = root.obj_val.find("problemSetup");
   const auto it_nodes = root.obj_val.find("nodes");
 
-  if (it_magic == root.obj_val.end() || it_magic->second.str_val != "lproof/1" ||
+  if (it_magic == root.obj_val.end() ||
+      it_magic->second.kind != JsonValue::Kind::kString ||
+      it_magic->second.str_val != "lproof/1" ||
       it_chk == root.obj_val.end() ||
       it_chk->second.kind != JsonValue::Kind::kString ||
-      it_bs == root.obj_val.end() || it_bs->second.int_val != N ||
       it_ctx == root.obj_val.end() ||
       it_ctx->second.kind != JsonValue::Kind::kObject ||
       it_setup == root.obj_val.end() ||
@@ -1125,8 +1423,24 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
       it_nodes->second.kind != JsonValue::Kind::kArray) {
     ver.passed = false;
     ver.error_code = "LP-J02";
-    ver.message =
-        "Missing required top-level lproof/1 sections or boardSize mismatch.";
+    ver.message = "Missing required top-level lproof/1 sections.";
+    return ver;
+  }
+
+  const auto& setup_obj = it_setup->second.obj_val;
+  int64_t parsed_bs = -1;
+  if (const auto it_sbs = setup_obj.find("boardSize");
+      it_sbs != setup_obj.end() && it_sbs->second.kind == JsonValue::Kind::kInt) {
+    parsed_bs = it_sbs->second.int_val;
+  } else if (const auto it_bs = root.obj_val.find("boardSize");
+             it_bs != root.obj_val.end() &&
+             it_bs->second.kind == JsonValue::Kind::kInt) {
+    parsed_bs = it_bs->second.int_val;
+  }
+  if (parsed_bs != N) {
+    ver.passed = false;
+    ver.error_code = "LP-J02";
+    ver.message = "Missing or mismatched boardSize in lproof/1 file.";
     return ver;
   }
 
@@ -1148,91 +1462,262 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
   ProofContext context;
   Position<N> initial_pos;
   SolveReport<N> report;
+  BitBoard<N> origin_b_bits;
+  BitBoard<N> origin_w_bits;
+  BitBoard<N> wall_bits;
+  Color origin_turn = Color::kBlack;
 
   try {
+    if (const auto it_pid = root.obj_val.find("problemId");
+        it_pid != root.obj_val.end() &&
+        it_pid->second.kind == JsonValue::Kind::kString) {
+      report.problem_id = it_pid->second.str_val;
+    }
+
     const auto& ctx_obj = it_ctx->second.obj_val;
-    if (const auto it = ctx_obj.find("contextId"); it != ctx_obj.end()) {
+    if (const auto it = ctx_obj.find("contextId");
+        it != ctx_obj.end() && it->second.kind == JsonValue::Kind::kString) {
       ParseHexU64(it->second.str_val, &context.context_id);
     }
-    if (const auto it = ctx_obj.find("rootAttacker"); it != ctx_obj.end()) {
-      context.root_attacker =
-          (it->second.str_val == "W") ? Color::kWhite : Color::kBlack;
+    if (const auto it = ctx_obj.find("rootAttacker"); it == ctx_obj.end() ||
+        !ParseColorValue(it->second, &context.root_attacker)) {
+      ver.passed = false;
+      ver.error_code = "LP-J02";
+      ver.message = "Invalid or missing context.rootAttacker.";
+      return ver;
     }
-    if (const auto it = ctx_obj.find("attackerGoal"); it != ctx_obj.end()) {
+    if (const auto it = ctx_obj.find("attackerGoal");
+        it == ctx_obj.end() || it->second.kind != JsonValue::Kind::kString ||
+        (it->second.str_val != "TOKILL" && it->second.str_val != "TOLIVE")) {
+      ver.passed = false;
+      ver.error_code = "LP-J02";
+      ver.message = "Invalid or missing context.attackerGoal.";
+      return ver;
+    } else {
       context.attacker_goal = (it->second.str_val == "TOKILL")
                                   ? SearchGoal::kToKill
                                   : SearchGoal::kToLive;
     }
-    if (const auto it = ctx_obj.find("crucialStoneOp"); it != ctx_obj.end()) {
-      context.crucial_stone_op =
-          static_cast<LogicalOp>(static_cast<uint8_t>(it->second.int_val));
+    if (const auto it = ctx_obj.find("crucialStoneOp"); it == ctx_obj.end() ||
+        !ParseLogicalOp(it->second, &context.crucial_stone_op)) {
+      ver.passed = false;
+      ver.error_code = "LP-J02";
+      ver.message = "Invalid or missing context.crucialStoneOp.";
+      return ver;
     }
-    if (const auto it = ctx_obj.find("koRule"); it != ctx_obj.end()) {
-      context.ko_rule =
-          static_cast<KoRule>(static_cast<uint8_t>(it->second.int_val));
+    if (const auto it = ctx_obj.find("koRule"); it == ctx_obj.end() ||
+        !ParseKoRule(it->second, &context.ko_rule)) {
+      ver.passed = false;
+      ver.error_code = "LP-J02";
+      ver.message = "Invalid or missing context.koRule.";
+      return ver;
     }
-    if (const auto it = ctx_obj.find("attackerAllowKo"); it != ctx_obj.end()) {
+    if (const auto it = ctx_obj.find("attackerAllowKo");
+        it != ctx_obj.end() && it->second.kind == JsonValue::Kind::kBool) {
       context.attacker_allow_ko = it->second.bool_val;
     }
-    if (const auto it = ctx_obj.find("defenderAllowKo"); it != ctx_obj.end()) {
+    if (const auto it = ctx_obj.find("defenderAllowKo");
+        it != ctx_obj.end() && it->second.kind == JsonValue::Kind::kBool) {
       context.defender_allow_ko = it->second.bool_val;
     }
     if (const auto it = ctx_obj.find("initialTokens");
         it != ctx_obj.end() && it->second.kind == JsonValue::Kind::kArray) {
       for (const auto& tj : it->second.arr_val) {
-        if (tj.kind != JsonValue::Kind::kObject) continue;
+        if (tj.kind != JsonValue::Kind::kObject) {
+          ver.passed = false;
+          ver.error_code = "LP-J02";
+          ver.message = "Malformed token entry in context.initialTokens.";
+          return ver;
+        }
+        const auto& tid_v = tj.obj_val.at("tokenId");
+        const auto& ico_v = tj.obj_val.at("initialCoord");
+        const auto& gix_v = tj.obj_val.at("groupIndex");
+        if (tid_v.kind != JsonValue::Kind::kInt ||
+            ico_v.kind != JsonValue::Kind::kInt ||
+            gix_v.kind != JsonValue::Kind::kInt ||
+            ico_v.int_val < 0 || ico_v.int_val >= N * N) {
+          ver.passed = false;
+          ver.error_code = "LP-J02";
+          ver.message = "Invalid token integer fields in context.initialTokens.";
+          return ver;
+        }
         TargetToken tok;
-        tok.token_id =
-            static_cast<uint16_t>(tj.obj_val.at("tokenId").int_val);
-        tok.initial_coord =
-            static_cast<int16_t>(tj.obj_val.at("initialCoord").int_val);
-        tok.group_index =
-            static_cast<uint8_t>(tj.obj_val.at("groupIndex").int_val);
-        tok.stone_color = (tj.obj_val.at("stoneColor").str_val == "W")
-                              ? Color::kWhite
-                              : Color::kBlack;
+        tok.token_id = static_cast<uint16_t>(tid_v.int_val);
+        tok.initial_coord = static_cast<int16_t>(ico_v.int_val);
+        tok.group_index = static_cast<uint8_t>(gix_v.int_val);
+        if (!ParseColorValue(tj.obj_val.at("stoneColor"), &tok.stone_color)) {
+          ver.passed = false;
+          ver.error_code = "LP-J02";
+          ver.message = "Invalid stoneColor in context.initialTokens.";
+          return ver;
+        }
         context.initial_tokens.push_back(tok);
       }
     }
 
-    const auto& setup_obj = it_setup->second.obj_val;
-    initial_pos.Clear(context);
-
-    auto load_coords_to_bits = [&](const std::string& key, BitBoard<N>* bits) {
+    auto load_coords_to_bits = [&](const std::string& key, BitBoard<N>* bits,
+                                   bool required) -> bool {
       const auto it = setup_obj.find(key);
-      if (it == setup_obj.end() || it->second.kind != JsonValue::Kind::kArray) {
-        return;
-      }
+      if (it == setup_obj.end()) return !required;
+      if (it->second.kind != JsonValue::Kind::kArray) return false;
       for (const auto& elem : it->second.arr_val) {
-        const int c = static_cast<int>(elem.int_val);
-        if (c >= 0 && c < N * N) bits->Set(c, true);
+        if (elem.kind != JsonValue::Kind::kInt || elem.int_val < 0 ||
+            elem.int_val >= N * N) {
+          return false;
+        }
+        bits->Set(static_cast<int>(elem.int_val), true);
       }
+      return true;
     };
 
-    BitBoard<N> b_bits;
-    BitBoard<N> w_bits;
-    BitBoard<N> wall_bits;
-    load_coords_to_bits("blackInitialCoords", &b_bits);
-    load_coords_to_bits("whiteInitialCoords", &w_bits);
-    load_coords_to_bits("immortalWallCoords", &wall_bits);
-
-    for (int c : b_bits.ToCoords()) {
-      initial_pos.SetupInitialStone(c, Color::kBlack);
+    BitBoard<N> claimed_b_bits;
+    BitBoard<N> claimed_w_bits;
+    if (!load_coords_to_bits("blackInitialCoords", &claimed_b_bits, true) ||
+        !load_coords_to_bits("whiteInitialCoords", &claimed_w_bits, true) ||
+        !load_coords_to_bits("immortalWallCoords", &wall_bits, false)) {
+      ver.passed = false;
+      ver.error_code = "LP-J02";
+      ver.message = "Invalid stone/wall coordinate array in problemSetup.";
+      return ver;
     }
-    for (int c : w_bits.ToCoords()) {
-      initial_pos.SetupInitialStone(c, Color::kWhite);
-    }
-    initial_pos.SetImmortalWall(wall_bits);
 
     Color first_to_play = Color::kBlack;
-    if (const auto it = setup_obj.find("firstToPlay"); it != setup_obj.end()) {
-      first_to_play =
-          (it->second.str_val == "W") ? Color::kWhite : Color::kBlack;
+    if (const auto it = setup_obj.find("firstToPlay"); it == setup_obj.end() ||
+        !ParseColorValue(it->second, &first_to_play)) {
+      ver.passed = false;
+      ver.error_code = "LP-J02";
+      ver.message = "Invalid or missing problemSetup.firstToPlay.";
+      return ver;
     }
-    initial_pos.FinalizeInitialPosition(first_to_play);
+
+    std::string root_kind = "initial";
+    if (const auto it_rk = setup_obj.find("rootKind");
+        it_rk != setup_obj.end()) {
+      if (it_rk->second.kind != JsonValue::Kind::kString ||
+          (it_rk->second.str_val != "initial" &&
+           it_rk->second.str_val != "traced_subposition")) {
+        ver.passed = false;
+        ver.error_code = "LP-J02";
+        ver.message = "Invalid problemSetup.rootKind.";
+        return ver;
+      }
+      root_kind = it_rk->second.str_val;
+    }
+
+    initial_pos.Clear(context);
+    if (root_kind == "traced_subposition") {
+      const auto it_oturn = setup_obj.find("originFirstToPlay");
+      const auto it_trace = setup_obj.find("initialTraceMoves");
+      if (it_oturn == setup_obj.end() ||
+          !ParseColorValue(it_oturn->second, &origin_turn) ||
+          it_trace == setup_obj.end() ||
+          it_trace->second.kind != JsonValue::Kind::kArray ||
+          it_trace->second.arr_val.empty() ||
+          !load_coords_to_bits("originBlackCoords", &origin_b_bits, true) ||
+          !load_coords_to_bits("originWhiteCoords", &origin_w_bits, true)) {
+        ver.passed = false;
+        ver.error_code = "LP-J02";
+        ver.message =
+            "traced_subposition requires origin coords, originFirstToPlay, and "
+            "non-empty initialTraceMoves.";
+        return ver;
+      }
+      for (int c : origin_b_bits.ToCoords()) {
+        initial_pos.SetupInitialStone(c, Color::kBlack);
+      }
+      for (int c : origin_w_bits.ToCoords()) {
+        initial_pos.SetupInitialStone(c, Color::kWhite);
+      }
+      initial_pos.SetImmortalWall(wall_bits);
+      initial_pos.FinalizeInitialPosition(origin_turn);
+
+      for (const auto& mv_val : it_trace->second.arr_val) {
+        if (mv_val.kind != JsonValue::Kind::kInt ||
+            mv_val.int_val < kPassMove || mv_val.int_val >= N * N) {
+          ver.passed = false;
+          ver.error_code = "LP-S09";
+          ver.message = "Invalid move coordinate in initialTraceMoves.";
+          return ver;
+        }
+        if (!initial_pos.PlayMove(static_cast<int16_t>(mv_val.int_val))) {
+          ver.passed = false;
+          ver.error_code = "LP-S09";
+          ver.message =
+              "Illegal move in traced_subposition initialTraceMoves replay.";
+          return ver;
+        }
+      }
+
+      if (initial_pos.Stones(Color::kBlack) != claimed_b_bits ||
+          initial_pos.Stones(Color::kWhite) != claimed_w_bits ||
+          initial_pos.ToPlay() != first_to_play) {
+        ver.passed = false;
+        ver.error_code = "LP-S02";
+        ver.message =
+            "Replayed traced_subposition disagrees with declared "
+            "blackInitialCoords/whiteInitialCoords/firstToPlay.";
+        return ver;
+      }
+    } else {
+      origin_b_bits = claimed_b_bits;
+      origin_w_bits = claimed_w_bits;
+      origin_turn = first_to_play;
+      for (int c : claimed_b_bits.ToCoords()) {
+        initial_pos.SetupInitialStone(c, Color::kBlack);
+      }
+      for (int c : claimed_w_bits.ToCoords()) {
+        initial_pos.SetupInitialStone(c, Color::kWhite);
+      }
+      initial_pos.SetImmortalWall(wall_bits);
+      initial_pos.FinalizeInitialPosition(first_to_play);
+    }
+
+    if (const auto it_ko = setup_obj.find("koPoint");
+        it_ko != setup_obj.end() && it_ko->second.kind == JsonValue::Kind::kInt &&
+        it_ko->second.int_val != initial_pos.KoPoint()) {
+      ver.passed = false;
+      ver.error_code = "LP-S02";
+      ver.message = "problemSetup.koPoint disagrees with reconstructed position.";
+      return ver;
+    }
+    if (const auto it_cp = setup_obj.find("consecutivePasses");
+        it_cp != setup_obj.end() && it_cp->second.kind == JsonValue::Kind::kInt &&
+        it_cp->second.int_val != initial_pos.ConsecutivePasses()) {
+      ver.passed = false;
+      ver.error_code = "LP-S02";
+      ver.message =
+          "problemSetup.consecutivePasses disagrees with reconstructed position.";
+      return ver;
+    }
+    if (const auto it_stm = setup_obj.find("survivingTokensMask");
+        it_stm != setup_obj.end() &&
+        it_stm->second.kind == JsonValue::Kind::kInt &&
+        static_cast<uint64_t>(it_stm->second.int_val) !=
+            initial_pos.SurvivingTargetTokensMask()) {
+      ver.passed = false;
+      ver.error_code = "LP-S02";
+      ver.message =
+          "problemSetup.survivingTokensMask disagrees with reconstructed "
+          "position.";
+      return ver;
+    }
+    if (const auto it_zh = setup_obj.find("zobristHex");
+        it_zh != setup_obj.end() &&
+        it_zh->second.kind == JsonValue::Kind::kString) {
+      uint64_t claimed_zh = 0;
+      if (!ParseHexU64(it_zh->second.str_val, &claimed_zh) ||
+          claimed_zh != initial_pos.ZobristHash()) {
+        ver.passed = false;
+        ver.error_code = "LP-C01";
+        ver.message =
+            "problemSetup.zobristHex disagrees with reconstructed position hash.";
+        return ver;
+      }
+    }
 
     if (const auto it = setup_obj.find("inputHash");
         it == setup_obj.end() ||
+        it->second.kind != JsonValue::Kind::kString ||
         !ParseHexU64(it->second.str_val, &report.input_hash)) {
       ver.passed = false;
       ver.error_code = "LP-C01";
@@ -1241,27 +1726,117 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
           "file.";
       return ver;
     }
-    if (const auto it = setup_obj.find("hasRegionHint");
-        it != setup_obj.end() && it->second.bool_val) {
+
+    bool has_region_hint = false;
+    if (const auto it_hr = setup_obj.find("hasRegionHint");
+        it_hr != setup_obj.end() &&
+        it_hr->second.kind == JsonValue::Kind::kBool) {
+      has_region_hint = it_hr->second.bool_val;
+    } else if (const auto it_rc = setup_obj.find("regionCoords");
+               it_rc != setup_obj.end() &&
+               it_rc->second.kind == JsonValue::Kind::kArray &&
+               !it_rc->second.arr_val.empty()) {
+      has_region_hint = true;
+    }
+    if (has_region_hint) {
       BitBoard<N> reg_bits;
-      load_coords_to_bits("regionCoords", &reg_bits);
+      if (!load_coords_to_bits("regionCoords", &reg_bits, true)) {
+        ver.passed = false;
+        ver.error_code = "LP-J02";
+        ver.message = "Invalid problemSetup.regionCoords array.";
+        return ver;
+      }
       report.region_hint = reg_bits;
+    }
+
+    // F4: Optional external problem binding check (--problem <original.json>).
+    if (expected_problem != nullptr) {
+      if (!expected_problem->valid) {
+        ver.passed = false;
+        ver.error_code = "LP-P01";
+        ver.message = "External problem contract is invalid.";
+        return ver;
+      }
+      const auto& ep_pos = expected_problem->initial_position;
+      const auto& ep_ctx = expected_problem->proof_context;
+      const bool board_matches =
+          (origin_b_bits == ep_pos.Stones(Color::kBlack)) &&
+          (origin_w_bits == ep_pos.Stones(Color::kWhite)) &&
+          (wall_bits == ep_pos.ImmortalWall()) &&
+          (origin_turn == ep_pos.ToPlay());
+      const bool ctx_matches =
+          (context.root_attacker == ep_ctx.root_attacker) &&
+          (context.attacker_goal == ep_ctx.attacker_goal) &&
+          (context.crucial_stone_op == ep_ctx.crucial_stone_op) &&
+          (context.ko_rule == ep_ctx.ko_rule) &&
+          (context.attacker_allow_ko == ep_ctx.attacker_allow_ko) &&
+          (context.defender_allow_ko == ep_ctx.defender_allow_ko) &&
+          TargetTokensEqual(context.initial_tokens, ep_ctx.initial_tokens);
+      const bool region_matches =
+          (report.region_hint.has_value() ==
+           expected_problem->region_search_mask.has_value()) &&
+          (!report.region_hint.has_value() ||
+           (*report.region_hint == *expected_problem->region_search_mask));
+      if (!board_matches || !ctx_matches || !region_matches) {
+        ver.passed = false;
+        ver.error_code = "LP-P01";
+        ver.message =
+            "Proof certificate does not match external --problem identity "
+            "(stones, turn, immortal walls, context, tokens, or region).";
+        return ver;
+      }
+    }
+
+    // Validate optional stateTable shape when verifying full-table TS exports.
+    if (const auto it_st = root.obj_val.find("stateTable");
+        it_st != root.obj_val.end()) {
+      if (it_st->second.kind != JsonValue::Kind::kArray ||
+          it_st->second.arr_val.empty() ||
+          it_st->second.arr_val[0].kind != JsonValue::Kind::kObject) {
+        ver.passed = false;
+        ver.error_code = "LP-J02";
+        ver.message = "Malformed optional stateTable in lproof/1 file.";
+        return ver;
+      }
+      const auto& s0 = it_st->second.arr_val[0].obj_val;
+      if (const auto it_z0 = s0.find("zobristHex");
+          it_z0 != s0.end() &&
+          it_z0->second.kind == JsonValue::Kind::kString) {
+        uint64_t z0 = 0;
+        if (!ParseHexU64(it_z0->second.str_val, &z0) ||
+            z0 != initial_pos.ZobristHash()) {
+          ver.passed = false;
+          ver.error_code = "LP-S02";
+          ver.message = "stateTable[0].zobristHex disagrees with initial position.";
+          return ver;
+        }
+      }
     }
 
     if (const auto it = root.obj_val.find("rootOutcome");
         it == root.obj_val.end() ||
+        it->second.kind != JsonValue::Kind::kString ||
         !StrToOutcome(it->second.str_val, &report.root_status)) {
       ver.passed = false;
       ver.error_code = "LP-J02";
       ver.message = "Invalid rootOutcome in standalone lproof/1 file.";
       return ver;
     }
-    report.root_dag_node_id =
-        static_cast<uint32_t>(root.obj_val.at("rootNode").int_val);
-    report.root_pn = static_cast<uint32_t>(root.obj_val.at("rootPn").int_val);
-    report.root_dn = static_cast<uint32_t>(root.obj_val.at("rootDn").int_val);
+    const auto& rn_val = root.obj_val.at("rootNode");
+    if (rn_val.kind != JsonValue::Kind::kInt || rn_val.int_val < 0) {
+      report.root_dag_node_id = kInvalidDagNodeId;
+    } else {
+      report.root_dag_node_id = static_cast<uint32_t>(rn_val.int_val);
+    }
+    if (!ParseSatU32(root.obj_val.at("rootPn"), &report.root_pn) ||
+        !ParseSatU32(root.obj_val.at("rootDn"), &report.root_dn)) {
+      ver.passed = false;
+      ver.error_code = "LP-J02";
+      ver.message = "Invalid rootPn or rootDn in standalone lproof/1 file.";
+      return ver;
+    }
     if (const auto it = root.obj_val.find("bestMove");
-        it != root.obj_val.end()) {
+        it != root.obj_val.end() && it->second.kind == JsonValue::Kind::kInt) {
       report.best_move = static_cast<int16_t>(it->second.int_val);
     }
 
@@ -1272,45 +1847,117 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
         ver.message = "Malformed node entry in standalone lproof/1 file.";
         return ver;
       }
+      const auto& nid_v = nj.obj_val.at("nodeId");
+      const auto& or_v = nj.obj_val.at("isOrNode");
+      const auto& im_v = nj.obj_val.at("incomingMove");
+      const auto& out_v = nj.obj_val.at("outcome");
+      const auto& prz_v = nj.obj_val.at("isPrunedOutsideRz");
+      const auto& tt_v = nj.obj_val.at("isTtHit");
+      const auto& pcoords_v = nj.obj_val.at("proofRzCoords");
+      const auto& dcoords_v = nj.obj_val.at("disproofRzCoords");
+      const auto& cm_v = nj.obj_val.at("childMoves");
+      const auto& ci_v = nj.obj_val.at("childNodeIds");
+      if (nid_v.kind != JsonValue::Kind::kInt || nid_v.int_val < 0 ||
+          or_v.kind != JsonValue::Kind::kBool ||
+          im_v.kind != JsonValue::Kind::kInt ||
+          out_v.kind != JsonValue::Kind::kString ||
+          prz_v.kind != JsonValue::Kind::kBool ||
+          tt_v.kind != JsonValue::Kind::kBool ||
+          pcoords_v.kind != JsonValue::Kind::kArray ||
+          dcoords_v.kind != JsonValue::Kind::kArray ||
+          cm_v.kind != JsonValue::Kind::kArray ||
+          ci_v.kind != JsonValue::Kind::kArray) {
+        ver.passed = false;
+        ver.error_code = "LP-J02";
+        ver.message = "Invalid node field type in standalone lproof/1 file.";
+        return ver;
+      }
+
       ProofDagNode<N> node;
-      node.node_id = static_cast<uint32_t>(nj.obj_val.at("nodeId").int_val);
-      node.is_or_node = nj.obj_val.at("isOrNode").bool_val;
-      node.to_play = (nj.obj_val.at("toPlay").str_val == "W") ? Color::kWhite
-                                                              : Color::kBlack;
-      node.incoming_move =
-          static_cast<int16_t>(nj.obj_val.at("incomingMove").int_val);
-      node.pn = static_cast<uint32_t>(nj.obj_val.at("pn").int_val);
-      node.dn = static_cast<uint32_t>(nj.obj_val.at("dn").int_val);
-      if (!StrToOutcome(nj.obj_val.at("outcome").str_val, &node.outcome)) {
+      node.node_id = static_cast<uint32_t>(nid_v.int_val);
+      node.is_or_node = or_v.bool_val;
+      if (!ParseColorValue(nj.obj_val.at("toPlay"), &node.to_play)) {
+        ver.passed = false;
+        ver.error_code = "LP-J02";
+        ver.message = "Invalid node toPlay in standalone lproof/1 file.";
+        return ver;
+      }
+      node.incoming_move = static_cast<int16_t>(im_v.int_val);
+      if (!ParseSatU32(nj.obj_val.at("pn"), &node.pn) ||
+          !ParseSatU32(nj.obj_val.at("dn"), &node.dn)) {
+        ver.passed = false;
+        ver.error_code = "LP-J02";
+        ver.message = "Invalid node pn/dn in standalone lproof/1 file.";
+        return ver;
+      }
+      if (!StrToOutcome(out_v.str_val, &node.outcome)) {
         ver.passed = false;
         ver.error_code = "LP-J02";
         ver.message = "Invalid node outcome in standalone lproof/1 file.";
         return ver;
       }
-      node.terminal_evidence = static_cast<EvidenceKind>(
-          static_cast<uint8_t>(nj.obj_val.at("terminalEvidence").int_val));
-      node.is_pruned_outside_rz = nj.obj_val.at("isPrunedOutsideRz").bool_val;
-      node.is_tt_hit = nj.obj_val.at("isTtHit").bool_val;
-      node.source_proof_node_id =
-          static_cast<uint32_t>(nj.obj_val.at("sourceProofNodeId").int_val);
+      if (!ParseEvidenceKind(nj.obj_val.at("terminalEvidence"),
+                             &node.terminal_evidence)) {
+        ver.passed = false;
+        ver.error_code = "LP-J02";
+        ver.message = "Invalid node terminalEvidence in standalone lproof/1 file.";
+        return ver;
+      }
+      node.is_pruned_outside_rz = prz_v.bool_val;
+      node.is_tt_hit = tt_v.bool_val;
+      const auto& spn = nj.obj_val.at("sourceProofNodeId");
+      if (spn.kind == JsonValue::Kind::kNull) {
+        node.source_proof_node_id = kInvalidDagNodeId;
+      } else if (spn.kind == JsonValue::Kind::kInt && spn.int_val >= 0) {
+        node.source_proof_node_id = static_cast<uint32_t>(spn.int_val);
+      } else {
+        ver.passed = false;
+        ver.error_code = "LP-J02";
+        ver.message = "Invalid sourceProofNodeId in standalone lproof/1 file.";
+        return ver;
+      }
 
       BitBoard<N> p_rz;
       BitBoard<N> d_rz;
-      for (const auto& el : nj.obj_val.at("proofRzCoords").arr_val) {
+      for (const auto& el : pcoords_v.arr_val) {
+        if (el.kind != JsonValue::Kind::kInt) {
+          ver.passed = false;
+          ver.error_code = "LP-J02";
+          ver.message = "Non-integer entry in proofRzCoords.";
+          return ver;
+        }
         const int c = static_cast<int>(el.int_val);
         if (c >= 0 && c < N * N) p_rz.Set(c, true);
       }
-      for (const auto& el : nj.obj_val.at("disproofRzCoords").arr_val) {
+      for (const auto& el : dcoords_v.arr_val) {
+        if (el.kind != JsonValue::Kind::kInt) {
+          ver.passed = false;
+          ver.error_code = "LP-J02";
+          ver.message = "Non-integer entry in disproofRzCoords.";
+          return ver;
+        }
         const int c = static_cast<int>(el.int_val);
         if (c >= 0 && c < N * N) d_rz.Set(c, true);
       }
       node.proof_rz = ProofCertificateRZ<N>(p_rz);
       node.disproof_rz = ProofCertificateRZ<N>(d_rz);
 
-      for (const auto& el : nj.obj_val.at("childMoves").arr_val) {
+      for (const auto& el : cm_v.arr_val) {
+        if (el.kind != JsonValue::Kind::kInt) {
+          ver.passed = false;
+          ver.error_code = "LP-J02";
+          ver.message = "Non-integer entry in childMoves.";
+          return ver;
+        }
         node.child_moves.push_back(static_cast<int16_t>(el.int_val));
       }
-      for (const auto& el : nj.obj_val.at("childNodeIds").arr_val) {
+      for (const auto& el : ci_v.arr_val) {
+        if (el.kind != JsonValue::Kind::kInt || el.int_val < 0) {
+          ver.passed = false;
+          ver.error_code = "LP-J02";
+          ver.message = "Invalid entry in childNodeIds.";
+          return ver;
+        }
         node.child_node_ids.push_back(static_cast<uint32_t>(el.int_val));
       }
       report.proof_dag_nodes.push_back(std::move(node));

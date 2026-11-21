@@ -897,16 +897,23 @@ export class DfpnSolver {
       (queryPos.toPlay === context.rootAttacker && !context.attackerAllowKo) ||
       (queryPos.toPlay !== context.rootAttacker && !context.defenderAllowKo);
 
+    const allowedRegion =
+      regionCoords.length > 0 ? new Set<number>(regionCoords) : null;
+
     // Case 1: Single-witness node (OR -> ProvenWin, or AND -> ProvenLoss)
     if (
       (isOr && expectedOutcome === ProofOutcome.ProvenWin) ||
       (!isOr && expectedOutcome === ProofOutcome.ProvenLoss)
     ) {
       for (let i = 0; i < sourceNode.childNodeIds.length; i++) {
+        const mv = sourceNode.childMoves[i];
+        if (mv !== PASS_MOVE && allowedRegion !== null && !allowedRegion.has(mv)) {
+          continue;
+        }
         const chNode = this.proofDagNodes[sourceNode.childNodeIds[i]];
         if (!chNode || chNode.outcome !== expectedOutcome) continue;
         const nextPos = queryPos.clone();
-        const playRes = nextPos.playMove(sourceNode.childMoves[i]);
+        const playRes = nextPos.playMove(mv);
         if (!playRes.legal) continue;
         if (playRes.isKoCapture && restrictedSide) continue;
         if (
@@ -956,6 +963,24 @@ export class DfpnSolver {
     }
 
     return true;
+  }
+
+  private isMemoryBudgetExceeded(): boolean {
+    if (
+      !Number.isFinite(this.config.memoryBudgetMb) ||
+      this.config.memoryBudgetMb <= 0
+    ) {
+      return false;
+    }
+    const budgetBytes = this.config.memoryBudgetMb * 1024 * 1024;
+    // Conservative byte estimate across stateTable, historyTable, DAG nodes, frontier cache, and TT
+    const estimatedBytes =
+      this.stateTable.length * 1024 +
+      this.historyTable.length * 2048 +
+      this.proofDagNodes.length * 768 +
+      this.nodeFrontierCache.size * 4096 +
+      this.ttStore.size * 1024;
+    return estimatedBytes > budgetBytes;
   }
 
   private midSearch(
@@ -1069,6 +1094,19 @@ export class DfpnSolver {
     if (this.numNodes >= this.config.maxNodes) {
       this.resourceExhausted = true;
       this.unknownReason = UnknownReason.NodeLimit;
+      return {
+        pn: 1,
+        dn: 1,
+        outcome: ProofOutcome.Unknown,
+        koDependent: false,
+        proofRz: new ProofCertificateRZ(),
+        disproofRz: new ProofCertificateRZ(),
+        dagNodeId: -1,
+      };
+    }
+    if (this.isMemoryBudgetExceeded()) {
+      this.resourceExhausted = true;
+      this.unknownReason = UnknownReason.MemoryBudget;
       return {
         pn: 1,
         dn: 1,
@@ -1623,8 +1661,13 @@ export class DfpnSolver {
       if (
         curPn >= thPn ||
         curDn >= thDn ||
-        this.numNodes >= this.config.maxNodes
+        this.numNodes >= this.config.maxNodes ||
+        this.isMemoryBudgetExceeded()
       ) {
+        if (this.isMemoryBudgetExceeded()) {
+          this.resourceExhausted = true;
+          this.unknownReason = UnknownReason.MemoryBudget;
+        }
         finalPn = curPn;
         finalDn = curDn;
         finalOutcome = ProofOutcome.Unknown;

@@ -69,6 +69,10 @@ export class TranspositionStore {
   public patternProofReusableHits = 0;
   public ghiRejectedCount = 0;
 
+  public get size(): number {
+    return this.boardBuckets.size + this.patternRecords.length;
+  }
+
   // FR-6.2: Clear both tables at the start of every problem
   public clearAll(): void {
     this.boardBuckets.clear();

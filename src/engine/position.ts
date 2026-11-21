@@ -145,6 +145,10 @@ export class GoPosition {
   public context: ProofContext;
   public historySnapshots: CanonicalSnapshot[];
   public immortalWallSet: Set<number>;
+  public originBlackCoords: number[] = [];
+  public originWhiteCoords: number[] = [];
+  public originToPlay: Color = Color.Black;
+  public playedMoveTrace: number[] = [];
 
   private readonly orthoTable: number[][];
   private readonly diagTable: number[][];
@@ -198,6 +202,10 @@ export class GoPosition {
     copy.survivingTargetTokensMask = this.survivingTargetTokensMask;
     copy.historySnapshots = this.historySnapshots.slice();
     copy.immortalWallSet = this.immortalWallSet;
+    copy.originBlackCoords = this.originBlackCoords;
+    copy.originWhiteCoords = this.originWhiteCoords;
+    copy.originToPlay = this.originToPlay;
+    copy.playedMoveTrace = this.playedMoveTrace.slice();
     copy.boardZobrist = this.boardZobrist;
     copy.cachedZobristHex = this.cachedZobristHex;
     return copy;
@@ -286,6 +294,10 @@ export class GoPosition {
         this.survivingTargetTokensMask |= 1 << idx;
       }
     });
+    this.originBlackCoords = this.getBlackCoords();
+    this.originWhiteCoords = this.getWhiteCoords();
+    this.originToPlay = firstToPlay;
+    this.playedMoveTrace = [];
     this.historySnapshots = [this.currentCanonicalSnapshot()];
   }
 
@@ -460,6 +472,7 @@ export class GoPosition {
       this.consecutivePasses += 1;
       this.toPlay = oppositeColor(this.toPlay);
       this.cachedZobristHex = null;
+      this.playedMoveTrace.push(PASS_MOVE);
       this.historySnapshots.push(this.currentCanonicalSnapshot());
       return { legal: true, capturedCoords: [], isKoCapture: false };
     }
@@ -609,6 +622,7 @@ export class GoPosition {
       }
     }
 
+    this.playedMoveTrace.push(move);
     this.historySnapshots.push(nextSnap);
     return { legal: true, capturedCoords, isKoCapture };
   }

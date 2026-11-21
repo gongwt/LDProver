@@ -159,9 +159,21 @@ int RunSolveCommand(int argc, char* argv[]) {
 
   ldprover::DfpnSolver<19> solver(config);
   const auto report = solver.Solve(parsed.initial_position, parsed.proof_context,
-                                   parsed.region_search_mask);
+                                   parsed.region_search_mask, prob_id);
 
   ldprover::ProofArtifactManager<19> artifacts;
+  std::string checker_code = "SKIPPED_UNKNOWN";
+  if (report.root_status != ldprover::ProofOutcome::kUnknown) {
+    const auto ver = artifacts.VerifyProofDag(
+        parsed.initial_position, parsed.proof_context, report);
+    checker_code = ver.error_code;
+    if (!ver.passed) {
+      std::cerr << "[LDProver] Proof verification failed (" << ver.error_code
+                << "): " << ver.message << "\n";
+      return 2;
+    }
+  }
+
   std::string checksum;
   const std::string proof_json = artifacts.SerializeLProofJson(
       parsed.initial_position, parsed.proof_context, report, &checksum);
@@ -181,18 +193,6 @@ int RunSolveCommand(int argc, char* argv[]) {
     }
   }
 
-  std::string checker_code = "SKIPPED_UNKNOWN";
-  if (report.root_status != ldprover::ProofOutcome::kUnknown) {
-    const auto ver = artifacts.VerifyProofDag(
-        parsed.initial_position, parsed.proof_context, report);
-    checker_code = ver.error_code;
-    if (!ver.passed) {
-      std::cerr << "[LDProver] Proof verification failed (" << ver.error_code
-                << "): " << ver.message << "\n";
-      return 2;
-    }
-  }
-
   std::cout << "{\"solverVersion\":\"LDProver-1.8.2\",\"problemId\":\""
             << prob_id << "\",\"rootStatus\":\""
             << OutcomeLabel(report.root_status)
@@ -204,14 +204,43 @@ int RunSolveCommand(int argc, char* argv[]) {
   return 0;
 }
 
+template <int N>
+int ExecuteCheckForBoardSize(const std::string& proof_json,
+                             const std::string& problem_path,
+                             ldprover::VerificationReport* out_ver) {
+  ldprover::ProofArtifactManager<N> mgr;
+  if (!problem_path.empty()) {
+    std::string raw_problem_json;
+    if (!ReadEntireFile(problem_path, &raw_problem_json)) {
+      std::cerr << "[LDProver] Cannot read --problem file: " << problem_path
+                << "\n";
+      return 2;
+    }
+    ldprover::ProblemContractParser<N> parser;
+    const std::string pid = BasenameStem(problem_path);
+    const auto parsed = parser.ParseTsumegoJsonObject(pid, raw_problem_json);
+    if (!parsed.valid) {
+      std::cerr << "{\"problemId\":\"" << pid << "\",\"valid\":false,"
+                << "\"errorCode\":\"" << parsed.error_code << "\","
+                << "\"message\":\"" << parsed.error_message << "\"}\n";
+      return 2;
+    }
+    *out_ver = mgr.VerifyLProofJsonString(proof_json, &parsed);
+    return 0;
+  }
+  *out_ver = mgr.VerifyLProofJsonString(proof_json, nullptr);
+  return 0;
+}
+
 int RunCheckCommand(int argc, char* argv[]) {
   std::string proof_path;
+  std::string problem_path;
   for (int i = 2; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--proof" && i + 1 < argc) {
       proof_path = argv[++i];
     } else if (arg == "--problem" && i + 1 < argc) {
-      ++i;  // Optional cross-reference path accepted per CLI contract.
+      problem_path = argv[++i];
     } else {
       std::cerr << "[LDProver] Unknown or incomplete check option: " << arg
                 << "\n";
@@ -232,22 +261,22 @@ int RunCheckCommand(int argc, char* argv[]) {
 
   const int bs = DetectBoardSizeFromProofJson(proof_json);
   ldprover::VerificationReport ver;
+  int prep_rc = 0;
   if (bs == 5) {
-    ldprover::ProofArtifactManager<5> mgr;
-    ver = mgr.VerifyLProofJsonString(proof_json);
+    prep_rc = ExecuteCheckForBoardSize<5>(proof_json, problem_path, &ver);
   } else if (bs == 7) {
-    ldprover::ProofArtifactManager<7> mgr;
-    ver = mgr.VerifyLProofJsonString(proof_json);
+    prep_rc = ExecuteCheckForBoardSize<7>(proof_json, problem_path, &ver);
   } else if (bs == 19) {
-    ldprover::ProofArtifactManager<19> mgr;
-    ver = mgr.VerifyLProofJsonString(proof_json);
+    prep_rc = ExecuteCheckForBoardSize<19>(proof_json, problem_path, &ver);
   } else {
     std::cerr << "[LDProver] Unsupported boardSize in proof JSON.\n";
     return 2;
   }
+  if (prep_rc != 0) return prep_rc;
 
   std::cout << "{\"passed\":" << (ver.passed ? "true" : "false")
             << ",\"errorCode\":\"" << ver.error_code
+            << "\",\"message\":\"" << ver.message
             << "\",\"verifiedNodes\":" << ver.verified_nodes
             << ",\"replayedPrunedCertificates\":"
             << ver.replayed_pruned_certificates

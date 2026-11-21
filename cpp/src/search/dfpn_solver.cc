@@ -20,12 +20,23 @@ constexpr uint32_t ClampSat(uint64_t val) noexcept {
 }  // namespace
 
 template <int N>
+bool DfpnSolver<N>::IsMemoryBudgetExceeded() const noexcept {
+  if (config_.memory_budget_bytes == 0ULL) return false;
+  const uint64_t approx_bytes =
+      static_cast<uint64_t>(report_.proof_dag_nodes.size()) * 768ULL +
+      static_cast<uint64_t>(tt_store_.EstimatedEntryCount()) * 1024ULL;
+  return approx_bytes > config_.memory_budget_bytes;
+}
+
+template <int N>
 SolveReport<N> DfpnSolver<N>::Solve(
     const Position<N>& initial_pos, const ProofContext& context,
-    const std::optional<BitBoard<N>>& region_hint) {
+    const std::optional<BitBoard<N>>& region_hint,
+    const std::string& problem_id) {
   // FR-6.2: Clear BoardTT and PatternTT at the start of every problem.
   tt_store_.ClearAll();
   report_ = SolveReport<N>{};
+  report_.problem_id = problem_id;
   report_.input_hash = initial_pos.ZobristHash();
   report_.region_hint = region_hint;
 
@@ -45,12 +56,14 @@ SolveReport<N> DfpnSolver<N>::Solve(
 
   // Extract principal variation when proven.
   if (report_.root_status != ProofOutcome::kUnknown &&
+      report_.root_dag_node_id != kInvalidDagNodeId &&
       report_.root_dag_node_id < report_.proof_dag_nodes.size()) {
     uint32_t cur_id = report_.root_dag_node_id;
     for (int step = 0; step < 64 && cur_id < report_.proof_dag_nodes.size();
          ++step) {
       const auto& cur = report_.proof_dag_nodes[cur_id];
       if ((cur.is_pruned_outside_rz || cur.is_tt_hit) &&
+          cur.source_proof_node_id != kInvalidDagNodeId &&
           cur.source_proof_node_id < cur.node_id) {
         cur_id = cur.source_proof_node_id;
         continue;
@@ -58,8 +71,9 @@ SolveReport<N> DfpnSolver<N>::Solve(
       if (cur.child_node_ids.empty()) break;
       int chosen = -1;
       for (size_t i = 0; i < cur.child_node_ids.size(); ++i) {
-        if (report_.proof_dag_nodes[cur.child_node_ids[i]].outcome ==
-            cur.outcome) {
+        if (cur.child_node_ids[i] < report_.proof_dag_nodes.size() &&
+            report_.proof_dag_nodes[cur.child_node_ids[i]].outcome ==
+                cur.outcome) {
           chosen = static_cast<int>(i);
           if (cur.child_moves[i] != kPassMove) break;
         }
@@ -95,7 +109,7 @@ int32_t DfpnSolver<N>::ScoreMoveFastCapture(const Position<N>& pos,
     if ((pos.SurvivingTargetTokensMask() & (1ULL << i)) == 0) continue;
     int t_coord = context.initial_tokens[i].initial_coord;
     BitBoard<N> libs;
-    BitBoard<N> ch = pos.FloodFillChain(t_coord, &libs);
+    (void)pos.FloodFillChain(t_coord, &libs);
     if (libs.Get(move)) {
       score += 550;
       if (libs.Count() == 1) score += 1350;
@@ -184,16 +198,22 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
   if ((is_or && expected_outcome == ProofOutcome::kProvenWin) ||
       (!is_or && expected_outcome == ProofOutcome::kProvenLoss)) {
     for (size_t i = 0; i < node.child_node_ids.size(); ++i) {
-      if (report_.proof_dag_nodes[node.child_node_ids[i]].outcome !=
-          expected_outcome) {
+      const uint32_t cid = node.child_node_ids[i];
+      if (cid >= report_.proof_dag_nodes.size() ||
+          report_.proof_dag_nodes[cid].outcome != expected_outcome) {
+        continue;
+      }
+      const int16_t mv = node.child_moves[i];
+      if (mv != kPassMove && region_hint.has_value() &&
+          (mv < 0 || mv >= N * N || !region_hint->Get(mv))) {
         continue;
       }
       Position<N> next = query_pos;
       bool is_ko_cap = false;
-      if (!next.PlayMove(node.child_moves[i], &is_ko_cap)) continue;
+      if (!next.PlayMove(mv, &is_ko_cap)) continue;
       if (is_ko_cap && restricted_side) continue;
       if (RevalidateSourceProofOnQueryState(
-              next, context, region_hint, node.child_node_ids[i],
+              next, context, region_hint, cid,
               expected_outcome, guard_depth + 1)) {
         return true;
       }
@@ -213,12 +233,15 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
       }
     }
     if (found_idx < 0) return false;
+    const uint32_t cid = node.child_node_ids[found_idx];
+    if (cid >= report_.proof_dag_nodes.size() ||
+        report_.proof_dag_nodes[cid].outcome != expected_outcome) {
+      return false;
+    }
     Position<N> next = query_pos;
-    bool is_ko_cap = false;
-    if (!next.PlayMove(mv, &is_ko_cap)) continue;
-    if (is_ko_cap && restricted_side) return false;
+    if (!next.PlayMove(mv)) return false;
     if (!RevalidateSourceProofOnQueryState(
-            next, context, region_hint, node.child_node_ids[found_idx],
+            next, context, region_hint, cid,
             expected_outcome, guard_depth + 1)) {
       return false;
     }
@@ -238,6 +261,7 @@ void DfpnSolver<N>::MidSearch(
     int16_t incoming_move) {
   ++report_.num_nodes;
   *out_ko_dependent = false;
+  *out_dag_node_id = kInvalidDagNodeId;
   const bool is_or_node = (pos.ToPlay() == context.root_attacker);
 
   // Step 1 (FR-3.2, FR-3.8): Evaluate Terminal BEFORE InPath cycle detection.
@@ -295,6 +319,14 @@ void DfpnSolver<N>::MidSearch(
   if (report_.num_nodes >= config_.max_nodes) {
     report_.resource_exhausted = true;
     report_.unknown_reason = UnknownReason::kNodeLimit;
+    *out_pn = 1;
+    *out_dn = 1;
+    *out_outcome = ProofOutcome::kUnknown;
+    return;
+  }
+  if (IsMemoryBudgetExceeded()) {
+    report_.resource_exhausted = true;
+    report_.unknown_reason = UnknownReason::kMemoryBudget;
     *out_pn = 1;
     *out_dn = 1;
     *out_outcome = ProofOutcome::kUnknown;
@@ -411,7 +443,7 @@ void DfpnSolver<N>::MidSearch(
   uint32_t widening_level = 0;
   ProofCertificateRZ<N> active_null_move_rz;
   bool has_null_move_rz = false;
-  uint32_t representative_dag_id = 0;
+  uint32_t representative_dag_id = kInvalidDagNodeId;
   ProofOutcome representative_outcome = ProofOutcome::kUnknown;
 
   while (true) {
@@ -533,40 +565,79 @@ void DfpnSolver<N>::MidSearch(
         continue;
       }
 
+      const ProofOutcome target_outcome =
+          (cur_pn == 0) ? ProofOutcome::kProvenWin : ProofOutcome::kProvenLoss;
+      const bool is_existential =
+          (is_or_node && cur_pn == 0) || (!is_or_node && cur_dn == 0);
+
+      std::vector<uint32_t> proven_child_ids;
+      std::vector<int16_t> proven_child_moves;
+
+      if (is_existential) {
+        int witness_idx = -1;
+        for (size_t i = 0; i < children.size(); ++i) {
+          const auto& ch = children[i];
+          const bool metric_zero = is_or_node ? (ch.pn == 0) : (ch.dn == 0);
+          if (metric_zero && ch.outcome == target_outcome && !ch.ko_dependent &&
+              ch.dag_node_id != kInvalidDagNodeId &&
+              ch.dag_node_id < report_.proof_dag_nodes.size()) {
+            witness_idx = static_cast<int>(i);
+            break;
+          }
+        }
+        if (witness_idx < 0) {
+          *out_pn = 1;
+          *out_dn = 1;
+          *out_outcome = ProofOutcome::kUnknown;
+          *out_dag_node_id = kInvalidDagNodeId;
+          break;
+        }
+        const auto& w = children[witness_idx];
+        if (is_or_node) {
+          *out_proof_rz =
+              rz_engine_.ComputeSingleWitnessRZ(pos, w.move, w.proof_rz);
+        } else {
+          *out_disproof_rz =
+              rz_engine_.ComputeSingleWitnessRZ(pos, w.move, w.disproof_rz);
+        }
+        if (depth == 0) report_.best_move = w.move;
+        proven_child_ids.push_back(w.dag_node_id);
+        proven_child_moves.push_back(w.move);
+      } else {
+        bool all_valid = true;
+        std::vector<ProofCertificateRZ<N>> child_rzs;
+        child_rzs.reserve(children.size());
+        proven_child_ids.reserve(children.size());
+        proven_child_moves.reserve(children.size());
+        for (const auto& ch : children) {
+          if (ch.outcome != target_outcome ||
+              ch.dag_node_id == kInvalidDagNodeId ||
+              ch.dag_node_id >= report_.proof_dag_nodes.size()) {
+            all_valid = false;
+            break;
+          }
+          child_rzs.push_back(is_or_node ? ch.disproof_rz : ch.proof_rz);
+          proven_child_ids.push_back(ch.dag_node_id);
+          proven_child_moves.push_back(ch.move);
+        }
+        if (!all_valid) {
+          *out_pn = 1;
+          *out_dn = 1;
+          *out_outcome = ProofOutcome::kUnknown;
+          *out_dag_node_id = kInvalidDagNodeId;
+          break;
+        }
+        if (is_or_node) {
+          *out_disproof_rz =
+              rz_engine_.ComputeAllChildrenUnionRZ(pos, child_rzs);
+        } else {
+          *out_proof_rz = rz_engine_.ComputeAllChildrenUnionRZ(pos, child_rzs);
+        }
+      }
+
       *out_pn = cur_pn;
       *out_dn = cur_dn;
-      *out_outcome =
-          (cur_pn == 0) ? ProofOutcome::kProvenWin : ProofOutcome::kProvenLoss;
-
-      // Backpropagate dual-chain Relevance Zone (FR-5.2, FR-5.3).
-      if (is_or_node && cur_pn == 0) {
-        for (const auto& ch : children) {
-          if (ch.pn == 0) {
-            *out_proof_rz = rz_engine_.ComputeSingleWitnessRZ(
-                pos, ch.move, ch.proof_rz);
-            if (depth == 0) report_.best_move = ch.move;
-            break;
-          }
-        }
-      } else if (!is_or_node && cur_dn == 0) {
-        for (const auto& ch : children) {
-          if (ch.dn == 0) {
-            *out_disproof_rz = rz_engine_.ComputeSingleWitnessRZ(
-                pos, ch.move, ch.disproof_rz);
-            if (depth == 0) report_.best_move = ch.move;
-            break;
-          }
-        }
-      } else if (is_or_node && cur_dn == 0) {
-        std::vector<ProofCertificateRZ<N>> child_rzs;
-        for (const auto& ch : children) child_rzs.push_back(ch.disproof_rz);
-        *out_disproof_rz =
-            rz_engine_.ComputeAllChildrenUnionRZ(pos, child_rzs);
-      } else {
-        std::vector<ProofCertificateRZ<N>> child_rzs;
-        for (const auto& ch : children) child_rzs.push_back(ch.proof_rz);
-        *out_proof_rz = rz_engine_.ComputeAllChildrenUnionRZ(pos, child_rzs);
-      }
+      *out_outcome = target_outcome;
 
       ProofDagNode<N> dag_node;
       dag_node.node_id = static_cast<uint32_t>(report_.proof_dag_nodes.size());
@@ -578,12 +649,8 @@ void DfpnSolver<N>::MidSearch(
       dag_node.outcome = *out_outcome;
       dag_node.proof_rz = *out_proof_rz;
       dag_node.disproof_rz = *out_disproof_rz;
-      for (const auto& ch : children) {
-        if (ch.expanded) {
-          dag_node.child_node_ids.push_back(ch.dag_node_id);
-          dag_node.child_moves.push_back(ch.move);
-        }
-      }
+      dag_node.child_node_ids = std::move(proven_child_ids);
+      dag_node.child_moves = std::move(proven_child_moves);
       report_.proof_dag_nodes.push_back(dag_node);
       *out_dag_node_id = dag_node.node_id;
 
@@ -601,8 +668,20 @@ void DfpnSolver<N>::MidSearch(
     }
 
     // Threshold cutoff check (FR-4.3: OR condition).
+    if (IsMemoryBudgetExceeded()) {
+      report_.resource_exhausted = true;
+      report_.unknown_reason = UnknownReason::kMemoryBudget;
+      *out_pn = cur_pn;
+      *out_dn = cur_dn;
+      *out_outcome = ProofOutcome::kUnknown;
+      break;
+    }
     if (cur_pn >= th_pn || cur_dn >= th_dn ||
         report_.num_nodes >= config_.max_nodes) {
+      if (report_.num_nodes >= config_.max_nodes) {
+        report_.resource_exhausted = true;
+        report_.unknown_reason = UnknownReason::kNodeLimit;
+      }
       *out_pn = cur_pn;
       *out_dn = cur_dn;
       *out_outcome = ProofOutcome::kUnknown;
@@ -670,9 +749,11 @@ void DfpnSolver<N>::MidSearch(
 
     bool is_ko_capture = false;
     if (!pos.PlayMove(mpc.move, &is_ko_capture)) {
-      mpc.pn = is_or_node ? kPnDnSaturation : 0;
-      mpc.dn = is_or_node ? 0 : kPnDnSaturation;
-      continue;
+      *out_pn = 1;
+      *out_dn = 1;
+      *out_outcome = ProofOutcome::kUnknown;
+      *out_dag_node_id = kInvalidDagNodeId;
+      break;
     }
 
     bool child_ko_dep = false;
@@ -680,7 +761,6 @@ void DfpnSolver<N>::MidSearch(
               in_path_hashes, &mpc.pn, &mpc.dn, &mpc.outcome, &child_ko_dep,
               &mpc.proof_rz, &mpc.disproof_rz, &mpc.dag_node_id, mpc.move);
     pos.UndoMove();
-    mpc.expanded = true;
 
     // FR-5.7: KoDependent witness barrier check (propagates child_ko_dep too!).
     const bool restricted_side =
@@ -692,18 +772,25 @@ void DfpnSolver<N>::MidSearch(
       mpc.outcome = ProofOutcome::kUnknown;
       mpc.pn = kPnDnSaturation / 2;
       mpc.dn = kPnDnSaturation / 2;
+      mpc.dag_node_id = kInvalidDagNodeId;
+      mpc.expanded = false;
       *out_ko_dependent = true;
+    } else {
+      mpc.expanded = (mpc.outcome != ProofOutcome::kUnknown &&
+                      mpc.dag_node_id != kInvalidDagNodeId);
     }
 
     // Record compact sibling certificate RZ for OutsideRZRevalidated pruning (FR-5.5).
     // Never seed OR-node active_null_move_rz from PASS_MOVE (DOUBLE_PASS_RESOLUTION)!
-    if (!is_or_node && mpc.pn == 0 && mpc.proof_rz.Size() > 0 &&
+    if (!is_or_node && mpc.pn == 0 && mpc.dag_node_id != kInvalidDagNodeId &&
+        mpc.proof_rz.Size() > 0 &&
         (!has_null_move_rz || mpc.proof_rz.Size() < active_null_move_rz.Size())) {
       active_null_move_rz = mpc.proof_rz;
       has_null_move_rz = true;
       representative_dag_id = mpc.dag_node_id;
       representative_outcome = ProofOutcome::kProvenWin;
     } else if (is_or_node && mpc.move != kPassMove && mpc.dn == 0 &&
+               mpc.dag_node_id != kInvalidDagNodeId &&
                mpc.disproof_rz.Size() > 0 &&
                (!has_null_move_rz ||
                 mpc.disproof_rz.Size() < active_null_move_rz.Size())) {

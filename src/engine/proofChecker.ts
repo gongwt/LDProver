@@ -13,13 +13,16 @@ import {
   CanonicalSnapshot,
   Color,
   KoRule,
+  LogicalOp,
   PN_DN_SATURATION,
   ProofContext,
   ProofDagNode,
   ProofOutcome,
+  SearchGoal,
   SolveReport,
   StateTableEntry,
   TerminalStatus,
+  TsumegoProblemSpec,
   VerificationReport,
 } from './types';
 
@@ -210,6 +213,48 @@ function decodeSatNumber(val: unknown): number {
   return -1;
 }
 
+function encodeColorStr(c: Color): 'B' | 'W' {
+  return c === Color.White ? 'W' : 'B';
+}
+
+function decodeColor(val: unknown): Color | null {
+  if (val === 'B' || val === 'b' || val === Color.Black) return Color.Black;
+  if (val === 'W' || val === 'w' || val === Color.White) return Color.White;
+  return null;
+}
+
+function isIntegerArray(val: unknown): val is number[] {
+  if (!Array.isArray(val)) return false;
+  for (let i = 0; i < val.length; i++) {
+    if (typeof val[i] !== 'number' || !Number.isInteger(val[i])) return false;
+  }
+  return true;
+}
+
+function sortedUniqueNumbers(arr: number[]): number[] {
+  return Array.from(new Set(arr)).sort((a, b) => a - b);
+}
+
+function isValidSnapshotShape(s: unknown): s is CanonicalSnapshot {
+  if (!s || typeof s !== 'object' || Array.isArray(s)) return false;
+  const obj = s as Record<string, unknown>;
+  return (
+    isIntegerArray(obj.blackCoords) &&
+    isIntegerArray(obj.whiteCoords) &&
+    decodeColor(obj.toPlay) !== null &&
+    typeof obj.zobristHex === 'string'
+  );
+}
+
+function normalizeSnapshot(s: Record<string, unknown>): CanonicalSnapshot {
+  return {
+    blackCoords: s.blackCoords as number[],
+    whiteCoords: s.whiteCoords as number[],
+    toPlay: decodeColor(s.toPlay)!,
+    zobristHex: s.zobristHex as string,
+  };
+}
+
 /**
  * Formats JSON with 2-space object indentation while keeping primitive arrays
  * (e.g. stone coordinate lists and child IDs) on a single line, matching C++ PrettyPrintJson.
@@ -266,7 +311,8 @@ export class ProofArtifactManager {
     const immortalWallCoords = Array.from(initialPos.immortalWallSet).sort(
       (a, b) => a - b
     );
-    const regionCoords = (report.regionCoords ?? []).slice();
+    const regionCoords = sortedUniqueNumbers(report.regionCoords ?? []);
+    const isTracedSubposition = initialPos.playedMoveTrace.length > 0;
 
     // Losslessly deduplicate CanonicalSnapshots across historyTable via snapshotPool
     const snapshotPool: CanonicalSnapshot[] = [];
@@ -286,31 +332,50 @@ export class ProofArtifactManager {
       })
     );
 
+    const problemSetup: Record<string, unknown> = {
+      boardSize: initialPos.boardSize,
+      rootKind: isTracedSubposition ? 'traced_subposition' : 'initial',
+      firstToPlay: encodeColorStr(initialPos.toPlay),
+      koPoint: initialPos.koPoint,
+      consecutivePasses: initialPos.consecutivePasses,
+      survivingTokensMask: initialPos.survivingTargetTokensMask,
+      zobristHex: initialPos.computeZobristHex(),
+      inputHash: report.inputHash,
+      blackInitialCoords: initialPos.getBlackCoords(),
+      whiteInitialCoords: initialPos.getWhiteCoords(),
+      immortalWallCoords,
+      hasRegionHint: regionCoords.length > 0,
+      regionCoords,
+      rawRegionPointCount: report.rawRegionPointCount ?? regionCoords.length,
+      isFullRegionSearch: report.isFullRegionSearch ?? true,
+    };
+
+    if (isTracedSubposition) {
+      problemSetup.originFirstToPlay = encodeColorStr(initialPos.originToPlay);
+      problemSetup.originBlackCoords = initialPos.originBlackCoords.slice();
+      problemSetup.originWhiteCoords = initialPos.originWhiteCoords.slice();
+      problemSetup.initialTraceMoves = initialPos.playedMoveTrace.slice();
+    }
+
     const payloadWithoutChecksum = {
       magic: 'lproof/1',
       problemId: report.problemId,
       context: {
         contextId: context.contextId,
-        rootAttacker: context.rootAttacker === Color.Black ? 'B' : 'W',
+        rootAttacker: encodeColorStr(context.rootAttacker),
         attackerGoal: context.attackerGoal,
         crucialStoneOp: context.crucialStoneOp,
         koRule: context.koRule,
         attackerAllowKo: context.attackerAllowKo,
         defenderAllowKo: context.defenderAllowKo,
-        initialTokens: context.initialTokens,
+        initialTokens: context.initialTokens.map((t) => ({
+          tokenId: t.tokenId,
+          initialCoord: t.initialCoord,
+          groupIndex: t.groupIndex,
+          stoneColor: encodeColorStr(t.stoneColor),
+        })),
       },
-      problemSetup: {
-        boardSize: initialPos.boardSize,
-        firstToPlay: initialPos.toPlay === Color.Black ? 'B' : 'W',
-        zobristHex: initialPos.computeZobristHex(),
-        inputHash: report.inputHash,
-        blackInitialCoords: initialPos.getBlackCoords(),
-        whiteInitialCoords: initialPos.getWhiteCoords(),
-        immortalWallCoords,
-        regionCoords,
-        rawRegionPointCount: report.rawRegionPointCount ?? regionCoords.length,
-        isFullRegionSearch: report.isFullRegionSearch ?? true,
-      },
+      problemSetup,
       rootNode: report.rootDagNodeId,
       rootOutcome: report.rootStatus,
       rootPn: report.rootPn >= PN_DN_SATURATION ? 'SAT' : report.rootPn,
@@ -326,7 +391,7 @@ export class ProofArtifactManager {
         historyId: n.historyId,
         parentStateId: n.parentStateId,
         isOrNode: n.isOrNode,
-        toPlay: n.toPlay,
+        toPlay: encodeColorStr(n.toPlay),
         incomingMove: n.incomingMove,
         incomingMoveSgf: n.incomingMoveSgf,
         pn: n.pn >= PN_DN_SATURATION ? 'SAT' : n.pn,
@@ -441,188 +506,656 @@ export class ProofArtifactManager {
 
   /**
    * Standalone process-independent verifier that reconstructs ALL problem assumptions,
-   * initial board, context, states, histories, and DAG solely from a serialized `.lproof.json`
-   * file string without requiring any in-memory solver objects.
+   * initial board (or traced sub-position), context, states, histories, and DAG solely from a
+   * serialized `.lproof.json` file string without requiring any in-memory solver objects.
+   * Supports both full-table TS exports and compact DAG-only C++ exports under the unified
+   * `lproof/1` protocol, plus optional binding against an external `expectedProblem`.
    */
-  public verifySerializedLProofJson(lproofJsonText: string): VerificationReport {
-    let parsed: Record<string, unknown>;
+  public verifySerializedLProofJson(
+    lproofJsonText: string,
+    expectedBinding?: {
+      problem?: TsumegoProblemSpec;
+      context?: ProofContext;
+    }
+  ): VerificationReport {
+    const makeJsonError = (
+      errorCode: string,
+      message: string,
+      detail: string,
+      schemaVersion = 'lproof/1',
+      checksum = ''
+    ): VerificationReport => ({
+      passed: false,
+      schemaVersion,
+      jcsSha256Checksum: checksum,
+      verifiedNodes: 0,
+      verifiedStates: 0,
+      verifiedHistories: 0,
+      replayedPrunedCertificates: 0,
+      replayedTtHits: 0,
+      failedNodeId: null,
+      errorCode,
+      message,
+      auditChecks: [
+        {
+          checkId: 'CHK-01',
+          requirementRef: 'FR-8.3 / FR-9.1',
+          title: 'lproof/1 独立文件结构与完整性质检',
+          passed: false,
+          detail,
+        },
+      ],
+    });
+
+    let rawParsed: unknown;
     try {
-      parsed = JSON.parse(lproofJsonText) as Record<string, unknown>;
+      rawParsed = JSON.parse(lproofJsonText);
     } catch (err) {
-      return {
-        passed: false,
-        schemaVersion: 'lproof/1',
-        jcsSha256Checksum: '',
-        verifiedNodes: 0,
-        verifiedStates: 0,
-        verifiedHistories: 0,
-        replayedPrunedCertificates: 0,
-        replayedTtHits: 0,
-        failedNodeId: null,
-        errorCode: 'LP-J01',
-        message: `JSON 解析失败: ${err instanceof Error ? err.message : String(err)}`,
-        auditChecks: [
-          {
-            checkId: 'CHK-01',
-            requirementRef: 'FR-8.3 / FR-9.1',
-            title: 'lproof/1 独立文件 JSON 语法与魔数检查',
-            passed: false,
-            detail: 'Malformed JSON payload.',
-          },
-        ],
-      };
+      return makeJsonError(
+        'LP-J01',
+        `JSON 解析失败: ${err instanceof Error ? err.message : String(err)}`,
+        'Malformed JSON payload.'
+      );
     }
 
+    // Fail-closed guard BEFORE accessing ANY property on parsed (R3 F6.1: rejects null/arrays/primitives)
+    if (!rawParsed || typeof rawParsed !== 'object' || Array.isArray(rawParsed)) {
+      return makeJsonError(
+        'LP-J02',
+        'lproof/1 根载荷必须为 JSON 对象（拒绝 null、数组或原始标量）。',
+        'Top-level JSON value is not a plain object.',
+        'unknown'
+      );
+    }
+
+    const parsed = rawParsed as Record<string, unknown>;
+    const hasStateTable = Array.isArray(parsed.stateTable);
     const hasPooledHistory =
       Array.isArray(parsed.snapshotPool) &&
       Array.isArray(parsed.historySnapshotIds);
     const hasInlineHistory = Array.isArray(parsed.historyTable);
 
     if (
-      !parsed ||
       parsed.magic !== 'lproof/1' ||
       typeof parsed.checksum !== 'string' ||
       !parsed.context ||
+      typeof parsed.context !== 'object' ||
+      Array.isArray(parsed.context) ||
       !parsed.problemSetup ||
-      !Array.isArray(parsed.stateTable) ||
-      (!hasPooledHistory && !hasInlineHistory) ||
-      !Array.isArray(parsed.nodes)
+      typeof parsed.problemSetup !== 'object' ||
+      Array.isArray(parsed.problemSetup) ||
+      !Array.isArray(parsed.nodes) ||
+      (hasStateTable && !hasPooledHistory && !hasInlineHistory)
     ) {
-      return {
-        passed: false,
-        schemaVersion: String(parsed?.magic ?? 'unknown'),
-        jcsSha256Checksum: String(parsed?.checksum ?? ''),
-        verifiedNodes: 0,
-        verifiedStates: 0,
-        verifiedHistories: 0,
-        replayedPrunedCertificates: 0,
-        replayedTtHits: 0,
-        failedNodeId: null,
-        errorCode: 'LP-J02',
-        message: 'lproof/1 独立文件缺少必要字段（context / problemSetup / stateTable / historyTable / nodes）。',
-        auditChecks: [
-          {
-            checkId: 'CHK-01',
-            requirementRef: 'FR-8.3 / FR-9.1',
-            title: 'lproof/1 独立文件结构完整性',
-            passed: false,
-            detail: 'Missing required top-level fields.',
-          },
-        ],
-      };
+      return makeJsonError(
+        'LP-J02',
+        'lproof/1 独立文件缺少必要字段（magic / checksum / context / problemSetup / nodes）或历史表缺失。',
+        'Missing required top-level fields.',
+        String(parsed.magic ?? 'unknown'),
+        typeof parsed.checksum === 'string' ? parsed.checksum : ''
+      );
     }
 
-    const { checksum: fileChecksum, ...withoutChecksum } = parsed;
+    const fileChecksum = parsed.checksum;
+    const { checksum: _ignored, ...withoutChecksum } = parsed;
+    void _ignored;
     const expectedChecksum = `sha256-jcs:${sha256Hex(
       canonicalizeJsonJcs(withoutChecksum)
     )}`;
     if (fileChecksum !== expectedChecksum) {
-      return {
-        passed: false,
-        schemaVersion: 'lproof/1',
-        jcsSha256Checksum: fileChecksum,
-        verifiedNodes: 0,
-        verifiedStates: 0,
-        verifiedHistories: 0,
-        replayedPrunedCertificates: 0,
-        replayedTtHits: 0,
-        failedNodeId: null,
-        errorCode: 'LP-C01',
-        message: '独立文件 RFC 8785 JCS SHA-256 校验和不匹配，证书已被篡改。',
-        auditChecks: [
-          {
-            checkId: 'CHK-01',
-            requirementRef: 'FR-8.3 / FR-9.1',
-            title: 'RFC 8785 JCS SHA-256 Checksum 完整性校验',
-            passed: false,
-            detail: `Expected=${expectedChecksum.slice(0, 28)}... Got=${fileChecksum.slice(0, 28)}...`,
-          },
-        ],
-      };
+      return makeJsonError(
+        'LP-C01',
+        '独立文件 RFC 8785 JCS SHA-256 校验和不匹配，证书已被篡改。',
+        `Expected=${expectedChecksum.slice(0, 28)}... Got=${fileChecksum.slice(
+          0,
+          28
+        )}...`,
+        'lproof/1',
+        fileChecksum
+      );
     }
 
     const rawCtx = parsed.context as Record<string, unknown>;
     const setup = parsed.problemSetup as Record<string, unknown>;
+
+    const rootAttacker = decodeColor(rawCtx.rootAttacker);
+    if (rootAttacker === null) {
+      return makeJsonError(
+        'LP-J02',
+        'lproof/1 context.rootAttacker 字段非法。',
+        'Invalid rootAttacker.',
+        'lproof/1',
+        fileChecksum
+      );
+    }
+
+    const attackerGoal =
+      rawCtx.attackerGoal === SearchGoal.ToKill
+        ? SearchGoal.ToKill
+        : rawCtx.attackerGoal === SearchGoal.ToLive
+        ? SearchGoal.ToLive
+        : null;
+    if (attackerGoal === null) {
+      return makeJsonError(
+        'LP-J02',
+        'lproof/1 context.attackerGoal 字段非法。',
+        'Invalid attackerGoal.',
+        'lproof/1',
+        fileChecksum
+      );
+    }
+
+    const decodeLogicalOp = (v: unknown): LogicalOp | null => {
+      if (v === LogicalOp.Single || v === 0) return LogicalOp.Single;
+      if (v === LogicalOp.Conjunction || v === 1) return LogicalOp.Conjunction;
+      if (v === LogicalOp.Disjunction || v === 2) return LogicalOp.Disjunction;
+      return null;
+    };
+    const crucialStoneOp = decodeLogicalOp(rawCtx.crucialStoneOp);
+    if (crucialStoneOp === null) {
+      return makeJsonError(
+        'LP-J02',
+        'lproof/1 context.crucialStoneOp 字段非法。',
+        'Invalid crucialStoneOp.',
+        'lproof/1',
+        fileChecksum
+      );
+    }
+
+    const decodeKoRule = (v: unknown): KoRule | null => {
+      if (v === KoRule.SituationalSuperko || v === 0) {
+        return KoRule.SituationalSuperko;
+      }
+      if (v === KoRule.PositionalSuperko || v === 1) {
+        return KoRule.PositionalSuperko;
+      }
+      if (v === KoRule.SimpleKoOnly || v === 'SIMPLE_KO' || v === 2) {
+        return KoRule.SimpleKoOnly;
+      }
+      return null;
+    };
+    const koRule = decodeKoRule(rawCtx.koRule);
+    if (koRule === null) {
+      return makeJsonError(
+        'LP-J02',
+        'lproof/1 context.koRule 字段非法。',
+        'Invalid koRule.',
+        'lproof/1',
+        fileChecksum
+      );
+    }
+
+    if (
+      typeof rawCtx.attackerAllowKo !== 'boolean' ||
+      typeof rawCtx.defenderAllowKo !== 'boolean' ||
+      !Array.isArray(rawCtx.initialTokens)
+    ) {
+      return makeJsonError(
+        'LP-J02',
+        'lproof/1 context 缺少合法的劫争权限或 initialTokens 数组。',
+        'Invalid ko flags or initialTokens.',
+        'lproof/1',
+        fileChecksum
+      );
+    }
+
+    const initialTokens: ProofContext['initialTokens'] = [];
+    for (const rawTok of rawCtx.initialTokens) {
+      if (!rawTok || typeof rawTok !== 'object' || Array.isArray(rawTok)) {
+        return makeJsonError(
+          'LP-J02',
+          'lproof/1 initialTokens 条目格式非法。',
+          'Malformed TargetToken.',
+          'lproof/1',
+          fileChecksum
+        );
+      }
+      const tObj = rawTok as Record<string, unknown>;
+      const tCol = decodeColor(tObj.stoneColor);
+      if (
+        typeof tObj.tokenId !== 'number' ||
+        typeof tObj.initialCoord !== 'number' ||
+        typeof tObj.groupIndex !== 'number' ||
+        tCol === null
+      ) {
+        return makeJsonError(
+          'LP-J02',
+          'lproof/1 initialTokens 条目字段缺失或类型非法。',
+          'Invalid TargetToken fields.',
+          'lproof/1',
+          fileChecksum
+        );
+      }
+      initialTokens.push({
+        tokenId: tObj.tokenId,
+        initialCoord: tObj.initialCoord,
+        groupIndex: tObj.groupIndex,
+        stoneColor: tCol,
+      });
+    }
+
     const context: ProofContext = {
       contextId: String(rawCtx.contextId ?? ''),
-      rootAttacker: rawCtx.rootAttacker === 'W' ? Color.White : Color.Black,
-      attackerGoal: rawCtx.attackerGoal as ProofContext['attackerGoal'],
-      crucialStoneOp: rawCtx.crucialStoneOp as ProofContext['crucialStoneOp'],
-      koRule: (rawCtx.koRule as KoRule) ?? KoRule.SituationalSuperko,
-      attackerAllowKo: Boolean(rawCtx.attackerAllowKo),
-      defenderAllowKo: Boolean(rawCtx.defenderAllowKo),
-      initialTokens: Array.isArray(rawCtx.initialTokens)
-        ? (rawCtx.initialTokens as ProofContext['initialTokens'])
-        : [],
+      rootAttacker,
+      attackerGoal,
+      crucialStoneOp,
+      koRule,
+      attackerAllowKo: rawCtx.attackerAllowKo,
+      defenderAllowKo: rawCtx.defenderAllowKo,
+      initialTokens,
     };
 
-    const boardSize =
-      typeof setup.boardSize === 'number' ? setup.boardSize : 19;
-    const firstToPlay = setup.firstToPlay === 'W' ? Color.White : Color.Black;
-    const blackInitialCoords = Array.isArray(setup.blackInitialCoords)
-      ? (setup.blackInitialCoords as number[])
-      : [];
-    const whiteInitialCoords = Array.isArray(setup.whiteInitialCoords)
-      ? (setup.whiteInitialCoords as number[])
-      : [];
-    const immortalWallCoords = Array.isArray(setup.immortalWallCoords)
-      ? (setup.immortalWallCoords as number[])
-      : [];
-    const regionCoords = Array.isArray(setup.regionCoords)
-      ? (setup.regionCoords as number[])
-      : [];
-
-    const initialPos = new GoPosition(context, boardSize, immortalWallCoords);
-    initialPos.setupInitialStones(
-      blackInitialCoords,
-      whiteInitialCoords,
-      firstToPlay
-    );
-
-    const nodes: ProofDagNode[] = (
-      parsed.nodes as Array<Record<string, unknown>>
-    ).map((n) => ({
-      nodeId: Number(n.nodeId),
-      stateId: Number(n.stateId),
-      historyId: Number(n.historyId),
-      parentStateId: Number(n.parentStateId),
-      isOrNode: Boolean(n.isOrNode),
-      toPlay: Number(n.toPlay) as Color,
-      incomingMove: Number(n.incomingMove),
-      incomingMoveSgf: String(n.incomingMoveSgf ?? ''),
-      pn: decodeSatNumber(n.pn),
-      dn: decodeSatNumber(n.dn),
-      outcome: n.outcome as ProofOutcome,
-      terminalEvidence: String(n.terminalEvidence ?? ''),
-      isPrunedOutsideRz: Boolean(n.isPrunedOutsideRz),
-      isTtHit: Boolean(n.isTtHit),
-      isKoDependentBarrier: Boolean(n.isKoDependentBarrier),
-      sourceProofNodeId:
-        typeof n.sourceProofNodeId === 'number' ? n.sourceProofNodeId : null,
-      proofRzCoords: Array.isArray(n.proofRzCoords)
-        ? (n.proofRzCoords as number[])
-        : [],
-      disproofRzCoords: Array.isArray(n.disproofRzCoords)
-        ? (n.disproofRzCoords as number[])
-        : [],
-      childNodeIds: Array.isArray(n.childNodeIds)
-        ? (n.childNodeIds as number[])
-        : [],
-      childMoves: Array.isArray(n.childMoves) ? (n.childMoves as number[]) : [],
-      prunedCertificate: n.prunedCertificate
-        ? (n.prunedCertificate as ProofDagNode['prunedCertificate'])
-        : undefined,
-    }));
-
-    let reconstructedHistoryTable: CanonicalSnapshot[][];
-    if (hasPooledHistory) {
-      const pool = parsed.snapshotPool as CanonicalSnapshot[];
-      const idRows = parsed.historySnapshotIds as number[][];
-      reconstructedHistoryTable = idRows.map((row) =>
-        Array.isArray(row) ? row.map((idx) => pool[idx]) : []
+    const boardSizeRaw =
+      typeof setup.boardSize === 'number'
+        ? setup.boardSize
+        : typeof parsed.boardSize === 'number'
+        ? parsed.boardSize
+        : -1;
+    if (boardSizeRaw !== 5 && boardSizeRaw !== 7 && boardSizeRaw !== 19) {
+      return makeJsonError(
+        'LP-J02',
+        `lproof/1 非法棋盘尺寸 boardSize=${String(boardSizeRaw)}。`,
+        'Invalid boardSize.',
+        'lproof/1',
+        fileChecksum
       );
+    }
+    const boardSize = boardSizeRaw;
+
+    const firstToPlay = decodeColor(setup.firstToPlay);
+    if (
+      firstToPlay === null ||
+      !isIntegerArray(setup.blackInitialCoords) ||
+      !isIntegerArray(setup.whiteInitialCoords) ||
+      !isIntegerArray(setup.immortalWallCoords) ||
+      !isIntegerArray(setup.regionCoords)
+    ) {
+      return makeJsonError(
+        'LP-J02',
+        'lproof/1 problemSetup 缺少合法的初始棋子/围墙/区域数组或 firstToPlay。',
+        'Malformed problemSetup arrays.',
+        'lproof/1',
+        fileChecksum
+      );
+    }
+
+    const blackInitialCoords = setup.blackInitialCoords;
+    const whiteInitialCoords = setup.whiteInitialCoords;
+    const immortalWallCoords = setup.immortalWallCoords;
+    const hasRegionHint =
+      typeof setup.hasRegionHint === 'boolean'
+        ? setup.hasRegionHint
+        : setup.regionCoords.length > 0;
+    const regionCoords = hasRegionHint ? setup.regionCoords : [];
+
+    // Reconstruct active root position (R3 F3: zero-trust replay for traced_subposition!)
+    const rootKind =
+      typeof setup.rootKind === 'string' ? setup.rootKind : 'initial';
+    const initialPos = new GoPosition(context, boardSize, immortalWallCoords);
+    let originBlackForBinding = blackInitialCoords;
+    let originWhiteForBinding = whiteInitialCoords;
+    let originToPlayForBinding = firstToPlay;
+
+    if (rootKind === 'traced_subposition') {
+      const originToPlay = decodeColor(setup.originFirstToPlay);
+      if (
+        originToPlay === null ||
+        !isIntegerArray(setup.originBlackCoords) ||
+        !isIntegerArray(setup.originWhiteCoords) ||
+        !isIntegerArray(setup.initialTraceMoves) ||
+        setup.initialTraceMoves.length === 0
+      ) {
+        return makeJsonError(
+          'LP-J02',
+          'traced_subposition 证书缺少合法的 originBlackCoords / originWhiteCoords / originFirstToPlay / initialTraceMoves。',
+          'Incomplete traced_subposition provenance.',
+          'lproof/1',
+          fileChecksum
+        );
+      }
+      originBlackForBinding = setup.originBlackCoords;
+      originWhiteForBinding = setup.originWhiteCoords;
+      originToPlayForBinding = originToPlay;
+      initialPos.setupInitialStones(
+        setup.originBlackCoords,
+        setup.originWhiteCoords,
+        originToPlay
+      );
+      for (let i = 0; i < setup.initialTraceMoves.length; i++) {
+        const tmv = setup.initialTraceMoves[i];
+        const res = initialPos.playMove(tmv);
+        if (!res.legal) {
+          return makeJsonError(
+            'LP-S09',
+            `traced_subposition 到达轨迹第 ${i + 1} 手 move=${tmv} 在规则下非法。`,
+            `Illegal move ${tmv} at trace index ${i}.`,
+            'lproof/1',
+            fileChecksum
+          );
+        }
+      }
+      // Verify traced replay matches declared sub-root setup 100%
+      if (
+        initialPos.toPlay !== firstToPlay ||
+        !numberArraysEqual(
+          initialPos.getBlackCoords(),
+          sortedUniqueNumbers(blackInitialCoords)
+        ) ||
+        !numberArraysEqual(
+          initialPos.getWhiteCoords(),
+          sortedUniqueNumbers(whiteInitialCoords)
+        ) ||
+        (typeof setup.koPoint === 'number' &&
+          initialPos.koPoint !== setup.koPoint) ||
+        (typeof setup.consecutivePasses === 'number' &&
+          initialPos.consecutivePasses !== setup.consecutivePasses) ||
+        (typeof setup.survivingTokensMask === 'number' &&
+          initialPos.survivingTargetTokensMask !== setup.survivingTokensMask) ||
+        (typeof setup.zobristHex === 'string' &&
+          initialPos.computeZobristHex() !== setup.zobristHex)
+      ) {
+        return makeJsonError(
+          'LP-S02',
+          'traced_subposition 重放结果与 problemSetup 声明的子根棋面/劫点/虚手/关键子掩码/Zobrist 不一致。',
+          'Replayed traced sub-position diverges from declared problemSetup.',
+          'lproof/1',
+          fileChecksum
+        );
+      }
+    } else if (rootKind === 'initial') {
+      initialPos.setupInitialStones(
+        blackInitialCoords,
+        whiteInitialCoords,
+        firstToPlay
+      );
+      if (
+        (typeof setup.koPoint === 'number' &&
+          setup.koPoint !== initialPos.koPoint) ||
+        (typeof setup.consecutivePasses === 'number' &&
+          setup.consecutivePasses !== 0) ||
+        (typeof setup.survivingTokensMask === 'number' &&
+          setup.survivingTokensMask !== initialPos.survivingTargetTokensMask)
+      ) {
+        return makeJsonError(
+          'LP-S02',
+          'initial 根证书声称了非初始 koPoint / consecutivePasses / survivingTokensMask。',
+          'Initial root setup violates clean initial invariants.',
+          'lproof/1',
+          fileChecksum
+        );
+      }
     } else {
-      reconstructedHistoryTable = parsed.historyTable as CanonicalSnapshot[][];
+      return makeJsonError(
+        'LP-J02',
+        `未知的 problemSetup.rootKind="${rootKind}"。`,
+        'Unsupported rootKind.',
+        'lproof/1',
+        fileChecksum
+      );
+    }
+
+    // Optional external original-problem identity binding (R3 F4)
+    if (expectedBinding?.problem) {
+      const expProb = expectedBinding.problem;
+      const expRegion = sortedUniqueNumbers(expProb.regionCoords);
+      const certRegion = sortedUniqueNumbers(regionCoords);
+      const expWall = sortedUniqueNumbers(expProb.immortalWallCoords);
+      const certWall = sortedUniqueNumbers(immortalWallCoords);
+      const expBlack = sortedUniqueNumbers(expProb.blackInitialCoords);
+      const expWhite = sortedUniqueNumbers(expProb.whiteInitialCoords);
+      const expTurn = expProb.turnColor === 'W' ? Color.White : Color.Black;
+      if (
+        boardSize !== expProb.boardSize ||
+        originToPlayForBinding !== expTurn ||
+        !numberArraysEqual(sortedUniqueNumbers(originBlackForBinding), expBlack) ||
+        !numberArraysEqual(sortedUniqueNumbers(originWhiteForBinding), expWhite) ||
+        !numberArraysEqual(certWall, expWall) ||
+        !numberArraysEqual(certRegion, expRegion)
+      ) {
+        return makeJsonError(
+          'LP-P01',
+          `证书与外部待验原题 "${expProb.id}" 的棋盘尺寸/初始棋子/先手/围墙或 region 不一致。`,
+          'Problem identity binding mismatch against expectedProblem.',
+          'lproof/1',
+          fileChecksum
+        );
+      }
+    }
+    if (expectedBinding?.context) {
+      const ec = expectedBinding.context;
+      const tokensMatch =
+        context.initialTokens.length === ec.initialTokens.length &&
+        context.initialTokens.every(
+          (t, i) =>
+            t.initialCoord === ec.initialTokens[i].initialCoord &&
+            t.stoneColor === ec.initialTokens[i].stoneColor &&
+            t.groupIndex === ec.initialTokens[i].groupIndex
+        );
+      if (
+        context.rootAttacker !== ec.rootAttacker ||
+        context.attackerGoal !== ec.attackerGoal ||
+        context.crucialStoneOp !== ec.crucialStoneOp ||
+        context.koRule !== ec.koRule ||
+        context.attackerAllowKo !== ec.attackerAllowKo ||
+        context.defenderAllowKo !== ec.defenderAllowKo ||
+        !tokensMatch
+      ) {
+        return makeJsonError(
+          'LP-P01',
+          '证书的 ProofContext（攻防目标/关键子/劫规则/劫权）与外部待验命题不一致。',
+          'ProofContext binding mismatch against expectedContext.',
+          'lproof/1',
+          fileChecksum
+        );
+      }
+    }
+
+    const nodes: ProofDagNode[] = [];
+    for (const rawNode of parsed.nodes) {
+      if (!rawNode || typeof rawNode !== 'object' || Array.isArray(rawNode)) {
+        return makeJsonError(
+          'LP-J02',
+          'lproof/1 nodes 包含非对象条目。',
+          'Malformed node entry.',
+          'lproof/1',
+          fileChecksum
+        );
+      }
+      const n = rawNode as Record<string, unknown>;
+      const nodeToPlay = decodeColor(n.toPlay);
+      if (
+        typeof n.nodeId !== 'number' ||
+        typeof n.isOrNode !== 'boolean' ||
+        nodeToPlay === null ||
+        typeof n.incomingMove !== 'number' ||
+        typeof n.outcome !== 'string' ||
+        !isIntegerArray(n.childNodeIds) ||
+        !isIntegerArray(n.childMoves)
+      ) {
+        return makeJsonError(
+          'LP-J02',
+          `lproof/1 节点条目字段缺失或类型非法 (nodeId=${String(n.nodeId)})。`,
+          'Malformed ProofDagNode fields.',
+          'lproof/1',
+          fileChecksum
+        );
+      }
+      nodes.push({
+        nodeId: n.nodeId,
+        stateId: typeof n.stateId === 'number' ? n.stateId : 0,
+        historyId: typeof n.historyId === 'number' ? n.historyId : 0,
+        parentStateId: typeof n.parentStateId === 'number' ? n.parentStateId : -1,
+        isOrNode: n.isOrNode,
+        toPlay: nodeToPlay,
+        incomingMove: n.incomingMove,
+        incomingMoveSgf:
+          typeof n.incomingMoveSgf === 'string'
+            ? n.incomingMoveSgf
+            : coordToSgf(n.incomingMove, boardSize),
+        pn: decodeSatNumber(n.pn),
+        dn: decodeSatNumber(n.dn),
+        outcome: n.outcome as ProofOutcome,
+        terminalEvidence: String(n.terminalEvidence ?? ''),
+        isPrunedOutsideRz: Boolean(n.isPrunedOutsideRz),
+        isTtHit: Boolean(n.isTtHit),
+        isKoDependentBarrier: Boolean(n.isKoDependentBarrier),
+        sourceProofNodeId:
+          typeof n.sourceProofNodeId === 'number' ? n.sourceProofNodeId : null,
+        proofRzCoords: isIntegerArray(n.proofRzCoords) ? n.proofRzCoords : [],
+        disproofRzCoords: isIntegerArray(n.disproofRzCoords)
+          ? n.disproofRzCoords
+          : [],
+        childNodeIds: n.childNodeIds,
+        childMoves: n.childMoves,
+        prunedCertificate:
+          n.prunedCertificate &&
+          typeof n.prunedCertificate === 'object' &&
+          !Array.isArray(n.prunedCertificate)
+            ? (n.prunedCertificate as ProofDagNode['prunedCertificate'])
+            : undefined,
+      });
+    }
+
+    let reconstructedHistoryTable: CanonicalSnapshot[][] = [];
+    if (hasStateTable) {
+      if (hasPooledHistory) {
+        const rawPool = parsed.snapshotPool as unknown[];
+        const pool: CanonicalSnapshot[] = [];
+        for (let i = 0; i < rawPool.length; i++) {
+          if (!isValidSnapshotShape(rawPool[i])) {
+            return makeJsonError(
+              'LP-J02',
+              `lproof/1 snapshotPool[${i}] 结构非法。`,
+              'Invalid snapshotPool entry.',
+              'lproof/1',
+              fileChecksum
+            );
+          }
+          pool.push(normalizeSnapshot(rawPool[i] as Record<string, unknown>));
+        }
+        const idRows = parsed.historySnapshotIds as unknown[];
+        for (let r = 0; r < idRows.length; r++) {
+          const row = idRows[r];
+          if (!isIntegerArray(row)) {
+            return makeJsonError(
+              'LP-J02',
+              `lproof/1 historySnapshotIds[${r}] 非整数数组。`,
+              'Invalid historySnapshotIds row.',
+              'lproof/1',
+              fileChecksum
+            );
+          }
+          const snaps: CanonicalSnapshot[] = [];
+          for (const idx of row) {
+            if (idx < 0 || idx >= pool.length) {
+              return makeJsonError(
+                'LP-J02',
+                `lproof/1 historySnapshotIds[${r}] 包含越界快照索引 ${idx}。`,
+                'Out-of-bounds snapshotPool index.',
+                'lproof/1',
+                fileChecksum
+              );
+            }
+            snaps.push(pool[idx]);
+          }
+          reconstructedHistoryTable.push(snaps);
+        }
+      } else if (hasInlineHistory) {
+        const rawHist = parsed.historyTable as unknown[];
+        for (let r = 0; r < rawHist.length; r++) {
+          const row = rawHist[r];
+          if (!Array.isArray(row)) {
+            return makeJsonError(
+              'LP-J02',
+              `lproof/1 historyTable[${r}] 非数组。`,
+              'Invalid historyTable row.',
+              'lproof/1',
+              fileChecksum
+            );
+          }
+          const snaps: CanonicalSnapshot[] = [];
+          for (const item of row) {
+            if (!isValidSnapshotShape(item)) {
+              return makeJsonError(
+                'LP-J02',
+                `lproof/1 historyTable[${r}] 包含非法快照对象。`,
+                'Invalid inline history snapshot.',
+                'lproof/1',
+                fileChecksum
+              );
+            }
+            snaps.push(
+              normalizeSnapshot(item as unknown as Record<string, unknown>)
+            );
+          }
+          reconstructedHistoryTable.push(snaps);
+        }
+      }
+    }
+
+    const stateTable: StateTableEntry[] = [];
+    if (hasStateTable) {
+      for (let i = 0; i < (parsed.stateTable as unknown[]).length; i++) {
+        const rawSt = (parsed.stateTable as unknown[])[i];
+        if (!rawSt || typeof rawSt !== 'object' || Array.isArray(rawSt)) {
+          return makeJsonError(
+            'LP-J02',
+            `lproof/1 stateTable[${i}] 非对象。`,
+            'Malformed stateTable entry.',
+            'lproof/1',
+            fileChecksum
+          );
+        }
+        const stObj = rawSt as Record<string, unknown>;
+        const stToPlay = decodeColor(stObj.toPlay);
+        if (
+          typeof stObj.stateId !== 'number' ||
+          typeof stObj.parentStateId !== 'number' ||
+          typeof stObj.moveFromParent !== 'number' ||
+          stToPlay === null ||
+          typeof stObj.koPoint !== 'number' ||
+          typeof stObj.consecutivePasses !== 'number' ||
+          typeof stObj.survivingTokensMask !== 'number' ||
+          typeof stObj.zobristHex !== 'string' ||
+          !isIntegerArray(stObj.blackCoords) ||
+          !isIntegerArray(stObj.whiteCoords) ||
+          typeof stObj.historyId !== 'number'
+        ) {
+          return makeJsonError(
+            'LP-J02',
+            `lproof/1 stateTable[${i}] 缺少必要字段或类型非法。`,
+            'Invalid stateTable fields.',
+            'lproof/1',
+            fileChecksum
+          );
+        }
+        stateTable.push({
+          stateId: stObj.stateId,
+          parentStateId: stObj.parentStateId,
+          moveFromParent: stObj.moveFromParent,
+          toPlay: stToPlay,
+          koPoint: stObj.koPoint,
+          consecutivePasses: stObj.consecutivePasses,
+          survivingTokensMask: stObj.survivingTokensMask,
+          zobristHex: stObj.zobristHex,
+          blackCoords: stObj.blackCoords,
+          whiteCoords: stObj.whiteCoords,
+          historyId: stObj.historyId,
+        });
+      }
+    }
+
+    if (
+      typeof parsed.rootNode !== 'number' ||
+      typeof parsed.rootOutcome !== 'string'
+    ) {
+      return makeJsonError(
+        'LP-J02',
+        'lproof/1 缺少合法的 rootNode 或 rootOutcome。',
+        'Missing rootNode or rootOutcome.',
+        'lproof/1',
+        fileChecksum
+      );
     }
 
     const reconstructedReport: SolveReport = {
@@ -671,9 +1204,9 @@ export class ProofArtifactManager {
       eyeTopologyRegions: [],
       principalVariation: [],
       proofDagNodes: nodes,
-      stateTable: parsed.stateTable as StateTableEntry[],
+      stateTable,
       historyTable: reconstructedHistoryTable,
-      rootDagNodeId: Number(parsed.rootNode),
+      rootDagNodeId: parsed.rootNode,
       proofChecksum: fileChecksum,
       sgfContent: '',
       sgfChecksum: '',
@@ -681,7 +1214,10 @@ export class ProofArtifactManager {
       resultJson: '',
     };
 
-    return this.verifyProofDag(initialPos, context, reconstructedReport);
+    return this.verifyProofDag(initialPos, context, reconstructedReport, {
+      skipChecksumRecompute: true,
+      isCompactDag: !hasStateTable,
+    });
   }
 
   /**
@@ -758,18 +1294,26 @@ export class ProofArtifactManager {
       (queryPos.toPlay === context.rootAttacker && !context.attackerAllowKo) ||
       (queryPos.toPlay !== context.rootAttacker && !context.defenderAllowKo);
 
+    const allowedRegion =
+      regionCoords.length > 0 ? new Set<number>(regionCoords) : null;
+
     // Existential replay: OR -> ProvenWin or AND -> ProvenLoss
     if (
       (isOr && expectedOutcome === ProofOutcome.ProvenWin) ||
       (!isOr && expectedOutcome === ProofOutcome.ProvenLoss)
     ) {
       for (let i = 0; i < sourceNode.childNodeIds.length; i++) {
+        const mv = sourceNode.childMoves[i];
+        // R3 F1: Existential witness moves MUST belong to the query's allowed region (or PASS)
+        if (mv !== PASS_MOVE && allowedRegion !== null && !allowedRegion.has(mv)) {
+          continue;
+        }
         const cid = sourceNode.childNodeIds[i];
         if (cid < 0 || cid >= sourceNode.nodeId) continue;
         const chNode = dagNodes[cid];
         if (!chNode || chNode.outcome !== expectedOutcome) continue;
         const nextPos = queryPos.clone();
-        const playRes = nextPos.playMove(sourceNode.childMoves[i]);
+        const playRes = nextPos.playMove(mv);
         if (!playRes.legal) continue;
         if (playRes.isKoCapture && restrictedSide) continue;
         if (
@@ -830,11 +1374,216 @@ export class ProofArtifactManager {
     return true;
   }
 
+  /**
+   * Zero-trust recursive DAG verifier for compact `lproof/1` files (without StateTable, e.g. C++ CLI output).
+   */
+  private verifyCompactDagRecursive(
+    pos: GoPosition,
+    effectiveRegionCoords: number[],
+    allowedRegionSet: Set<number> | null,
+    context: ProofContext,
+    report: SolveReport,
+    nodeId: number,
+    independentTerminal: BensonTerminalEvaluator,
+    depth: number,
+    stats: {
+      verifiedStates: number;
+      verifiedLeaves: number;
+      verifiedUniversals: number;
+      replayedPruned: number;
+      replayedTt: number;
+    },
+    recordFailure: (code: string, nid: number | null) => void
+  ): { ok: boolean; detail: string } {
+    if (depth > 256 || nodeId < 0 || nodeId >= report.proofDagNodes.length) {
+      recordFailure('LP-S01', nodeId);
+      return { ok: false, detail: `DAG 递归超深或节点 #${nodeId} 越界` };
+    }
+    const node = report.proofDagNodes[nodeId];
+    stats.verifiedStates++;
+
+    const expectedIsOr = pos.toPlay === context.rootAttacker;
+    if (node.toPlay !== pos.toPlay || node.isOrNode !== expectedIsOr) {
+      recordFailure('LP-N10', nodeId);
+      return {
+        ok: false,
+        detail: `节点 #${nodeId} 轮次/AND-OR 角色与真实可达局面冲突`,
+      };
+    }
+
+    if (node.isPrunedOutsideRz || node.isTtHit) {
+      if (
+        node.sourceProofNodeId === null ||
+        node.sourceProofNodeId < 0 ||
+        node.sourceProofNodeId >= node.nodeId
+      ) {
+        recordFailure('LP-R02', nodeId);
+        return {
+          ok: false,
+          detail: `复用/剪枝节点 #${nodeId} 缺失有效 sourceProofNodeId`,
+        };
+      }
+      const ok = this.replaySourceSubgraphOnQueryState(
+        pos,
+        effectiveRegionCoords,
+        context,
+        report.proofDagNodes,
+        node.sourceProofNodeId,
+        node.outcome,
+        independentTerminal,
+        0
+      );
+      if (!ok) {
+        recordFailure('LP-R03', nodeId);
+        return {
+          ok: false,
+          detail: `节点 #${nodeId} 在真实可达 QueryState+HistorySet 下重放源证明 #${node.sourceProofNodeId} 失败`,
+        };
+      }
+      if (node.isPrunedOutsideRz) stats.replayedPruned++;
+      if (node.isTtHit) stats.replayedTt++;
+      return { ok: true, detail: '' };
+    }
+
+    if (node.childNodeIds.length === 0) {
+      stats.verifiedLeaves++;
+      const term = independentTerminal.evaluateTerminal(pos, context);
+      const expectedStatus =
+        node.outcome === ProofOutcome.ProvenWin
+          ? TerminalStatus.Win
+          : TerminalStatus.Loss;
+      if (term.status !== expectedStatus) {
+        recordFailure('LP-L04', nodeId);
+        return {
+          ok: false,
+          detail: `叶节点 #${nodeId} 独立终局复算失败：声称 ${node.outcome}，实测 ${term.status}`,
+        };
+      }
+      return { ok: true, detail: '' };
+    }
+
+    if (node.childMoves.length !== node.childNodeIds.length) {
+      recordFailure('LP-N11', nodeId);
+      return {
+        ok: false,
+        detail: `内部节点 #${nodeId} childMoves 与 childNodeIds 数量不一致`,
+      };
+    }
+
+    const moveToEdge = new Map<
+      number,
+      { cid: number; nextPos: GoPosition; isKoCapture: boolean }
+    >();
+    for (let k = 0; k < node.childMoves.length; k++) {
+      const mv = node.childMoves[k];
+      const cid = node.childNodeIds[k];
+      if (moveToEdge.has(mv)) {
+        recordFailure('LP-N11', nodeId);
+        return { ok: false, detail: `内部节点 #${nodeId} 存在重复着法边 move=${mv}` };
+      }
+      if (
+        mv !== PASS_MOVE &&
+        allowedRegionSet !== null &&
+        !allowedRegionSet.has(mv)
+      ) {
+        recordFailure('LP-S11', nodeId);
+        return {
+          ok: false,
+          detail: `内部节点 #${nodeId} 的着法边 ${coordToSgf(
+            mv,
+            pos.boardSize
+          )} (move=${mv}) 超出声明的合法 region 集合`,
+        };
+      }
+      const nextPos = pos.clone();
+      const playRes = nextPos.playMove(mv);
+      if (!playRes.legal) {
+        recordFailure('LP-S09', nodeId);
+        return { ok: false, detail: `内部节点 #${nodeId} 包含非法着法边 move=${mv}` };
+      }
+      moveToEdge.set(mv, { cid, nextPos, isKoCapture: playRes.isKoCapture });
+    }
+
+    const restrictedSide =
+      (pos.toPlay === context.rootAttacker && !context.attackerAllowKo) ||
+      (pos.toPlay !== context.rootAttacker && !context.defenderAllowKo);
+    const existentialMode =
+      (node.isOrNode && node.outcome === ProofOutcome.ProvenWin) ||
+      (!node.isOrNode && node.outcome === ProofOutcome.ProvenLoss);
+
+    if (existentialMode) {
+      for (const [, edge] of moveToEdge) {
+        const chNode = report.proofDagNodes[edge.cid];
+        if (!chNode || chNode.outcome !== node.outcome) continue;
+        if (edge.isKoCapture && restrictedSide) continue;
+        const sub = this.verifyCompactDagRecursive(
+          edge.nextPos,
+          effectiveRegionCoords,
+          allowedRegionSet,
+          context,
+          report,
+          edge.cid,
+          independentTerminal,
+          depth + 1,
+          stats,
+          recordFailure
+        );
+        if (sub.ok) return { ok: true, detail: '' };
+        return sub;
+      }
+      recordFailure('LP-N21', nodeId);
+      return {
+        ok: false,
+        detail: `单见证节点 #${nodeId} 缺少合法、区域内、非禁劫的同结论见证子节点`,
+      };
+    }
+
+    stats.verifiedUniversals++;
+    const expectedLegalMoves = pos.generateLegalMoves(effectiveRegionCoords);
+    for (const lm of expectedLegalMoves) {
+      const edge = moveToEdge.get(lm);
+      if (!edge) {
+        recordFailure('LP-N22', nodeId);
+        return {
+          ok: false,
+          detail: `全覆盖节点 #${nodeId} 遗漏合法应手 ${coordToSgf(
+            lm,
+            pos.boardSize
+          )}`,
+        };
+      }
+      const chNode = report.proofDagNodes[edge.cid];
+      if (!chNode || chNode.outcome !== node.outcome) {
+        recordFailure('LP-N22', nodeId);
+        return {
+          ok: false,
+          detail: `全覆盖节点 #${nodeId} 应手子节点 #${edge.cid} 结论不一致`,
+        };
+      }
+      const sub = this.verifyCompactDagRecursive(
+        edge.nextPos,
+        effectiveRegionCoords,
+        allowedRegionSet,
+        context,
+        report,
+        edge.cid,
+        independentTerminal,
+        depth + 1,
+        stats,
+        recordFailure
+      );
+      if (!sub.ok) return sub;
+    }
+
+    return { ok: true, detail: '' };
+  }
+
   // FR-9.1, FR-9.2, FR-9.3: Zero-trust Independent Proof Checker (`tprover check`)
   public verifyProofDag(
     initialPos: GoPosition,
     context: ProofContext,
-    report: SolveReport
+    report: SolveReport,
+    options?: { skipChecksumRecompute?: boolean; isCompactDag?: boolean }
   ): VerificationReport {
     const auditChecks: VerificationReport['auditChecks'] = [];
     const independentTerminal = new BensonTerminalEvaluator();
@@ -847,9 +1596,21 @@ export class ProofArtifactManager {
       }
     };
 
+    const isCompactDag = Boolean(options?.isCompactDag);
+    const effectiveRegionCoords = report.regionCoords ?? [];
+    const allowedRegionSet =
+      effectiveRegionCoords.length > 0
+        ? new Set<number>(effectiveRegionCoords)
+        : null;
+
     // Check 1: RFC 8785 JCS SHA-256 Checksum, InputHash, & Root Proposition Binding (FR-8.3, FR-9.1)
-    const recomputed = this.serializeLProofJson(initialPos, context, report);
-    const checksumValid = recomputed.checksum === report.proofChecksum;
+    let checksumValid = true;
+    let displayChecksum = report.proofChecksum;
+    if (!options?.skipChecksumRecompute) {
+      const recomputed = this.serializeLProofJson(initialPos, context, report);
+      checksumValid = recomputed.checksum === report.proofChecksum;
+      displayChecksum = recomputed.checksum;
+    }
     const expectedInputHash = initialPos.computeZobristHex();
     const inputHashValid = report.inputHash === expectedInputHash;
 
@@ -864,7 +1625,7 @@ export class ProofArtifactManager {
       if (!rootNode) {
         rootBindingValid = false;
         rootBindingDetail = `缺失根节点 rootDagNodeId=${rootId}`;
-      } else if (rootNode.stateId !== 0) {
+      } else if (!isCompactDag && rootNode.stateId !== 0) {
         rootBindingValid = false;
         rootBindingDetail = `根节点 #${rootNode.nodeId} 未绑定初始状态 stateId=0 (实为 ${rootNode.stateId})`;
       } else if (rootNode.outcome !== report.rootStatus) {
@@ -892,8 +1653,12 @@ export class ProofArtifactManager {
       title: 'RFC 8785 JCS SHA-256 Checksum、InputHash 与根命题绑定校验',
       passed: chk01Passed,
       detail: chk01Passed
-        ? `SHA-256=${recomputed.checksum.slice(0, 27)}... | InputHash=${report.inputHash} | Root=#${report.rootDagNodeId}`
-        : `Checksum=${checksumValid}, InputHash=${inputHashValid} (${report.inputHash} vs ${expectedInputHash})${
+        ? `SHA-256=${displayChecksum.slice(0, 27)}... | InputHash=${
+            report.inputHash
+          } | Root=#${report.rootDagNodeId}`
+        : `Checksum=${checksumValid}, InputHash=${inputHashValid} (${
+            report.inputHash
+          } vs ${expectedInputHash})${
             rootBindingDetail ? ` | ${rootBindingDetail}` : ''
           }`,
     });
@@ -922,12 +1687,31 @@ export class ProofArtifactManager {
       };
     }
 
-    // Check 2: Zero-Trust StateTable & Canonical HistorySet Reconstruction from `initialPos` (FR-2.2, FR-9.2)
-    let stateReplayOk = report.stateTable.length > 0;
-    let stateReplayDetail = '';
-    const rebuiltPositions: GoPosition[] = new Array(report.stateTable.length);
+    // Compute reachable node closure from `rootDagNodeId` (including sourceProofNodeId targets)
+    const reachableNodeIds = new Set<number>();
+    let indexingAndTopologyOk = report.proofDagNodes.length > 0;
+    let topologyDetail = '';
 
-    if (!stateReplayOk) {
+    for (let i = 0; i < report.proofDagNodes.length; i++) {
+      if (!report.proofDagNodes[i] || report.proofDagNodes[i].nodeId !== i) {
+        indexingAndTopologyOk = false;
+        topologyDetail = `DAG 节点数组索引 #${i} 与 nodeId=${report.proofDagNodes[i]?.nodeId} 不一致`;
+        recordFailure('LP-T01', i);
+        break;
+      }
+    }
+
+    // Check 2: Zero-Trust StateTable & Canonical HistorySet Reconstruction (when not compact DAG)
+    let stateReplayOk = isCompactDag ? true : report.stateTable.length > 0;
+    let stateReplayDetail = '';
+    const rebuiltPositions: GoPosition[] = isCompactDag
+      ? []
+      : new Array(report.stateTable.length);
+
+    if (isCompactDag) {
+      stateReplayDetail =
+        '紧凑 DAG 模式（无外置 StateTable）：由独立 Checker 从初始局面按 DAG 边递归全量重放状态、历史集与令牌掩码。';
+    } else if (!stateReplayOk) {
       stateReplayDetail = 'StateTable 为空，无法从初始局面恢复可达状态。';
       recordFailure('LP-S02');
     } else {
@@ -954,6 +1738,16 @@ export class ProofArtifactManager {
             stateReplayOk = false;
             stateReplayDetail = `State #${s} 的 parentStateId=${st.parentStateId} 越界或非拓扑前驱`;
             recordFailure('LP-S02');
+            break;
+          }
+          if (
+            st.moveFromParent !== PASS_MOVE &&
+            allowedRegionSet !== null &&
+            !allowedRegionSet.has(st.moveFromParent)
+          ) {
+            stateReplayOk = false;
+            stateReplayDetail = `State #${s} 的转移着法 move=${st.moveFromParent} 超出题目声明的合法 region 集合`;
+            recordFailure('LP-S11');
             break;
           }
           expectedPos = rebuiltPositions[st.parentStateId].clone();
@@ -989,10 +1783,9 @@ export class ProofArtifactManager {
 
         rebuiltPositions[s] = expectedPos;
       }
-    }
-
-    if (stateReplayOk) {
-      stateReplayDetail = `从初始输入严格回放验证全部 ${rebuiltPositions.length} 个可达状态、不可复活令牌掩码与 SSK/PSK HistorySet`;
+      if (stateReplayOk) {
+        stateReplayDetail = `从初始输入严格回放验证全部 ${rebuiltPositions.length} 个可达状态、不可复活令牌掩码与 SSK/PSK HistorySet`;
+      }
     }
 
     auditChecks.push({
@@ -1003,24 +1796,9 @@ export class ProofArtifactManager {
       detail: stateReplayDetail,
     });
 
-    // Compute reachable node closure from `rootDagNodeId` (including sourceProofNodeId targets)
-    const reachableNodeIds = new Set<number>();
-    let indexingAndTopologyOk = report.proofDagNodes.length > 0;
-    let topologyDetail = '';
-
-    for (let i = 0; i < report.proofDagNodes.length; i++) {
-      if (!report.proofDagNodes[i] || report.proofDagNodes[i].nodeId !== i) {
-        indexingAndTopologyOk = false;
-        topologyDetail = `DAG 节点数组索引 #${i} 与 nodeId=${report.proofDagNodes[i]?.nodeId} 不一致`;
-        recordFailure('LP-T01', i);
-        break;
-      }
-    }
-
     // Check 3: Post-order topological acyclicity, LP-N15 (0, SAT)/(SAT, 0), & AND/OR role binding
     let lpN15AndRoleOk = indexingAndTopologyOk;
     if (indexingAndTopologyOk) {
-      // Verify topological acyclicity & saturation on ALL nodes in DAG (and collect reachable closure)
       const queue: number[] = [];
       if (
         report.rootDagNodeId >= 0 &&
@@ -1071,7 +1849,6 @@ export class ProofArtifactManager {
         }
       }
 
-      // Also check global node array saturation & post-order so fault-injected nodes are caught immediately
       for (const node of report.proofDagNodes) {
         if (!lpN15AndRoleOk) break;
         if (node.outcome === ProofOutcome.ProvenWin) {
@@ -1104,7 +1881,7 @@ export class ProofArtifactManager {
           }
         }
 
-        if (stateReplayOk && reachableNodeIds.has(node.nodeId)) {
+        if (!isCompactDag && stateReplayOk && reachableNodeIds.has(node.nodeId)) {
           const pos = rebuiltPositions[node.stateId];
           if (!pos) {
             lpN15AndRoleOk = false;
@@ -1135,8 +1912,80 @@ export class ProofArtifactManager {
       detail: topologyDetail,
     });
 
-    // Check 4: Independent Terminal Leaf Evaluation + Edge Legality + Full Legal-Move Coverage
-    const effectiveRegionCoords = report.regionCoords ?? [];
+    // Compact DAG path (e.g., C++ CLI exported lproof/1 without StateTable)
+    if (isCompactDag) {
+      const stats = {
+        verifiedStates: 0,
+        verifiedLeaves: 0,
+        verifiedUniversals: 0,
+        replayedPruned: 0,
+        replayedTt: 0,
+      };
+      let compactOk = chk01Passed && lpN15AndRoleOk;
+      let compactDetail = '';
+      if (!compactOk) {
+        compactDetail = '前置校验未通过，中止紧凑 DAG 递归重放。';
+      } else {
+        const res = this.verifyCompactDagRecursive(
+          initialPos.clone(),
+          effectiveRegionCoords,
+          allowedRegionSet,
+          context,
+          report,
+          report.rootDagNodeId,
+          independentTerminal,
+          0,
+          stats,
+          recordFailure
+        );
+        compactOk = res.ok;
+        compactDetail = res.ok
+          ? `递归重放验证 ${stats.verifiedStates} 个状态、${stats.verifiedLeaves} 个终局叶与 ${stats.verifiedUniversals} 个全称节点（region=${effectiveRegionCoords.length} 点）`
+          : res.detail;
+      }
+
+      auditChecks.push({
+        checkId: 'CHK-04',
+        requirementRef: 'FR-3.1..FR-3.8 / FR-4.2 / FR-9.2',
+        title: '可达终局叶独立重算、走子合法性、区域约束与全称覆盖核验',
+        passed: compactOk,
+        detail: compactDetail,
+      });
+
+      auditChecks.push({
+        checkId: 'CHK-05',
+        requirementRef: 'FR-5.5 / FR-5.6 / FR-6.9 / FR-9.3',
+        title: 'OutsideRZRevalidated 与 TT 证明复用独立语义闭包重放',
+        passed: compactOk,
+        detail: compactOk
+          ? `独立语义重放通过 ${stats.replayedPruned} 个 OutsideRZRevalidated 节点与 ${stats.replayedTt} 个 TT 复用节点`
+          : compactDetail,
+      });
+
+      const allPassed = auditChecks.every((chk) => chk.passed);
+      return {
+        passed: allPassed,
+        schemaVersion: 'lproof/1',
+        jcsSha256Checksum: report.proofChecksum,
+        verifiedNodes: reachableNodeIds.size,
+        verifiedStates: stats.verifiedStates,
+        verifiedHistories: stats.verifiedStates,
+        replayedPrunedCertificates: stats.replayedPruned,
+        replayedTtHits: stats.replayedTt,
+        failedNodeId: failedNode,
+        errorCode: allPassed
+          ? 'PASS'
+          : firstErrorCode === 'PASS'
+          ? 'LP-S01'
+          : firstErrorCode,
+        message: allPassed
+          ? `PASS — 独立 Proof Checker 完成紧凑 lproof/1 全图递归重放、区域约束与终局校验（region=${effectiveRegionCoords.length} 点）`
+          : `FAIL (${firstErrorCode}) — 独立证明校验拒绝无效或不完备证书`,
+        auditChecks,
+      };
+    }
+
+    // Check 4: Independent Terminal Leaf Evaluation + Region & Edge Legality + Full Legal-Move Coverage
     let semanticsOk = stateReplayOk && lpN15AndRoleOk;
     let semanticsDetail = '';
     let verifiedLeafCount = 0;
@@ -1185,6 +2034,20 @@ export class ProofArtifactManager {
               semanticsOk = false;
               semanticsDetail = `内部节点 #${node.nodeId} 存在重复着法边 move=${mv}`;
               recordFailure('LP-N11', node.nodeId);
+              break;
+            }
+            // R3 F1: EVERY proof edge (including existential witnesses) must lie inside declared region or be PASS
+            if (
+              mv !== PASS_MOVE &&
+              allowedRegionSet !== null &&
+              !allowedRegionSet.has(mv)
+            ) {
+              semanticsOk = false;
+              semanticsDetail = `内部节点 #${node.nodeId} 的着法边 ${coordToSgf(
+                mv,
+                pos.boardSize
+              )} (move=${mv}) 超出题目声明的合法 region 集合`;
+              recordFailure('LP-S11', node.nodeId);
               break;
             }
             const stepPos = pos.clone();
@@ -1271,13 +2134,13 @@ export class ProofArtifactManager {
     }
 
     if (semanticsOk) {
-      semanticsDetail = `独立验证 ${verifiedLeafCount} 个可达终局叶节点与 ${verifiedUniversalCount} 个全称节点的完整合法应手覆盖（region=${effectiveRegionCoords.length} 点）`;
+      semanticsDetail = `独立验证 ${verifiedLeafCount} 个可达终局叶节点与 ${verifiedUniversalCount} 个全称节点的区域约束与完整合法应手覆盖（region=${effectiveRegionCoords.length} 点）`;
     }
 
     auditChecks.push({
       checkId: 'CHK-04',
       requirementRef: 'FR-3.1..FR-3.8 / FR-4.2 / FR-9.2',
-      title: '可达终局叶独立重算、走子合法性与全称节点完整应手覆盖核验',
+      title: '可达终局叶独立重算、区域约束与全称节点完整应手覆盖核验',
       passed: semanticsOk,
       detail: semanticsDetail,
     });
@@ -1288,7 +2151,6 @@ export class ProofArtifactManager {
     let replayedPrunedCount = 0;
     let replayedTtCount = 0;
 
-    // Also reject any node in the array marked `isPrunedOutsideRz` whose certificate struct is missing/tampered
     for (const n of report.proofDagNodes) {
       if (n.isPrunedOutsideRz) {
         if (
@@ -1370,7 +2232,7 @@ export class ProofArtifactManager {
         ? 'LP-S01'
         : firstErrorCode,
       message: allPassed
-        ? `PASS — 独立 Proof Checker 完成状态可达重建、全称合法着覆盖与 RZ/TT 语义重放（覆盖 region=${effectiveRegionCoords.length} 点）`
+        ? `PASS — 独立 Proof Checker 完成状态可达重建、区域约束、全称合法着覆盖与 RZ/TT 语义重放（覆盖 region=${effectiveRegionCoords.length} 点）`
         : `FAIL (${firstErrorCode}) — 独立证明校验拒绝无效或不完备证书`,
       auditChecks,
     };

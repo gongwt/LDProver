@@ -11,6 +11,7 @@
 #define LDPROVER_SEARCH_DFPN_SOLVER_H_
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -22,6 +23,9 @@
 #include "ldprover/tt/transposition_table.h"
 
 namespace ldprover {
+
+inline constexpr uint32_t kInvalidDagNodeId =
+    std::numeric_limits<uint32_t>::max();
 
 struct SolverConfig {
   uint32_t max_nodes = 10000;
@@ -49,7 +53,7 @@ struct ProofDagNode {
   EvidenceKind terminal_evidence = EvidenceKind::kNone;
   bool is_pruned_outside_rz = false;
   bool is_tt_hit = false;
-  uint32_t source_proof_node_id = 0;
+  uint32_t source_proof_node_id = kInvalidDagNodeId;
   ProofCertificateRZ<N> proof_rz{};
   ProofCertificateRZ<N> disproof_rz{};
   std::vector<uint32_t> child_node_ids;
@@ -58,6 +62,7 @@ struct ProofDagNode {
 
 template <int N = kDefaultBoardSize>
 struct SolveReport {
+  std::string problem_id;
   uint64_t input_hash = 0;
   std::optional<BitBoard<N>> region_hint;
   ProofOutcome root_status = ProofOutcome::kUnknown;
@@ -78,7 +83,7 @@ struct SolveReport {
   ProofCertificateRZ<N> root_disproof_rz{};
   std::vector<int16_t> principal_variation;
   std::vector<ProofDagNode<N>> proof_dag_nodes;
-  uint32_t root_dag_node_id = 0;
+  uint32_t root_dag_node_id = kInvalidDagNodeId;
 };
 
 template <int N = kDefaultBoardSize>
@@ -89,7 +94,8 @@ class DfpnSolver {
   SolveReport<N> Solve(const Position<N>& initial_pos,
                        const ProofContext& context,
                        const std::optional<BitBoard<N>>& region_hint =
-                           std::nullopt);
+                           std::nullopt,
+                       const std::string& problem_id = "");
 
  private:
   struct SearchChild {
@@ -101,10 +107,12 @@ class DfpnSolver {
     bool expanded = false;
     bool pruned_outside_rz = false;
     bool ko_dependent = false;
-    uint32_t dag_node_id = 0;
+    uint32_t dag_node_id = kInvalidDagNodeId;
     ProofCertificateRZ<N> proof_rz{};
     ProofCertificateRZ<N> disproof_rz{};
   };
+
+  bool IsMemoryBudgetExceeded() const noexcept;
 
   void MidSearch(Position<N>& pos, const ProofContext& context,
                  const std::optional<BitBoard<N>>& region_hint,

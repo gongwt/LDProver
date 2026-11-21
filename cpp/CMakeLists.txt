@@ -55,10 +55,6 @@ add_executable(tprover
   src/cli/tprover_main.cc
 )
 target_link_libraries(tprover PRIVATE
-  ldprover_core
-  ldprover_terminal
-  ldprover_rz
-  ldprover_tt
   ldprover_dfpn
   ldprover_proof
 )

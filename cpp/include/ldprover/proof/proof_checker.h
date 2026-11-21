@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "ldprover/core/position.h"
+#include "ldprover/core/problem_parser.h"
 #include "ldprover/core/types.h"
 #include "ldprover/search/dfpn_solver.h"
 
@@ -52,16 +53,21 @@ class ProofArtifactManager {
   // FR-9.1, FR-9.2, FR-9.3: Zero-trust Independent Proof Checker.
   // Replays every reachable state transition from `initial_pos`, verifies
   // SSK/PSK HistorySet, Benson UCA / token capture terminal evidence at leaves,
-  // complete legal-move coverage at universal nodes, and full recursive
-  // semantic replay of OutsideRZRevalidated / TT certificates.
+  // complete legal-move coverage at universal nodes, declared region membership
+  // on every proof edge, and full recursive semantic replay of
+  // OutsideRZRevalidated / TT certificates.
   VerificationReport VerifyProofDag(const Position<N>& initial_pos,
                                     const ProofContext& context,
                                     const SolveReport<N>& report) const;
 
-  // Standalone process-independent verifier reconstructing initial Position<N>,
-  // ProofContext, and SolveReport<N> strictly from a serialized `.lproof.json`
-  // text payload and validating its RFC 8785 JCS SHA-256 checksum + full DAG.
-  VerificationReport VerifyLProofJsonString(const std::string& json_text) const;
+  // Standalone process-independent verifier reconstructing initial Position<N>
+  // (including traced sub-positions via zero-trust move replay), ProofContext,
+  // and SolveReport<N> strictly from a serialized `.lproof.json` text payload,
+  // validating its RFC 8785 JCS SHA-256 checksum, optional external problem
+  // binding (`expected_problem`), and full proof DAG.
+  VerificationReport VerifyLProofJsonString(
+      const std::string& json_text,
+      const ParsedProblem<N>* expected_problem = nullptr) const;
 };
 
 }  // namespace ldprover
