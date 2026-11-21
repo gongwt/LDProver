@@ -224,9 +224,13 @@ export class TranspositionStore {
   // FR-6.3, FR-6.4: Two-grade PatternTT lookup projecting position onto stored RZ
   public lookupPatternTT(
     pos: GoPosition,
-    context: ProofContext
+    context: ProofContext,
+    revalidateSubtreeFn?: (dagNodeId: number, outcome: ProofOutcome) => boolean
   ): { grade: PatternHitGrade; record: RadixPatternRecord | null } {
-    const queryMonotonic = pos.isCaptureFreeMonotonicHistory();
+    let firstHeuristicRecord: RadixPatternRecord | null = null;
+    let revalAttempts = 0;
+    const maxRevalAttempts = 6;
+
     for (let idx = this.patternRecords.length - 1; idx >= 0; idx--) {
       const rec = this.patternRecords[idx];
       if (
@@ -264,8 +268,7 @@ export class TranspositionStore {
       this.patternHits++;
 
       // Check full board + HistorySet equality for direct ProofReusable grade (FR-6.3, FR-6.9);
-      // any outside-RZ stone difference returns HEURISTIC_ONLY so DfpnSolver runs full
-      // RevalidateSourceProofOnQueryState before accepting proof reuse.
+      // any outside-RZ stone difference requires RevalidateSourceProofOnQueryState before proof reuse.
       let fullHistEqual =
         pos.historySnapshots.length === rec.historySnapshots.length &&
         pos.historySnapshots.length > 0 &&
@@ -294,9 +297,31 @@ export class TranspositionStore {
         return { grade: 'PROOF_REUSABLE', record: rec };
       }
 
-      return { grade: 'HEURISTIC_ONLY', record: rec };
+      if (
+        revalidateSubtreeFn &&
+        rec.proofClosureAvailable &&
+        !rec.ghiFlag &&
+        rec.proofDagNodeId >= 0 &&
+        revalAttempts < maxRevalAttempts
+      ) {
+        revalAttempts++;
+        if (revalidateSubtreeFn(rec.proofDagNodeId, rec.outcome)) {
+          this.patternProofReusableHits++;
+          return { grade: 'PROOF_REUSABLE', record: rec };
+        }
+      }
+
+      if (!firstHeuristicRecord) {
+        firstHeuristicRecord = rec;
+      }
+      if (revalAttempts >= maxRevalAttempts) {
+        break;
+      }
     }
 
+    if (firstHeuristicRecord) {
+      return { grade: 'HEURISTIC_ONLY', record: firstHeuristicRecord };
+    }
     return { grade: 'MISS', record: null };
   }
 

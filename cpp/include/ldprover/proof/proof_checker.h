@@ -10,6 +10,7 @@
 #define LDPROVER_PROOF_PROOF_CHECKER_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -20,10 +21,22 @@
 
 namespace ldprover {
 
+enum class VerificationScope : uint8_t {
+  kOriginalRoot = 0,
+  kTracedWithinRules = 1,
+  kFreeExploration = 2,
+};
+
 struct VerificationReport {
   bool passed = false;
   std::string schema_version = "lproof/1";
   std::string jcs_sha256_checksum;
+  std::string canonical_dag_checksum;
+  std::string encoding_mode;
+  std::string verified_scope;
+  std::string verified_root_kind;
+  bool trace_outside_region = false;
+  bool trace_has_restricted_ko_capture = false;
   uint32_t verified_nodes = 0;
   uint32_t verified_states = 0;
   uint32_t verified_histories = 0;
@@ -54,20 +67,23 @@ class ProofArtifactManager {
   // Replays every reachable state transition from `initial_pos`, verifies
   // SSK/PSK HistorySet, Benson UCA / token capture terminal evidence at leaves,
   // complete legal-move coverage at universal nodes, declared region membership
-  // on every proof edge, and full recursive semantic replay of
-  // OutsideRZRevalidated / TT certificates.
+  // on every proof edge, top-level bestMove binding, and full recursive semantic
+  // replay of OutsideRZRevalidated / TT certificates.
   VerificationReport VerifyProofDag(const Position<N>& initial_pos,
                                     const ProofContext& context,
                                     const SolveReport<N>& report) const;
 
   // Standalone process-independent verifier reconstructing initial Position<N>
   // (including traced sub-positions via zero-trust move replay), ProofContext,
-  // and SolveReport<N> strictly from a serialized `.lproof.json` text payload,
-  // validating its RFC 8785 JCS SHA-256 checksum, optional external problem
-  // binding (`expected_problem`), and full proof DAG.
+  // full optional StateTable/HistoryTable/SnapshotPool, and SolveReport<N>
+  // strictly from a serialized `.lproof.json` text payload, validating its
+  // RFC 8785 JCS SHA-256 checksum, optional external problem binding
+  // (`expected_problem`), explicit proposition scope (`scope_override`), and
+  // full proof DAG.
   VerificationReport VerifyLProofJsonString(
       const std::string& json_text,
-      const ParsedProblem<N>* expected_problem = nullptr) const;
+      const ParsedProblem<N>* expected_problem = nullptr,
+      std::optional<VerificationScope> scope_override = std::nullopt) const;
 };
 
 }  // namespace ldprover

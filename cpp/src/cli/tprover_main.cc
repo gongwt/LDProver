@@ -7,9 +7,11 @@
 // 2=rejected/missing file/artifact/check failure, 3=internal error).
 
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -100,6 +102,51 @@ std::string OutcomeLabel(ldprover::ProofOutcome outcome) {
   return "UNKNOWN";
 }
 
+std::string UnknownReasonLabel(ldprover::UnknownReason reason) {
+  switch (reason) {
+    case ldprover::UnknownReason::kNone:
+      return "none";
+    case ldprover::UnknownReason::kTimeout:
+      return "timeout";
+    case ldprover::UnknownReason::kKoDependent:
+      return "ko_dependent";
+    case ldprover::UnknownReason::kCycle:
+      return "cycle";
+    case ldprover::UnknownReason::kNodeLimit:
+      return "node_limit";
+    case ldprover::UnknownReason::kDepthLimit:
+      return "depth_limit";
+    case ldprover::UnknownReason::kMemoryBudget:
+      return "memory_budget";
+    case ldprover::UnknownReason::kWideningStalled:
+      return "widening_stalled";
+    case ldprover::UnknownReason::kInternalError:
+      return "internal_error";
+  }
+  return "none";
+}
+
+bool ParseStrictPositiveDouble(const char* raw, double* out_val) {
+  if (raw == nullptr || *raw == '\0') return false;
+  char* endptr = nullptr;
+  const double v = std::strtod(raw, &endptr);
+  if (endptr == raw || *endptr != '\0') return false;
+  if (!std::isfinite(v) || v <= 0.0) return false;
+  *out_val = v;
+  return true;
+}
+
+bool ParseStrictPositiveU32(const char* raw, uint32_t* out_val) {
+  if (raw == nullptr || *raw == '\0' || raw[0] == '-') return false;
+  char* endptr = nullptr;
+  const unsigned long v = std::strtoul(raw, &endptr, 10);
+  if (endptr == raw || *endptr != '\0' || v == 0UL || v > 0xFFFFFFFFUL) {
+    return false;
+  }
+  *out_val = static_cast<uint32_t>(v);
+  return true;
+}
+
 int RunSolveCommand(int argc, char* argv[]) {
   std::string problem_path;
   std::string out_proof_path;
@@ -125,10 +172,31 @@ int RunSolveCommand(int argc, char* argv[]) {
         return 2;
       }
     } else if (arg == "--node-limit" && i + 1 < argc) {
-      config.max_nodes = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+      if (!ParseStrictPositiveU32(argv[++i], &config.max_nodes)) {
+        std::cerr << "[LDProver] Invalid positive integer for --node-limit\n";
+        return 2;
+      }
+    } else if (arg == "--max-depth" && i + 1 < argc) {
+      if (!ParseStrictPositiveU32(argv[++i], &config.max_depth)) {
+        std::cerr << "[LDProver] Invalid positive integer for --max-depth\n";
+        return 2;
+      }
+    } else if (arg == "--widening-base-k" && i + 1 < argc) {
+      if (!ParseStrictPositiveU32(argv[++i], &config.widening_base_k)) {
+        std::cerr
+            << "[LDProver] Invalid positive integer for --widening-base-k\n";
+        return 2;
+      }
     } else if (arg == "--memory-budget" && i + 1 < argc) {
-      const uint64_t mb = std::strtoull(argv[++i], nullptr, 10);
-      config.memory_budget_bytes = mb * 1024ULL * 1024ULL;
+      double mb = 0.0;
+      if (!ParseStrictPositiveDouble(argv[++i], &mb)) {
+        std::cerr << "[LDProver] Invalid positive number (MiB) for "
+                     "--memory-budget\n";
+        return 2;
+      }
+      const double bytes_d = std::floor(mb * 1024.0 * 1024.0);
+      config.memory_budget_bytes =
+          (bytes_d < 1.0) ? 1ULL : static_cast<uint64_t>(bytes_d);
     } else {
       std::cerr << "[LDProver] Unknown or incomplete solve option: " << arg
                 << "\n";
@@ -196,6 +264,8 @@ int RunSolveCommand(int argc, char* argv[]) {
   std::cout << "{\"solverVersion\":\"LDProver-1.8.2\",\"problemId\":\""
             << prob_id << "\",\"rootStatus\":\""
             << OutcomeLabel(report.root_status)
+            << "\",\"unknownReason\":\""
+            << UnknownReasonLabel(report.unknown_reason)
             << "\",\"bestMove\":" << report.best_move
             << ",\"numNodes\":" << report.num_nodes
             << ",\"prunedOutsideRz\":" << report.pruned_outside_rz_count
@@ -205,9 +275,10 @@ int RunSolveCommand(int argc, char* argv[]) {
 }
 
 template <int N>
-int ExecuteCheckForBoardSize(const std::string& proof_json,
-                             const std::string& problem_path,
-                             ldprover::VerificationReport* out_ver) {
+int ExecuteCheckForBoardSize(
+    const std::string& proof_json, const std::string& problem_path,
+    std::optional<ldprover::VerificationScope> scope_override,
+    ldprover::VerificationReport* out_ver) {
   ldprover::ProofArtifactManager<N> mgr;
   if (!problem_path.empty()) {
     std::string raw_problem_json;
@@ -225,27 +296,45 @@ int ExecuteCheckForBoardSize(const std::string& proof_json,
                 << "\"message\":\"" << parsed.error_message << "\"}\n";
       return 2;
     }
-    *out_ver = mgr.VerifyLProofJsonString(proof_json, &parsed);
+    *out_ver = mgr.VerifyLProofJsonString(proof_json, &parsed, scope_override);
     return 0;
   }
-  *out_ver = mgr.VerifyLProofJsonString(proof_json, nullptr);
+  *out_ver = mgr.VerifyLProofJsonString(proof_json, nullptr, scope_override);
   return 0;
 }
 
 int RunCheckCommand(int argc, char* argv[]) {
   std::string proof_path;
   std::string problem_path;
+  bool allow_subposition = false;
+  bool free_exploration = false;
   for (int i = 2; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--proof" && i + 1 < argc) {
       proof_path = argv[++i];
     } else if (arg == "--problem" && i + 1 < argc) {
       problem_path = argv[++i];
+    } else if (arg == "--allow-subposition") {
+      allow_subposition = true;
+    } else if (arg == "--free-exploration") {
+      free_exploration = true;
     } else {
       std::cerr << "[LDProver] Unknown or incomplete check option: " << arg
                 << "\n";
       return 2;
     }
+  }
+
+  if (allow_subposition && free_exploration) {
+    std::cerr << "[LDProver] --allow-subposition and --free-exploration are "
+                 "mutually exclusive.\n";
+    return 2;
+  }
+  std::optional<ldprover::VerificationScope> scope_override;
+  if (allow_subposition) {
+    scope_override = ldprover::VerificationScope::kTracedWithinRules;
+  } else if (free_exploration) {
+    scope_override = ldprover::VerificationScope::kFreeExploration;
   }
 
   if (proof_path.empty()) {
@@ -263,11 +352,14 @@ int RunCheckCommand(int argc, char* argv[]) {
   ldprover::VerificationReport ver;
   int prep_rc = 0;
   if (bs == 5) {
-    prep_rc = ExecuteCheckForBoardSize<5>(proof_json, problem_path, &ver);
+    prep_rc = ExecuteCheckForBoardSize<5>(proof_json, problem_path,
+                                          scope_override, &ver);
   } else if (bs == 7) {
-    prep_rc = ExecuteCheckForBoardSize<7>(proof_json, problem_path, &ver);
+    prep_rc = ExecuteCheckForBoardSize<7>(proof_json, problem_path,
+                                          scope_override, &ver);
   } else if (bs == 19) {
-    prep_rc = ExecuteCheckForBoardSize<19>(proof_json, problem_path, &ver);
+    prep_rc = ExecuteCheckForBoardSize<19>(proof_json, problem_path,
+                                           scope_override, &ver);
   } else {
     std::cerr << "[LDProver] Unsupported boardSize in proof JSON.\n";
     return 2;
@@ -278,9 +370,19 @@ int RunCheckCommand(int argc, char* argv[]) {
             << ",\"errorCode\":\"" << ver.error_code
             << "\",\"message\":\"" << ver.message
             << "\",\"verifiedNodes\":" << ver.verified_nodes
+            << ",\"verifiedStates\":" << ver.verified_states
             << ",\"replayedPrunedCertificates\":"
             << ver.replayed_pruned_certificates
-            << ",\"checksum\":\"" << ver.jcs_sha256_checksum << "\"}\n";
+            << ",\"encodingMode\":\"" << ver.encoding_mode
+            << "\",\"verifiedScope\":\"" << ver.verified_scope
+            << "\",\"verifiedRootKind\":\"" << ver.verified_root_kind
+            << "\",\"traceOutsideRegion\":"
+            << (ver.trace_outside_region ? "true" : "false")
+            << ",\"traceHasRestrictedKoCapture\":"
+            << (ver.trace_has_restricted_ko_capture ? "true" : "false")
+            << ",\"checksum\":\"" << ver.jcs_sha256_checksum
+            << "\",\"canonicalDagChecksum\":\"" << ver.canonical_dag_checksum
+            << "\"}\n";
   return ver.passed ? 0 : 2;
 }
 
@@ -382,8 +484,10 @@ int main(int argc, char* argv[]) {
   if (argc < 2) {
     std::cerr << "Usage: tprover <solve|check|bench> [options]\n"
               << "  solve --problem <file.json> [--out-proof <proof.json>] "
-              << "[--mode board-tt|pattern-tt] [--node-limit <N>]\n"
-              << "  check --proof <proof.json> [--problem <original.json>]\n"
+              << "[--mode board-tt|pattern-tt] [--node-limit <N>] "
+              << "[--memory-budget <MiB>]\n"
+              << "  check --proof <proof.json> [--problem <original.json>] "
+              << "[--allow-subposition | --free-exploration]\n"
               << "  bench --manifest <benchmark_manifest.json> [--out <out.csv>]\n";
     return 2;
   }

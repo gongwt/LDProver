@@ -18,7 +18,8 @@ BitBoard<N> BensonTerminalEvaluator<N>::ComputeUnconditionalAlive(
     const Position<N>& pos, Color color,
     std::vector<StoneChainInfo<N>>* out_chains,
     std::vector<EyeSpaceRegion<N>>* out_regions,
-    BitBoard<N>* out_vital_rz) const {
+    BitBoard<N>* out_vital_rz,
+    const BitBoard<N>* target_anchor_mask) const {
   std::vector<StoneChainInfo<N>> chains;
   std::vector<EyeSpaceRegion<N>> regions;
   BitBoard<N> visited_stones;
@@ -159,12 +160,55 @@ BitBoard<N> BensonTerminalEvaluator<N>::ComputeUnconditionalAlive(
   for (uint16_t cid : active_chains) {
     chains[cid].is_uca_alive = true;
     uca_stones |= chains[cid].stones;
-    vital_rz |= chains[cid].stones;
+  }
+
+  // Minimal target-anchored vital_rz (excludes unrelated alive chains & outer immortal walls).
+  std::vector<uint16_t> rz_queue;
+  std::vector<bool> visited_rz_chain(chains.size(), false);
+  if (target_anchor_mask != nullptr && target_anchor_mask->Any()) {
+    for (uint16_t cid : active_chains) {
+      if ((chains[cid].stones & *target_anchor_mask).Any() &&
+          !visited_rz_chain[cid]) {
+        visited_rz_chain[cid] = true;
+        rz_queue.push_back(cid);
+      }
+    }
+  }
+  if (rz_queue.empty()) {
+    for (uint16_t cid : active_chains) {
+      if (!is_immortal_chain[cid] && !visited_rz_chain[cid]) {
+        visited_rz_chain[cid] = true;
+        rz_queue.push_back(cid);
+      }
+    }
+  }
+
+  for (size_t q_idx = 0; q_idx < rz_queue.size(); ++q_idx) {
+    const uint16_t cid = rz_queue[q_idx];
+    if (!is_immortal_chain[cid]) {
+      vital_rz |= chains[cid].stones;
+    }
     for (uint16_t rid : chains[cid].vital_eye_region_ids) {
-      vital_rz |= regions[rid].empty_points;
-      vital_rz |= regions[rid].enemy_stones;
-      for (uint16_t bcid : regions[rid].boundary_chain_ids) {
-        vital_rz |= chains[bcid].stones;
+      const auto& reg = regions[rid];
+      vital_rz |= reg.empty_points;
+      vital_rz |= reg.enemy_stones;
+      const BitBoard<N> reg_area = reg.empty_points | reg.enemy_stones;
+      for (uint16_t bcid : reg.boundary_chain_ids) {
+        if (!is_immortal_chain[bcid]) {
+          if (!visited_rz_chain[bcid]) {
+            visited_rz_chain[bcid] = true;
+            rz_queue.push_back(bcid);
+          }
+        } else {
+          // Include only immortal boundary stones directly adjacent to the vital region.
+          for (int pt : reg_area.ToCoords()) {
+            for (int nb : pos.OrthogonalNeighbors(pt)) {
+              if (chains[bcid].stones.Get(nb)) {
+                vital_rz.Set(nb, true);
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -190,15 +234,7 @@ TerminalEvaluationResult<N> BensonTerminalEvaluator<N>::EvaluateTerminal(
     return res;
   }
 
-  const Color target_color = context.initial_tokens.front().stone_color;
-  std::vector<StoneChainInfo<N>> chains;
-  std::vector<EyeSpaceRegion<N>> regions;
-  BitBoard<N> vital_rz;
-  const BitBoard<N> uca_stones = ComputeUnconditionalAlive(
-      pos, target_color, &chains, &regions, &vital_rz);
-  res.benson_alive_stones = uca_stones;
-
-  // Evaluate per-group survival and Benson UCA status using three-valued logic.
+  // Pre-check surviving target tokens and 2-liberty Benson precondition before full UCA.
   const uint64_t surviving_mask = pos.SurvivingTargetTokensMask();
   uint8_t max_group = 0;
   for (const auto& tok : context.initial_tokens) {
@@ -206,42 +242,89 @@ TerminalEvaluationResult<N> BensonTerminalEvaluator<N>::EvaluateTerminal(
   }
 
   std::vector<bool> group_has_surviving_token(max_group + 1, false);
-  std::vector<bool> group_has_uca_token(max_group + 1, false);
+  std::vector<bool> group_has_two_lib_token(max_group + 1, false);
   BitBoard<N> target_chains_rz;
+  BitBoard<N> target_anchor_mask;
 
   for (size_t i = 0; i < context.initial_tokens.size() && i < 64; ++i) {
     const auto& tok = context.initial_tokens[i];
     if ((surviving_mask & (1ULL << i)) != 0 &&
         pos.StoneAt(tok.initial_coord) == tok.stone_color) {
       group_has_surviving_token[tok.group_index] = true;
+      target_anchor_mask.Set(tok.initial_coord, true);
       BitBoard<N> libs;
       BitBoard<N> ch = pos.FloodFillChain(tok.initial_coord, &libs);
       target_chains_rz |= ch | libs;
-      if (uca_stones.Get(tok.initial_coord)) {
-        group_has_uca_token[tok.group_index] = true;
+      if (libs.Count() >= 2 || pos.ImmortalWall().Get(tok.initial_coord)) {
+        group_has_two_lib_token[tok.group_index] = true;
       }
     } else {
       target_chains_rz.Set(tok.initial_coord, true);
     }
   }
 
-  bool target_uca_satisfied = false;
   bool target_all_captured = false;
-
+  bool can_satisfy_benson = false;
   if (context.crucial_stone_op == LogicalOp::kConjunction) {
-    target_uca_satisfied = true;
     target_all_captured = false;
+    can_satisfy_benson = true;
     for (uint8_t g = 0; g <= max_group; ++g) {
-      if (!group_has_uca_token[g]) target_uca_satisfied = false;
       if (!group_has_surviving_token[g]) target_all_captured = true;
+      if (!group_has_two_lib_token[g]) can_satisfy_benson = false;
     }
   } else {
-    // kSingle or kDisjunction ('|' / ',')
-    target_uca_satisfied = false;
     target_all_captured = true;
+    can_satisfy_benson = false;
+    for (uint8_t g = 0; g <= max_group; ++g) {
+      if (group_has_surviving_token[g]) target_all_captured = false;
+      if (group_has_two_lib_token[g]) can_satisfy_benson = true;
+    }
+  }
+
+  // O(1) fast path: captured crucial tokens cannot satisfy Benson UCA.
+  if (target_all_captured) {
+    res.status = (context.attacker_goal == SearchGoal::kToLive)
+                     ? TerminalStatus::kLoss
+                     : TerminalStatus::kWin;
+    res.evidence_kind = EvidenceKind::kTokensCaptured;
+    res.leaf_certificate_rz = target_chains_rz;
+    res.diagnostic_note = "Target crucial_stone tokens captured";
+    return res;
+  }
+
+  const Color target_color = context.initial_tokens.front().stone_color;
+  std::vector<StoneChainInfo<N>> chains;
+  std::vector<EyeSpaceRegion<N>> regions;
+  BitBoard<N> vital_rz;
+  BitBoard<N> uca_stones;
+  if (can_satisfy_benson) {
+    uca_stones = ComputeUnconditionalAlive(
+        pos, target_color, &chains, &regions, &vital_rz, &target_anchor_mask);
+  }
+  res.benson_alive_stones = uca_stones;
+
+  std::vector<bool> group_has_uca_token(max_group + 1, false);
+  if (uca_stones.Any()) {
+    for (size_t i = 0; i < context.initial_tokens.size() && i < 64; ++i) {
+      const auto& tok = context.initial_tokens[i];
+      if ((surviving_mask & (1ULL << i)) != 0 &&
+          pos.StoneAt(tok.initial_coord) == tok.stone_color &&
+          uca_stones.Get(tok.initial_coord)) {
+        group_has_uca_token[tok.group_index] = true;
+      }
+    }
+  }
+
+  bool target_uca_satisfied = false;
+  if (context.crucial_stone_op == LogicalOp::kConjunction) {
+    target_uca_satisfied = true;
+    for (uint8_t g = 0; g <= max_group; ++g) {
+      if (!group_has_uca_token[g]) target_uca_satisfied = false;
+    }
+  } else {
+    target_uca_satisfied = false;
     for (uint8_t g = 0; g <= max_group; ++g) {
       if (group_has_uca_token[g]) target_uca_satisfied = true;
-      if (group_has_surviving_token[g]) target_all_captured = false;
     }
   }
 

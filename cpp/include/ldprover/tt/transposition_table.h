@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -33,6 +34,8 @@ struct BoardTTEntry {
   uint8_t consecutive_passes = 0;
   uint64_t surviving_tokens_mask = 0;
   std::vector<CanonicalSnapshot<N>> history_snapshots;
+  bool source_monotonic_history = false;
+  bool has_capture_in_subtree = false;
 
   uint32_t pn = 1;
   uint32_t dn = 1;
@@ -61,6 +64,8 @@ struct RadixPatternRecord {
   uint64_t surviving_tokens_mask = 0;
   std::vector<CanonicalSnapshot<N>> history_snapshots;
   ProofCertificateRZ<N> stored_rz{};
+  bool source_monotonic_history = false;
+  bool has_capture_in_subtree = false;
   uint32_t pn = 1;
   uint32_t dn = 1;
   ProofOutcome outcome = ProofOutcome::kUnknown;
@@ -73,32 +78,38 @@ struct RadixPatternRecord {
 template <int N = kDefaultBoardSize>
 class TranspositionStore {
  public:
+  using RevalidateFn = std::function<bool(uint32_t, ProofOutcome)>;
+
   TranspositionStore() = default;
 
   // FR-6.2: Clear both tables at the start of every problem (no cross-problem TT).
   void ClearAll() noexcept;
 
-  // FR-6.1: BoardTT lookup with full canonical HistorySet + ProofContext equality.
+  // FR-6.1: BoardTT lookup with monotonic history fast-path + GHI revalidation.
   std::optional<BoardTTEntry<N>> LookupBoardTT(
-      const Position<N>& pos, const ProofContext& context);
+      const Position<N>& pos, const ProofContext& context,
+      const RevalidateFn& revalidate_fn = {});
 
   void StoreBoardTT(const Position<N>& pos, const ProofContext& context,
                     uint32_t pn, uint32_t dn, ProofOutcome outcome,
                     bool is_ko_dependent, bool proof_closure_available,
                     uint32_t proof_dag_node_id,
                     const ProofCertificateRZ<N>& proof_rz,
-                    const ProofCertificateRZ<N>& disproof_rz);
+                    const ProofCertificateRZ<N>& disproof_rz,
+                    bool has_capture_in_subtree = false);
 
-  // FR-6.3, FR-6.4, FR-6.6: Two-grade PatternTT lookup via Radix Tree.
+  // FR-6.3, FR-6.4, FR-6.6: Two-grade PatternTT lookup with multi-candidate revalidation.
   PatternHitGrade LookupPatternTT(
       const Position<N>& pos, const ProofContext& context,
-      RadixPatternRecord<N>* out_record);
+      RadixPatternRecord<N>* out_record,
+      const RevalidateFn& revalidate_fn = {});
 
   void StorePatternTT(const Position<N>& pos, const ProofContext& context,
                       const ProofCertificateRZ<N>& zone, uint32_t pn,
                       uint32_t dn, ProofOutcome outcome,
                       uint32_t proof_dag_node_id,
-                      bool proof_closure_available);
+                      bool proof_closure_available,
+                      bool has_capture_in_subtree = false);
 
   uint64_t BoardHits() const noexcept { return board_hits_; }
   uint64_t PatternHits() const noexcept { return pattern_hits_; }

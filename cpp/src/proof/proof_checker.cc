@@ -1064,6 +1064,72 @@ bool VerifySubgraphRecursive(const Position<N>& pos,
   return true;
 }
 
+std::string VerificationScopeToStr(VerificationScope scope) {
+  switch (scope) {
+    case VerificationScope::kOriginalRoot:
+      return "original_root";
+    case VerificationScope::kTracedWithinRules:
+      return "traced_within_rules";
+    case VerificationScope::kFreeExploration:
+      return "free_exploration";
+  }
+  return "original_root";
+}
+
+template <int N>
+bool ParseBitBoardCoordArray(const JsonValue& arr, BitBoard<N>* out) {
+  if (arr.kind != JsonValue::Kind::kArray) return false;
+  BitBoard<N> bits;
+  for (const auto& elem : arr.arr_val) {
+    if (elem.kind != JsonValue::Kind::kInt || elem.int_val < 0 ||
+        elem.int_val >= N * N) {
+      return false;
+    }
+    bits.Set(static_cast<int>(elem.int_val), true);
+  }
+  *out = bits;
+  return true;
+}
+
+template <int N>
+bool ParseCanonicalSnapshotObj(const JsonValue& v, CanonicalSnapshot<N>* out) {
+  if (v.kind != JsonValue::Kind::kObject) return false;
+  const auto& obj = v.obj_val;
+  const auto it_b = obj.find("blackCoords");
+  const auto it_w = obj.find("whiteCoords");
+  const auto it_t = obj.find("toPlay");
+  const auto it_z = obj.find("zobristHex");
+  if (it_b == obj.end() || it_w == obj.end() || it_t == obj.end() ||
+      it_z == obj.end() || it_z->second.kind != JsonValue::Kind::kString) {
+    return false;
+  }
+  CanonicalSnapshot<N> snap;
+  if (!ParseBitBoardCoordArray<N>(it_b->second, &snap.black_stones) ||
+      !ParseBitBoardCoordArray<N>(it_w->second, &snap.white_stones) ||
+      !ParseColorValue(it_t->second, &snap.to_play) ||
+      !ParseHexU64(it_z->second.str_val, &snap.zobrist_hash)) {
+    return false;
+  }
+  *out = snap;
+  return true;
+}
+
+template <int N>
+bool HistorySnapshotListsEqual(
+    const std::vector<CanonicalSnapshot<N>>& a,
+    const std::vector<CanonicalSnapshot<N>>& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i].black_stones != b[i].black_stones ||
+        a[i].white_stones != b[i].white_stones ||
+        a[i].to_play != b[i].to_play ||
+        a[i].zobrist_hash != b[i].zobrist_hash) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 template <int N>
@@ -1072,6 +1138,7 @@ std::string ProofArtifactManager<N>::SerializeLProofJson(
     const SolveReport<N>& report, std::string* out_checksum) const {
   JsonValue root = JsonValue::MakeObj();
   root.obj_val["magic"] = JsonValue::MakeStr("lproof/1");
+  root.obj_val["encodingMode"] = JsonValue::MakeStr("compact_dag");
   root.obj_val["problemId"] = JsonValue::MakeStr(report.problem_id);
 
   JsonValue ctx_obj = JsonValue::MakeObj();
@@ -1252,6 +1319,13 @@ VerificationReport ProofArtifactManager<N>::VerifyProofDag(
     const SolveReport<N>& report) const {
   VerificationReport ver;
   SerializeLProofJson(initial_pos, context, report, &ver.jcs_sha256_checksum);
+  ver.canonical_dag_checksum = ver.jcs_sha256_checksum;
+  ver.encoding_mode = "compact_dag";
+  ver.verified_root_kind =
+      initial_pos.PlayedMoveTrace().empty() ? "initial" : "traced_subposition";
+  ver.verified_scope = initial_pos.PlayedMoveTrace().empty()
+                           ? "original_root"
+                           : "free_exploration";
 
   if (report.root_status == ProofOutcome::kUnknown) {
     ver.passed = false;
@@ -1373,6 +1447,89 @@ VerificationReport ProofArtifactManager<N>::VerifyProofDag(
     return ver;
   }
 
+  // Verify top-level `report.best_move` binding against the resolved root DAG
+  // node (R4 §4 P1-C: rejects tampered/non-witness/illegal bestMove -> LP-R02).
+  {
+    uint32_t eff_id = report.root_dag_node_id;
+    std::unordered_set<uint32_t> seen_root_hops;
+    while (eff_id < report.proof_dag_nodes.size() &&
+           (report.proof_dag_nodes[eff_id].is_pruned_outside_rz ||
+            report.proof_dag_nodes[eff_id].is_tt_hit)) {
+      if (seen_root_hops.count(eff_id) > 0 ||
+          report.proof_dag_nodes[eff_id].source_proof_node_id >= eff_id) {
+        break;
+      }
+      seen_root_hops.insert(eff_id);
+      eff_id = report.proof_dag_nodes[eff_id].source_proof_node_id;
+    }
+    const auto& eff_root = report.proof_dag_nodes[eff_id];
+    const int16_t bm = report.best_move;
+    if (eff_root.child_moves.empty()) {
+      if (bm != kPassMove && bm != kNullMove) {
+        ver.passed = false;
+        ver.failed_node_id = static_cast<int32_t>(eff_root.node_id);
+        ver.error_code = "LP-R02";
+        ver.message =
+            "Terminal leaf root declares a non-pass top-level bestMove.";
+        return ver;
+      }
+    } else {
+      const bool root_is_or = (initial_pos.ToPlay() == context.root_attacker);
+      const bool existential_root =
+          (root_is_or && eff_root.outcome == ProofOutcome::kProvenWin) ||
+          (!root_is_or && eff_root.outcome == ProofOutcome::kProvenLoss);
+      if (existential_root) {
+        const bool restricted_side =
+            (initial_pos.ToPlay() == context.root_attacker &&
+             !context.attacker_allow_ko) ||
+            (initial_pos.ToPlay() != context.root_attacker &&
+             !context.defender_allow_ko);
+        bool matched_witness = false;
+        for (size_t k = 0; k < eff_root.child_moves.size(); ++k) {
+          if (eff_root.child_moves[k] != bm) continue;
+          const uint32_t cid = eff_root.child_node_ids[k];
+          if (cid >= report.proof_dag_nodes.size() ||
+              report.proof_dag_nodes[cid].outcome != eff_root.outcome) {
+            continue;
+          }
+          if (!IsMoveInAllowedRegion<N>(bm, report.region_hint)) continue;
+          Position<N> probe = initial_pos;
+          bool is_ko_cap = false;
+          if (probe.PlayMove(bm, &is_ko_cap) &&
+              !(is_ko_cap && restricted_side)) {
+            matched_witness = true;
+            break;
+          }
+        }
+        if (!matched_witness) {
+          ver.passed = false;
+          ver.failed_node_id = static_cast<int32_t>(eff_root.node_id);
+          ver.error_code = "LP-R02";
+          ver.message =
+              "Top-level bestMove is not a legal, region-valid, ko-compliant "
+              "verified witness move of the root ProofDagNode.";
+          return ver;
+        }
+      } else {
+        bool is_child_move = false;
+        for (int16_t cmv : eff_root.child_moves) {
+          if (cmv == bm) {
+            is_child_move = true;
+            break;
+          }
+        }
+        if (bm != kPassMove && bm != kNullMove && !is_child_move) {
+          ver.passed = false;
+          ver.failed_node_id = static_cast<int32_t>(eff_root.node_id);
+          ver.error_code = "LP-R02";
+          ver.message =
+              "Top-level bestMove on universal root is not a valid child move.";
+          return ver;
+        }
+      }
+    }
+  }
+
   // Zero-trust full recursive DAG verification from `initial_pos`.
   BensonTerminalEvaluator<N> independent_terminal;
   if (!VerifySubgraphRecursive<N>(initial_pos, context, report,
@@ -1386,21 +1543,31 @@ VerificationReport ProofArtifactManager<N>::VerifyProofDag(
   ver.error_code = "PASS";
   ver.message =
       "All reachable lproof/1 nodes, SSK/PSK HistorySets, universal move "
-      "obligations, Classic Benson leaves, and RZ certificates verified.";
+      "obligations, Classic Benson leaves, root bestMove, and RZ certificates "
+      "verified.";
   return ver;
 }
 
 template <int N>
 VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
     const std::string& json_text,
-    const ParsedProblem<N>* expected_problem) const {
+    const ParsedProblem<N>* expected_problem,
+    std::optional<VerificationScope> scope_override) const {
   VerificationReport ver;
+  const VerificationScope effective_scope =
+      scope_override.has_value()
+          ? *scope_override
+          : (expected_problem != nullptr ? VerificationScope::kOriginalRoot
+                                         : VerificationScope::kFreeExploration);
+  ver.verified_scope = VerificationScopeToStr(effective_scope);
+
   JsonValue root;
   JsonParser parser(json_text);
   if (!parser.ParseDocument(&root) || root.kind != JsonValue::Kind::kObject) {
     ver.passed = false;
     ver.error_code = "LP-J01";
-    ver.message = "Malformed JSON syntax or non-object root in standalone lproof/1 file.";
+    ver.message =
+        "Malformed JSON syntax or non-object root in standalone lproof/1 file.";
     return ver;
   }
 
@@ -1427,10 +1594,37 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
     return ver;
   }
 
+  const bool has_state_table =
+      (root.obj_val.find("stateTable") != root.obj_val.end());
+  std::string encoding_mode =
+      has_state_table ? "full_state_table" : "compact_dag";
+  if (const auto it_em = root.obj_val.find("encodingMode");
+      it_em != root.obj_val.end()) {
+    if (it_em->second.kind != JsonValue::Kind::kString ||
+        (it_em->second.str_val != "full_state_table" &&
+         it_em->second.str_val != "compact_dag")) {
+      ver.passed = false;
+      ver.error_code = "LP-J02";
+      ver.message = "Invalid encodingMode in lproof/1 file.";
+      return ver;
+    }
+    encoding_mode = it_em->second.str_val;
+    if ((encoding_mode == "full_state_table" && !has_state_table) ||
+        (encoding_mode == "compact_dag" && has_state_table)) {
+      ver.passed = false;
+      ver.error_code = "LP-J02";
+      ver.message =
+          "encodingMode disagrees with presence/absence of stateTable.";
+      return ver;
+    }
+  }
+  ver.encoding_mode = encoding_mode;
+
   const auto& setup_obj = it_setup->second.obj_val;
   int64_t parsed_bs = -1;
   if (const auto it_sbs = setup_obj.find("boardSize");
-      it_sbs != setup_obj.end() && it_sbs->second.kind == JsonValue::Kind::kInt) {
+      it_sbs != setup_obj.end() &&
+      it_sbs->second.kind == JsonValue::Kind::kInt) {
     parsed_bs = it_sbs->second.int_val;
   } else if (const auto it_bs = root.obj_val.find("boardSize");
              it_bs != root.obj_val.end() &&
@@ -1466,6 +1660,11 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
   BitBoard<N> origin_w_bits;
   BitBoard<N> wall_bits;
   Color origin_turn = Color::kBlack;
+  std::string root_kind = "initial";
+  bool trace_outside_region = false;
+  bool trace_has_restricted_ko_capture = false;
+  uint32_t state_table_verified_count = 0;
+  std::vector<Position<N>> rebuilt_state_positions;
 
   try {
     if (const auto it_pid = root.obj_val.find("problemId");
@@ -1581,6 +1780,30 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
       return ver;
     }
 
+    // Parse regionHint BEFORE replaying traced_subposition moves so scope
+    // validation (LP-S11) can inspect trace moves against declared regionCoords.
+    bool has_region_hint = false;
+    if (const auto it_hr = setup_obj.find("hasRegionHint");
+        it_hr != setup_obj.end() &&
+        it_hr->second.kind == JsonValue::Kind::kBool) {
+      has_region_hint = it_hr->second.bool_val;
+    } else if (const auto it_rc = setup_obj.find("regionCoords");
+               it_rc != setup_obj.end() &&
+               it_rc->second.kind == JsonValue::Kind::kArray &&
+               !it_rc->second.arr_val.empty()) {
+      has_region_hint = true;
+    }
+    if (has_region_hint) {
+      BitBoard<N> reg_bits;
+      if (!load_coords_to_bits("regionCoords", &reg_bits, true)) {
+        ver.passed = false;
+        ver.error_code = "LP-J02";
+        ver.message = "Invalid problemSetup.regionCoords array.";
+        return ver;
+      }
+      report.region_hint = reg_bits;
+    }
+
     Color first_to_play = Color::kBlack;
     if (const auto it = setup_obj.find("firstToPlay"); it == setup_obj.end() ||
         !ParseColorValue(it->second, &first_to_play)) {
@@ -1590,7 +1813,6 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
       return ver;
     }
 
-    std::string root_kind = "initial";
     if (const auto it_rk = setup_obj.find("rootKind");
         it_rk != setup_obj.end()) {
       if (it_rk->second.kind != JsonValue::Kind::kString ||
@@ -1602,6 +1824,20 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
         return ver;
       }
       root_kind = it_rk->second.str_val;
+    }
+    ver.verified_root_kind = root_kind;
+
+    // R4 §3 P1-A: Default external problem binding enforces original_root!
+    if (root_kind == "traced_subposition" &&
+        effective_scope == VerificationScope::kOriginalRoot) {
+      ver.passed = false;
+      ver.error_code = "LP-P02";
+      ver.message =
+          "Certificate proves a traced_subposition rather than the original "
+          "root position (rejected under original_root scope; pass "
+          "--allow-subposition or --free-exploration explicitly to audit "
+          "sub-positions).";
+      return ver;
     }
 
     initial_pos.Clear(context);
@@ -1639,12 +1875,46 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
           ver.message = "Invalid move coordinate in initialTraceMoves.";
           return ver;
         }
-        if (!initial_pos.PlayMove(static_cast<int16_t>(mv_val.int_val))) {
+        const int16_t mv = static_cast<int16_t>(mv_val.int_val);
+        const bool outside_reg =
+            !IsMoveInAllowedRegion<N>(mv, report.region_hint);
+        if (outside_reg) trace_outside_region = true;
+
+        const bool restricted_side =
+            (initial_pos.ToPlay() == context.root_attacker &&
+             !context.attacker_allow_ko) ||
+            (initial_pos.ToPlay() != context.root_attacker &&
+             !context.defender_allow_ko);
+        bool is_ko_cap = false;
+        if (!initial_pos.PlayMove(mv, &is_ko_cap)) {
           ver.passed = false;
           ver.error_code = "LP-S09";
           ver.message =
               "Illegal move in traced_subposition initialTraceMoves replay.";
           return ver;
+        }
+        if (is_ko_cap && restricted_side) {
+          trace_has_restricted_ko_capture = true;
+        }
+        if (effective_scope == VerificationScope::kTracedWithinRules) {
+          if (outside_reg) {
+            ver.passed = false;
+            ver.trace_outside_region = true;
+            ver.error_code = "LP-S11";
+            ver.message =
+                "traced_subposition initialTraceMoves plays outside declared "
+                "regionCoords (rejected under traced_within_rules scope).";
+            return ver;
+          }
+          if (is_ko_cap && restricted_side) {
+            ver.passed = false;
+            ver.trace_has_restricted_ko_capture = true;
+            ver.error_code = "LP-S12";
+            ver.message =
+                "traced_subposition initialTraceMoves contains a restricted-side "
+                "ko capture (rejected under traced_within_rules scope).";
+            return ver;
+          }
         }
       }
 
@@ -1727,28 +1997,6 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
       return ver;
     }
 
-    bool has_region_hint = false;
-    if (const auto it_hr = setup_obj.find("hasRegionHint");
-        it_hr != setup_obj.end() &&
-        it_hr->second.kind == JsonValue::Kind::kBool) {
-      has_region_hint = it_hr->second.bool_val;
-    } else if (const auto it_rc = setup_obj.find("regionCoords");
-               it_rc != setup_obj.end() &&
-               it_rc->second.kind == JsonValue::Kind::kArray &&
-               !it_rc->second.arr_val.empty()) {
-      has_region_hint = true;
-    }
-    if (has_region_hint) {
-      BitBoard<N> reg_bits;
-      if (!load_coords_to_bits("regionCoords", &reg_bits, true)) {
-        ver.passed = false;
-        ver.error_code = "LP-J02";
-        ver.message = "Invalid problemSetup.regionCoords array.";
-        return ver;
-      }
-      report.region_hint = reg_bits;
-    }
-
     // F4: Optional external problem binding check (--problem <original.json>).
     if (expected_problem != nullptr) {
       if (!expected_problem->valid) {
@@ -1787,30 +2035,229 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
       }
     }
 
-    // Validate optional stateTable shape when verifying full-table TS exports.
-    if (const auto it_st = root.obj_val.find("stateTable");
-        it_st != root.obj_val.end()) {
-      if (it_st->second.kind != JsonValue::Kind::kArray ||
-          it_st->second.arr_val.empty() ||
-          it_st->second.arr_val[0].kind != JsonValue::Kind::kObject) {
+    // R4 §4 P1-C: Full zero-trust verification of optional stateTable +
+    // snapshotPool/historySnapshotIds/historyTable whenever present!
+    if (has_state_table) {
+      const auto& st_val = root.obj_val.at("stateTable");
+      if (st_val.kind != JsonValue::Kind::kArray || st_val.arr_val.empty()) {
         ver.passed = false;
         ver.error_code = "LP-J02";
-        ver.message = "Malformed optional stateTable in lproof/1 file.";
+        ver.message = "Malformed or empty stateTable in full_state_table proof.";
         return ver;
       }
-      const auto& s0 = it_st->second.arr_val[0].obj_val;
-      if (const auto it_z0 = s0.find("zobristHex");
-          it_z0 != s0.end() &&
-          it_z0->second.kind == JsonValue::Kind::kString) {
-        uint64_t z0 = 0;
-        if (!ParseHexU64(it_z0->second.str_val, &z0) ||
-            z0 != initial_pos.ZobristHash()) {
+
+      // Reconstruct historyTable from snapshotPool+historySnapshotIds or raw historyTable.
+      std::vector<std::vector<CanonicalSnapshot<N>>> history_table;
+      const auto it_sp = root.obj_val.find("snapshotPool");
+      const auto it_hsid = root.obj_val.find("historySnapshotIds");
+      const auto it_ht = root.obj_val.find("historyTable");
+      if (it_sp != root.obj_val.end() || it_hsid != root.obj_val.end()) {
+        if (it_sp == root.obj_val.end() || it_hsid == root.obj_val.end() ||
+            it_sp->second.kind != JsonValue::Kind::kArray ||
+            it_hsid->second.kind != JsonValue::Kind::kArray) {
           ver.passed = false;
-          ver.error_code = "LP-S02";
-          ver.message = "stateTable[0].zobristHex disagrees with initial position.";
+          ver.error_code = "LP-J02";
+          ver.message =
+              "Malformed snapshotPool or historySnapshotIds array in lproof/1 "
+              "file.";
           return ver;
         }
+        std::vector<CanonicalSnapshot<N>> pool;
+        pool.reserve(it_sp->second.arr_val.size());
+        for (const auto& sp_item : it_sp->second.arr_val) {
+          CanonicalSnapshot<N> snap;
+          if (!ParseCanonicalSnapshotObj<N>(sp_item, &snap)) {
+            ver.passed = false;
+            ver.error_code = "LP-J02";
+            ver.message = "Malformed snapshot entry in snapshotPool.";
+            return ver;
+          }
+          pool.push_back(snap);
+        }
+        history_table.reserve(it_hsid->second.arr_val.size());
+        for (const auto& h_row : it_hsid->second.arr_val) {
+          if (h_row.kind != JsonValue::Kind::kArray) {
+            ver.passed = false;
+            ver.error_code = "LP-J02";
+            ver.message = "Non-array row inside historySnapshotIds.";
+            return ver;
+          }
+          std::vector<CanonicalSnapshot<N>> row_snaps;
+          row_snaps.reserve(h_row.arr_val.size());
+          for (const auto& idx_v : h_row.arr_val) {
+            if (idx_v.kind != JsonValue::Kind::kInt || idx_v.int_val < 0 ||
+                static_cast<size_t>(idx_v.int_val) >= pool.size()) {
+              ver.passed = false;
+              ver.error_code = "LP-J02";
+              ver.message =
+                  "Out-of-range snapshotPool index inside historySnapshotIds.";
+              return ver;
+            }
+            row_snaps.push_back(pool[static_cast<size_t>(idx_v.int_val)]);
+          }
+          history_table.push_back(std::move(row_snaps));
+        }
+      } else if (it_ht != root.obj_val.end()) {
+        if (it_ht->second.kind != JsonValue::Kind::kArray) {
+          ver.passed = false;
+          ver.error_code = "LP-J02";
+          ver.message = "Malformed historyTable in lproof/1 file.";
+          return ver;
+        }
+        history_table.reserve(it_ht->second.arr_val.size());
+        for (const auto& h_row : it_ht->second.arr_val) {
+          if (h_row.kind != JsonValue::Kind::kArray) {
+            ver.passed = false;
+            ver.error_code = "LP-J02";
+            ver.message = "Non-array row inside historyTable.";
+            return ver;
+          }
+          std::vector<CanonicalSnapshot<N>> row_snaps;
+          row_snaps.reserve(h_row.arr_val.size());
+          for (const auto& snap_v : h_row.arr_val) {
+            CanonicalSnapshot<N> snap;
+            if (!ParseCanonicalSnapshotObj<N>(snap_v, &snap)) {
+              ver.passed = false;
+              ver.error_code = "LP-J02";
+              ver.message = "Malformed snapshot entry in historyTable.";
+              return ver;
+            }
+            row_snaps.push_back(snap);
+          }
+          history_table.push_back(std::move(row_snaps));
+        }
+      } else {
+        ver.passed = false;
+        ver.error_code = "LP-J02";
+        ver.message =
+            "full_state_table proof requires snapshotPool+historySnapshotIds "
+            "or historyTable.";
+        return ver;
       }
+
+      // Replay and verify EVERY entry in stateTable[0..M-1] from initial_pos.
+      rebuilt_state_positions.resize(st_val.arr_val.size());
+      for (size_t s = 0; s < st_val.arr_val.size(); ++s) {
+        const auto& st_item = st_val.arr_val[s];
+        if (st_item.kind != JsonValue::Kind::kObject) {
+          ver.passed = false;
+          ver.error_code = "LP-J02";
+          ver.message = "Non-object entry inside stateTable.";
+          return ver;
+        }
+        const auto& so = st_item.obj_val;
+        const auto& sid_v = so.at("stateId");
+        const auto& psid_v = so.at("parentStateId");
+        const auto& mfp_v = so.at("moveFromParent");
+        const auto& zhex_v = so.at("zobristHex");
+        const auto& bc_v = so.at("blackCoords");
+        const auto& wc_v = so.at("whiteCoords");
+        const auto& tp_v = so.at("toPlay");
+        const auto& ko_v = so.at("koPoint");
+        const auto& cp_v = so.at("consecutivePasses");
+        const auto& stm_v = so.at("survivingTokensMask");
+        const auto& hid_v = so.at("historyId");
+        if (sid_v.kind != JsonValue::Kind::kInt ||
+            psid_v.kind != JsonValue::Kind::kInt ||
+            mfp_v.kind != JsonValue::Kind::kInt ||
+            zhex_v.kind != JsonValue::Kind::kString ||
+            ko_v.kind != JsonValue::Kind::kInt ||
+            cp_v.kind != JsonValue::Kind::kInt ||
+            stm_v.kind != JsonValue::Kind::kInt ||
+            hid_v.kind != JsonValue::Kind::kInt) {
+          ver.passed = false;
+          ver.error_code = "LP-J02";
+          ver.message = "Invalid field types in stateTable entry.";
+          return ver;
+        }
+        if (sid_v.int_val != static_cast<int64_t>(s)) {
+          ver.passed = false;
+          ver.error_code = "LP-S02";
+          ver.message = "stateTable entry stateId does not match array index.";
+          return ver;
+        }
+
+        Position<N> expected_pos;
+        if (s == 0) {
+          if (psid_v.int_val != -1) {
+            ver.passed = false;
+            ver.error_code = "LP-S02";
+            ver.message = "stateTable[0].parentStateId must be -1.";
+            return ver;
+          }
+          expected_pos = initial_pos;
+        } else {
+          if (psid_v.int_val < 0 ||
+              static_cast<size_t>(psid_v.int_val) >= s) {
+            ver.passed = false;
+            ver.error_code = "LP-S02";
+            ver.message =
+                "stateTable parentStateId out of range or non-topological.";
+            return ver;
+          }
+          const int16_t mv = static_cast<int16_t>(mfp_v.int_val);
+          if (!IsMoveInAllowedRegion<N>(mv, report.region_hint)) {
+            ver.passed = false;
+            ver.error_code = "LP-S11";
+            ver.message =
+                "stateTable transition moveFromParent lies outside declared "
+                "regionCoords.";
+            return ver;
+          }
+          expected_pos =
+              rebuilt_state_positions[static_cast<size_t>(psid_v.int_val)];
+          if (!expected_pos.PlayMove(mv)) {
+            ver.passed = false;
+            ver.error_code = "LP-S09";
+            ver.message =
+                "Illegal moveFromParent transition in stateTable replay.";
+            return ver;
+          }
+        }
+
+        uint64_t claimed_z = 0;
+        BitBoard<N> claimed_b;
+        BitBoard<N> claimed_w;
+        Color claimed_tp = Color::kBlack;
+        if (!ParseHexU64(zhex_v.str_val, &claimed_z) ||
+            !ParseBitBoardCoordArray<N>(bc_v, &claimed_b) ||
+            !ParseBitBoardCoordArray<N>(wc_v, &claimed_w) ||
+            !ParseColorValue(tp_v, &claimed_tp)) {
+          ver.passed = false;
+          ver.error_code = "LP-J02";
+          ver.message = "Malformed board/hash fields in stateTable entry.";
+          return ver;
+        }
+        if (hid_v.int_val < 0 ||
+            static_cast<size_t>(hid_v.int_val) >= history_table.size()) {
+          ver.passed = false;
+          ver.error_code = "LP-S02";
+          ver.message = "stateTable entry historyId out of bounds.";
+          return ver;
+        }
+        if (claimed_z != expected_pos.ZobristHash() ||
+            claimed_tp != expected_pos.ToPlay() ||
+            ko_v.int_val != expected_pos.KoPoint() ||
+            cp_v.int_val != expected_pos.ConsecutivePasses() ||
+            static_cast<uint64_t>(stm_v.int_val) !=
+                expected_pos.SurvivingTargetTokensMask() ||
+            claimed_b != expected_pos.Stones(Color::kBlack) ||
+            claimed_w != expected_pos.Stones(Color::kWhite) ||
+            !HistorySnapshotListsEqual<N>(
+                history_table[static_cast<size_t>(hid_v.int_val)],
+                expected_pos.HistorySnapshots())) {
+          ver.passed = false;
+          ver.error_code = "LP-S02";
+          ver.message =
+              "stateTable entry disagrees with replayed state (Zobrist, "
+              "stones, turn, koPoint, passes, survivingTokensMask, or "
+              "historyTable mismatch).";
+          return ver;
+        }
+        rebuilt_state_positions[s] = expected_pos;
+      }
+      state_table_verified_count =
+          static_cast<uint32_t>(rebuilt_state_positions.size());
     }
 
     if (const auto it = root.obj_val.find("rootOutcome");
@@ -1836,8 +2283,34 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
       return ver;
     }
     if (const auto it = root.obj_val.find("bestMove");
-        it != root.obj_val.end() && it->second.kind == JsonValue::Kind::kInt) {
-      report.best_move = static_cast<int16_t>(it->second.int_val);
+        it != root.obj_val.end()) {
+      if (it->second.kind == JsonValue::Kind::kInt) {
+        report.best_move = static_cast<int16_t>(it->second.int_val);
+      } else if (it->second.kind == JsonValue::Kind::kNull) {
+        report.best_move = kPassMove;
+      } else {
+        ver.passed = false;
+        ver.error_code = "LP-J02";
+        ver.message = "Invalid bestMove type in standalone lproof/1 file.";
+        return ver;
+      }
+    }
+    if (const auto it_sgf = root.obj_val.find("bestMoveSgf");
+        it_sgf != root.obj_val.end() &&
+        it_sgf->second.kind == JsonValue::Kind::kString) {
+      const std::string expected_sgf = MoveToSgfLabel(report.best_move, N);
+      const bool sgf_ok =
+          (it_sgf->second.str_val == expected_sgf) ||
+          ((report.best_move == kPassMove || report.best_move == kNullMove) &&
+           (it_sgf->second.str_val == "pass" ||
+            it_sgf->second.str_val == "none"));
+      if (!sgf_ok) {
+        ver.passed = false;
+        ver.error_code = "LP-R02";
+        ver.message =
+            "Top-level bestMoveSgf disagrees with top-level bestMove.";
+        return ver;
+      }
     }
 
     for (const auto& nj : it_nodes->second.arr_val) {
@@ -1875,6 +2348,21 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
 
       ProofDagNode<N> node;
       node.node_id = static_cast<uint32_t>(nid_v.int_val);
+      if (const auto it_sid = nj.obj_val.find("stateId");
+          it_sid != nj.obj_val.end() &&
+          it_sid->second.kind == JsonValue::Kind::kInt) {
+        if (it_sid->second.int_val < 0 ||
+            (has_state_table &&
+             static_cast<size_t>(it_sid->second.int_val) >=
+                 rebuilt_state_positions.size())) {
+          ver.passed = false;
+          ver.failed_node_id = static_cast<int32_t>(node.node_id);
+          ver.error_code = "LP-S02";
+          ver.message = "ProofDagNode stateId out of stateTable bounds.";
+          return ver;
+        }
+        node.state_id = static_cast<uint32_t>(it_sid->second.int_val);
+      }
       node.is_or_node = or_v.bool_val;
       if (!ParseColorValue(nj.obj_val.at("toPlay"), &node.to_play)) {
         ver.passed = false;
@@ -1900,7 +2388,8 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
                              &node.terminal_evidence)) {
         ver.passed = false;
         ver.error_code = "LP-J02";
-        ver.message = "Invalid node terminalEvidence in standalone lproof/1 file.";
+        ver.message =
+            "Invalid node terminalEvidence in standalone lproof/1 file.";
         return ver;
       }
       node.is_pruned_outside_rz = prz_v.bool_val;
@@ -1962,6 +2451,16 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
       }
       report.proof_dag_nodes.push_back(std::move(node));
     }
+
+    if (has_state_table &&
+        report.root_dag_node_id < report.proof_dag_nodes.size() &&
+        report.proof_dag_nodes[report.root_dag_node_id].state_id != 0U) {
+      ver.passed = false;
+      ver.failed_node_id = static_cast<int32_t>(report.root_dag_node_id);
+      ver.error_code = "LP-S02";
+      ver.message = "Root ProofDagNode must bind to stateId=0 in stateTable.";
+      return ver;
+    }
   } catch (const std::exception& e) {
     ver.passed = false;
     ver.error_code = "LP-J02";
@@ -1970,7 +2469,21 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
     return ver;
   }
 
-  return VerifyProofDag(initial_pos, context, report);
+  VerificationReport dag_ver = VerifyProofDag(initial_pos, context, report);
+  // R4 §4 P1-C: Preserve the verified input file's RFC 8785 JCS SHA-256
+  // checksum rather than overwriting it with re-serialized compact DAG digest!
+  dag_ver.canonical_dag_checksum = dag_ver.jcs_sha256_checksum;
+  dag_ver.jcs_sha256_checksum = file_checksum;
+  dag_ver.encoding_mode = encoding_mode;
+  dag_ver.verified_scope = VerificationScopeToStr(effective_scope);
+  dag_ver.verified_root_kind = root_kind;
+  dag_ver.trace_outside_region = trace_outside_region;
+  dag_ver.trace_has_restricted_ko_capture = trace_has_restricted_ko_capture;
+  if (has_state_table && state_table_verified_count > 0) {
+    dag_ver.verified_states = state_table_verified_count;
+    dag_ver.verified_histories = state_table_verified_count;
+  }
+  return dag_ver;
 }
 
 template class ProofArtifactManager<5>;

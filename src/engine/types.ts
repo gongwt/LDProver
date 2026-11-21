@@ -227,10 +227,26 @@ export interface SolveReport {
   resultJson: string;
 }
 
+export type VerificationScope =
+  | 'original_root'
+  | 'traced_within_rules'
+  | 'free_exploration';
+
+export type LProofEncodingMode = 'full_state_table' | 'compact_dag';
+
 export interface VerificationReport {
   passed: boolean;
   schemaVersion: string;
   jcsSha256Checksum: string;
+  canonicalDagChecksum?: string;
+  encodingMode?: LProofEncodingMode;
+  verifiedScope?: VerificationScope;
+  verifiedRootKind?: 'initial' | 'traced_subposition';
+  verifiedGoal?: SearchGoal;
+  verifiedAttackerAllowKo?: boolean;
+  verifiedDefenderAllowKo?: boolean;
+  traceOutsideRegion?: boolean;
+  traceHasRestrictedKoCapture?: boolean;
   verifiedNodes: number;
   verifiedStates: number;
   verifiedHistories: number;

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -35,7 +36,7 @@ struct SolverConfig {
   bool enable_pattern_tt = true;
   bool enable_fast_capture_ordering = true;
   bool enable_progressive_widening = true;
-  uint32_t widening_base_k = 6;
+  uint32_t widening_base_k = 8;
   bool deterministic_mode = true;  // FR-7.8, NFR-4
 };
 
@@ -107,19 +108,44 @@ class DfpnSolver {
     bool expanded = false;
     bool pruned_outside_rz = false;
     bool ko_dependent = false;
+    bool move_captured = false;
+    bool subtree_has_capture = false;
     uint32_t dag_node_id = kInvalidDagNodeId;
+    uint64_t child_path_id = 0;
     ProofCertificateRZ<N> proof_rz{};
     ProofCertificateRZ<N> disproof_rz{};
   };
 
-  bool IsMemoryBudgetExceeded() const noexcept;
+  struct CachedNodeFrontier {
+    std::vector<SearchChild> children;
+    uint32_t widening_level = 0;
+    ProofCertificateRZ<N> active_null_move_rz{};
+    bool has_null_move_rz = false;
+    uint32_t representative_dag_id = kInvalidDagNodeId;
+    ProofOutcome representative_outcome = ProofOutcome::kUnknown;
+    uint32_t checked_null_move_dag_id = kInvalidDagNodeId;
+  };
+
+  struct NodeTacticalContext {
+    std::vector<int> crucial_lib_bonus;
+    std::vector<int> enemy_min_lib;
+    std::vector<int> friendly_min_lib;
+    BitBoard<N> target_coords{};
+  };
+
+  bool IsMemoryBudgetExceeded(uint32_t active_depth) const noexcept;
+
+  NodeTacticalContext BuildNodeTacticalContext(
+      const Position<N>& pos, const ProofContext& context) const;
 
   void MidSearch(Position<N>& pos, const ProofContext& context,
                  const std::optional<BitBoard<N>>& region_hint,
                  uint32_t th_pn, uint32_t th_dn, uint32_t depth,
+                 uint64_t node_path_id,
                  std::unordered_set<uint64_t>& in_path_hashes,
                  uint32_t* out_pn, uint32_t* out_dn,
                  ProofOutcome* out_outcome, bool* out_ko_dependent,
+                 bool* out_has_capture,
                  ProofCertificateRZ<N>* out_proof_rz,
                  ProofCertificateRZ<N>* out_disproof_rz,
                  uint32_t* out_dag_node_id,
@@ -127,8 +153,9 @@ class DfpnSolver {
 
   // FR-4.10: Deterministic FastCapture tactical move ordering.
   int32_t ScoreMoveFastCapture(const Position<N>& pos,
-                               const ProofContext& context, int16_t move,
-                               bool is_or_node) const;
+                               const ProofContext& context,
+                               const NodeTacticalContext& tctx,
+                               int16_t move, bool is_or_node) const;
 
   // FR-5.5: Revalidate source proof under QueryState + HistorySet (both witness
   // and full-coverage AND/OR nodes) before materializing OutsideRZRevalidated.
@@ -143,6 +170,11 @@ class DfpnSolver {
   RelevanceZoneEngine<N> rz_engine_;
   TranspositionStore<N> tt_store_;
   SolveReport<N> report_;
+  std::optional<BitBoard<N>> attention_mask_;
+  std::vector<bool> dag_has_capture_;
+  std::unordered_map<uint64_t, CachedNodeFrontier> node_frontier_cache_;
+  mutable std::unordered_map<std::string, bool> reval_cache_;
+  uint64_t next_path_id_ = 1ULL;
 };
 
 }  // namespace ldprover

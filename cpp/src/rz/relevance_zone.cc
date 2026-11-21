@@ -17,23 +17,29 @@ ProofCertificateRZ<N> RelevanceZoneEngine<N>::ComputeSingleWitnessRZ(
   if (witness_move >= 0 && witness_move < N * N) {
     rz.Set(witness_move, true);
     for (int nb : parent_pos.OrthogonalNeighbors(witness_move)) {
-      if (rz.Get(nb) || parent_pos.StoneAt(nb) != Color::kEmpty) {
+      if (!parent_pos.ImmortalWall().Get(nb) &&
+          parent_pos.StoneAt(nb) != Color::kEmpty &&
+          (rz.Get(nb) || parent_pos.StoneAt(nb) != Color::kEmpty)) {
         BitBoard<N> libs;
         BitBoard<N> chain = parent_pos.FloodFillChain(nb, &libs);
-        if (chain.Intersects(rz) || nb == witness_move) {
+        if ((chain & parent_pos.ImmortalWall()).None() &&
+            (chain.Intersects(rz) || libs.Get(witness_move))) {
           rz |= chain | libs;
         }
       }
     }
   }
 
-  // Expand chains intersecting current RZ with their immediate liberties.
+  // Expand non-immortal chains intersecting current RZ with their immediate liberties.
   BitBoard<N> expanded = rz;
   for (int coord : rz.ToCoords()) {
-    if (parent_pos.StoneAt(coord) != Color::kEmpty) {
+    if (parent_pos.StoneAt(coord) != Color::kEmpty &&
+        !parent_pos.ImmortalWall().Get(coord)) {
       BitBoard<N> libs;
       BitBoard<N> chain = parent_pos.FloodFillChain(coord, &libs);
-      expanded |= chain | libs;
+      if ((chain & parent_pos.ImmortalWall()).None()) {
+        expanded |= chain | libs;
+      }
     }
   }
   return ProofCertificateRZ<N>(expanded);
@@ -48,22 +54,26 @@ ProofCertificateRZ<N> RelevanceZoneEngine<N>::ComputeAllChildrenUnionRZ(
     union_bits |= crz.Bits();
   }
 
-  // Triple safety closure (FR-5.2):
-  // 1. Include all chains intersecting union_bits and their liberties.
-  // 2. Include orthogonal boundary points of chains inside union_bits.
-  // 3. Include active simple ko point if adjacent.
+  // Triple safety closure (FR-5.2), excluding immortal outer boundary walls:
+  // 1. Include all non-immortal chains intersecting union_bits and their liberties.
+  // 2. Include low-liberty orthogonal boundary chains adjacent to union_bits.
+  // 3. Include active simple ko point if present.
   BitBoard<N> closed = union_bits;
   for (int coord : union_bits.ToCoords()) {
-    if (parent_pos.StoneAt(coord) != Color::kEmpty) {
+    if (parent_pos.StoneAt(coord) != Color::kEmpty &&
+        !parent_pos.ImmortalWall().Get(coord)) {
       BitBoard<N> libs;
       BitBoard<N> chain = parent_pos.FloodFillChain(coord, &libs);
-      closed |= chain | libs;
+      if ((chain & parent_pos.ImmortalWall()).None()) {
+        closed |= chain | libs;
+      }
     }
     for (int nb : parent_pos.OrthogonalNeighbors(coord)) {
-      if (parent_pos.StoneAt(nb) != Color::kEmpty) {
+      if (parent_pos.StoneAt(nb) != Color::kEmpty &&
+          !parent_pos.ImmortalWall().Get(nb)) {
         BitBoard<N> libs;
         BitBoard<N> nb_chain = parent_pos.FloodFillChain(nb, &libs);
-        if (libs.Count() <= 2) {
+        if ((nb_chain & parent_pos.ImmortalWall()).None() && libs.Count() <= 2) {
           closed |= nb_chain | libs;
         }
       }

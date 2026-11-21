@@ -17,14 +17,28 @@ constexpr uint32_t ClampSat(uint64_t val) noexcept {
   return val >= kPnDnSaturation ? kPnDnSaturation : static_cast<uint32_t>(val);
 }
 
+std::string HexU64Compact(uint64_t v) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string out(16, '0');
+  for (int i = 15; i >= 0; --i) {
+    out[static_cast<size_t>(i)] = kHex[v & 0xFULL];
+    v >>= 4;
+  }
+  return out;
+}
+
 }  // namespace
 
 template <int N>
-bool DfpnSolver<N>::IsMemoryBudgetExceeded() const noexcept {
+bool DfpnSolver<N>::IsMemoryBudgetExceeded(
+    uint32_t active_depth) const noexcept {
   if (config_.memory_budget_bytes == 0ULL) return false;
   const uint64_t approx_bytes =
       static_cast<uint64_t>(report_.proof_dag_nodes.size()) * 768ULL +
-      static_cast<uint64_t>(tt_store_.EstimatedEntryCount()) * 1024ULL;
+      static_cast<uint64_t>(tt_store_.EstimatedEntryCount()) * 1024ULL +
+      static_cast<uint64_t>(node_frontier_cache_.size()) * 4096ULL +
+      static_cast<uint64_t>(reval_cache_.size()) * 128ULL +
+      static_cast<uint64_t>(active_depth + 1U) * 2048ULL;
   return approx_bytes > config_.memory_budget_bytes;
 }
 
@@ -33,21 +47,60 @@ SolveReport<N> DfpnSolver<N>::Solve(
     const Position<N>& initial_pos, const ProofContext& context,
     const std::optional<BitBoard<N>>& region_hint,
     const std::string& problem_id) {
-  // FR-6.2: Clear BoardTT and PatternTT at the start of every problem.
+  // FR-6.2: Clear BoardTT, PatternTT, and per-solve caches at problem start.
   tt_store_.ClearAll();
+  node_frontier_cache_.clear();
+  reval_cache_.clear();
+  dag_has_capture_.clear();
+  next_path_id_ = 1ULL;
   report_ = SolveReport<N>{};
   report_.problem_id = problem_id;
   report_.input_hash = initial_pos.ZobristHash();
   report_.region_hint = region_hint;
 
+  // Build local tactical attention mask (Chebyshev radius 2 around non-immortal
+  // stones inside the declared region, plus crucial tokens).
+  attention_mask_.reset();
+  if (region_hint.has_value()) {
+    BitBoard<N> seeds =
+        (initial_pos.Stones(Color::kBlack) | initial_pos.Stones(Color::kWhite)) &
+        (~initial_pos.ImmortalWall()) & (*region_hint);
+    for (const auto& tok : context.initial_tokens) {
+      if (tok.initial_coord >= 0 && tok.initial_coord < N * N) {
+        seeds.Set(tok.initial_coord, true);
+      }
+    }
+    if (seeds.Any()) {
+      BitBoard<N> att;
+      for (int sc : seeds.ToCoords()) {
+        const int sr = sc / N;
+        const int sc_col = sc % N;
+        for (int dr = -2; dr <= 2; ++dr) {
+          for (int dc = -2; dc <= 2; ++dc) {
+            const int nr = sr + dr;
+            const int nc = sc_col + dc;
+            if (nr >= 0 && nr < N && nc >= 0 && nc < N) {
+              const int coord = nr * N + nc;
+              if (region_hint->Get(coord)) att.Set(coord, true);
+            }
+          }
+        }
+      }
+      if (att.Any()) attention_mask_ = att;
+    }
+  }
+
   Position<N> work_pos = initial_pos;
   std::unordered_set<uint64_t> in_path_hashes;
   bool ko_dep = false;
+  bool root_has_capture = false;
+  const uint64_t root_path_id = next_path_id_++;
 
   MidSearch(work_pos, context, region_hint, kPnDnSaturation, kPnDnSaturation,
-            0, in_path_hashes, &report_.root_pn, &report_.root_dn,
-            &report_.root_status, &ko_dep, &report_.root_proof_rz,
-            &report_.root_disproof_rz, &report_.root_dag_node_id, kPassMove);
+            0, root_path_id, in_path_hashes, &report_.root_pn, &report_.root_dn,
+            &report_.root_status, &ko_dep, &root_has_capture,
+            &report_.root_proof_rz, &report_.root_disproof_rz,
+            &report_.root_dag_node_id, kPassMove);
 
   if (ko_dep && report_.root_status == ProofOutcome::kUnknown &&
       report_.unknown_reason == UnknownReason::kNone) {
@@ -95,66 +148,166 @@ SolveReport<N> DfpnSolver<N>::Solve(
 }
 
 template <int N>
-int32_t DfpnSolver<N>::ScoreMoveFastCapture(const Position<N>& pos,
-                                            const ProofContext& context,
-                                            int16_t move,
-                                            bool is_or_node) const {
-  if (move == kPassMove) {
-    return (!is_or_node && pos.ConsecutivePasses() == 0) ? 450 : -2000;
-  }
-  int32_t score = 0;
+typename DfpnSolver<N>::NodeTacticalContext
+DfpnSolver<N>::BuildNodeTacticalContext(const Position<N>& pos,
+                                        const ProofContext& context) const {
+  NodeTacticalContext ctx;
+  const int board_pts = N * N;
+  ctx.crucial_lib_bonus.assign(static_cast<size_t>(board_pts), 0);
+  ctx.enemy_min_lib.assign(static_cast<size_t>(board_pts), 99);
+  ctx.friendly_min_lib.assign(static_cast<size_t>(board_pts), 99);
 
-  // Prioritize moves adjacent to crucial stones or their liberties.
+  // Precompute crucial stone chain liberties once per frontier node.
+  BitBoard<N> visited_crucial;
   for (size_t i = 0; i < context.initial_tokens.size() && i < 64; ++i) {
     if ((pos.SurvivingTargetTokensMask() & (1ULL << i)) == 0) continue;
-    int t_coord = context.initial_tokens[i].initial_coord;
+    const int t_coord = context.initial_tokens[i].initial_coord;
+    if (t_coord < 0 || t_coord >= board_pts) continue;
+    ctx.target_coords.Set(t_coord, true);
+    if (visited_crucial.Get(t_coord)) continue;
     BitBoard<N> libs;
-    (void)pos.FloodFillChain(t_coord, &libs);
-    if (libs.Get(move)) {
-      score += 550;
-      if (libs.Count() == 1) score += 1350;
-      else if (libs.Count() == 2) score += 720;
+    const BitBoard<N> chain = pos.FloodFillChain(t_coord, &libs);
+    visited_crucial |= chain;
+    const int lib_cnt = libs.Count();
+    int bonus = 560;
+    if (lib_cnt == 1) bonus += 1400;
+    else if (lib_cnt == 2) bonus += 740;
+    else if (lib_cnt == 3) bonus += 260;
+    for (int lc : libs.ToCoords()) {
+      ctx.crucial_lib_bonus[static_cast<size_t>(lc)] =
+          std::max(ctx.crucial_lib_bonus[static_cast<size_t>(lc)], bonus);
     }
   }
 
-  // Simulate move to evaluate captures and tactical atari.
-  Position<N> next = pos;
-  const int prev_enemy_count =
-      pos.Stones(OppositeColor(pos.ToPlay())).Count();
-  if (next.PlayMove(move)) {
-    const int new_enemy_count =
-        next.Stones(pos.ToPlay() == Color::kBlack ? Color::kWhite
-                                                  : Color::kBlack)
-            .Count();
-    const int captured = prev_enemy_count - new_enemy_count;
-    if (captured > 0) score += 1250 + captured * 300;
+  // Precompute liberty counts for all non-immortal chains once per node.
+  const Color us = pos.ToPlay();
+  const Color enemy = OppositeColor(us);
+  BitBoard<N> seen_chains;
+  const BitBoard<N> wall = pos.ImmortalWall();
+  const BitBoard<N> non_wall_stones =
+      (pos.Stones(Color::kBlack) | pos.Stones(Color::kWhite)) & (~wall);
 
-    BitBoard<N> our_libs;
-    next.FloodFillChain(move, &our_libs);
-    if (our_libs.Count() == 1) score -= 350;
-    if (our_libs.Count() >= 3) score += 200;
+  for (int sc : non_wall_stones.ToCoords()) {
+    if (seen_chains.Get(sc)) continue;
+    const Color c = pos.StoneAt(sc);
+    if (c == Color::kEmpty) continue;
+    BitBoard<N> libs;
+    const BitBoard<N> chain = pos.FloodFillChain(sc, &libs);
+    seen_chains |= chain;
+    if ((chain & wall).Any()) continue;
+    const int lib_cnt = libs.Count();
+    for (int lc : libs.ToCoords()) {
+      if (c == enemy) {
+        ctx.enemy_min_lib[static_cast<size_t>(lc)] =
+            std::min(ctx.enemy_min_lib[static_cast<size_t>(lc)], lib_cnt);
+      } else {
+        ctx.friendly_min_lib[static_cast<size_t>(lc)] =
+            std::min(ctx.friendly_min_lib[static_cast<size_t>(lc)], lib_cnt);
+      }
+    }
+  }
+  return ctx;
+}
+
+template <int N>
+int32_t DfpnSolver<N>::ScoreMoveFastCapture(const Position<N>& pos,
+                                            const ProofContext& context,
+                                            const NodeTacticalContext& tctx,
+                                            int16_t move,
+                                            bool is_or_node) const {
+  if (move == kPassMove) {
+    // At AND nodes (defender to play) with 0 consecutive passes, rank PASS high
+    // to seed a compact null-move certificate RZ immediately.
+    return (!is_or_node && pos.ConsecutivePasses() == 0) ? 1850 : -2000;
+  }
+  int32_t score = tctx.crucial_lib_bonus[static_cast<size_t>(move)];
+
+  // Penalize outer-moat moves outside local tactical attention zone.
+  if (attention_mask_.has_value() && !attention_mask_->Get(move)) {
+    score -= 950;
   }
 
-  // Distinguish border-expanding blocks from pure internal eye-space self-fills.
-  const Color enemy = OppositeColor(pos.ToPlay());
+  // Atari / capture / rescue bonuses from precomputed chain liberties.
+  const int e_min = tctx.enemy_min_lib[static_cast<size_t>(move)];
+  const int f_min = tctx.friendly_min_lib[static_cast<size_t>(move)];
+  if (e_min == 1) score += 1550;       // immediate capture
+  else if (e_min == 2) score += 540;   // puts enemy in atari
+  if (f_min == 1) score += 720;        // rescues own atari chain
+  else if (f_min == 2) score += 260;
+
+  // Symmetric local eye-vitality & connection geometry (no stone simulation needed
+  // unless capture/atari is plausible).
+  const Color us = pos.ToPlay();
+  const Color enemy = OppositeColor(us);
   int friendly_ortho = 0;
   int enemy_ortho = 0;
-  for (int nb : pos.OrthogonalNeighbors(move)) {
-    if (pos.StoneAt(nb) == pos.ToPlay()) ++friendly_ortho;
-    else if (pos.StoneAt(nb) == enemy) ++enemy_ortho;
+  int empty_ortho = 0;
+  int wall_ortho = 0;
+  const auto ortho = pos.OrthogonalNeighbors(move);
+  for (int nb : ortho) {
+    if (pos.ImmortalWall().Get(nb)) ++wall_ortho;
+    const Color s = pos.StoneAt(nb);
+    if (s == us) ++friendly_ortho;
+    else if (s == enemy) ++enemy_ortho;
+    else ++empty_ortho;
   }
   int friendly_diag = 0;
   int enemy_diag = 0;
   for (int d : pos.DiagonalNeighbors(move)) {
-    if (pos.StoneAt(d) == pos.ToPlay()) ++friendly_diag;
-    else if (pos.StoneAt(d) == enemy) ++enemy_diag;
+    const Color s = pos.StoneAt(d);
+    if (s == us) ++friendly_diag;
+    else if (s == enemy) ++enemy_diag;
   }
-  if (friendly_ortho >= 1 && enemy_ortho >= 1) score += 380;
+
+  const int deg = static_cast<int>(ortho.size());
+  // Vital point of enemy eye shape (surrounded by enemy stones -> nakade/vital).
+  if (enemy_ortho >= deg - 1 && enemy_ortho >= 2) {
+    score += 640;
+  }
+  // Vital point of own eye shape (e.g. straight-three / bulky-five center).
+  if (friendly_ortho >= 2 && empty_ortho >= 1 && enemy_ortho == 0) {
+    score += 290;
+  }
+  // Contact / hane / cut / wedge moves.
+  if (friendly_ortho >= 1 && enemy_ortho >= 1) score += 420;
   if (friendly_ortho >= 1 && enemy_diag >= 1) score += 320;
-  if (friendly_ortho >= 1 && friendly_diag >= 2 && enemy_ortho == 0 &&
-      enemy_diag == 0) {
-    score -= 240;
+  if (enemy_ortho >= 1 && enemy_diag >= 2) score += 310;
+
+  // Penalize obvious self-eye-fill (surrounded exclusively by own stones + diagonals).
+  if (friendly_ortho == deg && enemy_ortho == 0 && enemy_diag == 0 &&
+      e_min > 1) {
+    score -= 680;
+  } else if (friendly_ortho >= 1 && friendly_diag >= 2 && enemy_ortho == 0 &&
+             enemy_diag == 0 && empty_ortho <= 1) {
+    score -= 260;
   }
+
+  // Slight preference for 1st/2nd line corner/edge vital points near target stones.
+  const int r = move / N;
+  const int c = move % N;
+  const int edge_r = std::min(r, N - 1 - r);
+  const int edge_c = std::min(c, N - 1 - c);
+  if ((edge_r == 1 && edge_c == 1) || (edge_r == 0 && edge_c <= 2) ||
+      (edge_c == 0 && edge_r <= 2)) {
+    score += 110;
+  }
+
+  // Exact capture / self-atari check only when contact or capture is possible.
+  if (e_min == 1 || (empty_ortho == 0 && friendly_ortho > 0) ||
+      (empty_ortho <= 1 && enemy_ortho > 0)) {
+    Position<N> next = pos;
+    const int prev_enemy_count = pos.Stones(enemy).Count();
+    if (next.PlayMove(move)) {
+      const int captured = prev_enemy_count - next.Stones(enemy).Count();
+      if (captured > 0) score += 900 + captured * 260;
+      BitBoard<N> our_libs;
+      (void)next.FloodFillChain(move, &our_libs);
+      if (our_libs.Count() == 1 && captured == 0) score -= 420;
+      else if (our_libs.Count() >= 3) score += 180;
+    }
+  }
+  (void)context;
+  (void)wall_ortho;
   return score;
 }
 
@@ -180,19 +333,56 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
   const auto& node = report_.proof_dag_nodes[resolved_id];
   if (node.outcome != expected_outcome) return false;
 
-  const auto term = terminal_eval_.EvaluateTerminal(query_pos, context);
-  if (term.status == TerminalStatus::kWin) {
-    return expected_outcome == ProofOutcome::kProvenWin;
+  // Memoize revalidation per exact semantic query state + history + source DAG.
+  std::string cache_key;
+  cache_key.reserve(96);
+  cache_key.append(HexU64Compact(query_pos.ZobristHash()));
+  cache_key.push_back(':');
+  cache_key.push_back(query_pos.ToPlay() == Color::kWhite ? 'W' : 'B');
+  cache_key.push_back(':');
+  cache_key.append(std::to_string(query_pos.KoPoint()));
+  cache_key.push_back(':');
+  cache_key.append(std::to_string(query_pos.ConsecutivePasses()));
+  cache_key.push_back(':');
+  cache_key.append(HexU64Compact(query_pos.SurvivingTargetTokensMask()));
+  cache_key.push_back(':');
+  if (query_pos.IsCaptureFreeMonotonicHistory()) {
+    cache_key.push_back('M');
+  } else {
+    cache_key.append(query_pos.ComputeCanonicalHistoryKey());
   }
-  if (term.status == TerminalStatus::kLoss) {
-    return expected_outcome == ProofOutcome::kProvenLoss;
+  cache_key.push_back(':');
+  cache_key.append(std::to_string(resolved_id));
+  cache_key.push_back(':');
+  cache_key.push_back(
+      expected_outcome == ProofOutcome::kProvenWin ? 'W' : 'L');
+
+  if (const auto it = reval_cache_.find(cache_key); it != reval_cache_.end()) {
+    return it->second;
   }
 
-  if (node.child_node_ids.empty()) return false;
+  auto finish = [&](bool result) -> bool {
+    if (reval_cache_.size() < 200000U) {
+      reval_cache_.emplace(std::move(cache_key), result);
+    }
+    return result;
+  };
+
+  const auto term = terminal_eval_.EvaluateTerminal(query_pos, context);
+  if (term.status == TerminalStatus::kWin) {
+    return finish(expected_outcome == ProofOutcome::kProvenWin);
+  }
+  if (term.status == TerminalStatus::kLoss) {
+    return finish(expected_outcome == ProofOutcome::kProvenLoss);
+  }
+
+  if (node.child_node_ids.empty()) return finish(false);
   const bool is_or = (query_pos.ToPlay() == context.root_attacker);
   const bool restricted_side =
-      (query_pos.ToPlay() == context.root_attacker && !context.attacker_allow_ko) ||
-      (query_pos.ToPlay() != context.root_attacker && !context.defender_allow_ko);
+      (query_pos.ToPlay() == context.root_attacker &&
+       !context.attacker_allow_ko) ||
+      (query_pos.ToPlay() != context.root_attacker &&
+       !context.defender_allow_ko);
 
   // Case 1: Single-witness node (OR -> ProvenWin, or AND -> ProvenLoss)
   if ((is_or && expected_outcome == ProofOutcome::kProvenWin) ||
@@ -213,12 +403,12 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
       if (!next.PlayMove(mv, &is_ko_cap)) continue;
       if (is_ko_cap && restricted_side) continue;
       if (RevalidateSourceProofOnQueryState(
-              next, context, region_hint, cid,
-              expected_outcome, guard_depth + 1)) {
-        return true;
+              next, context, region_hint, cid, expected_outcome,
+              guard_depth + 1U)) {
+        return finish(true);
       }
     }
-    return false;
+    return finish(false);
   }
 
   // Case 2: Full-coverage node (AND -> ProvenWin, or OR -> ProvenLoss).
@@ -232,35 +422,36 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
         break;
       }
     }
-    if (found_idx < 0) return false;
-    const uint32_t cid = node.child_node_ids[found_idx];
+    if (found_idx < 0) return finish(false);
+    const uint32_t cid = node.child_node_ids[static_cast<size_t>(found_idx)];
     if (cid >= report_.proof_dag_nodes.size() ||
         report_.proof_dag_nodes[cid].outcome != expected_outcome) {
-      return false;
+      return finish(false);
     }
     Position<N> next = query_pos;
-    if (!next.PlayMove(mv)) return false;
+    if (!next.PlayMove(mv)) return finish(false);
     if (!RevalidateSourceProofOnQueryState(
-            next, context, region_hint, cid,
-            expected_outcome, guard_depth + 1)) {
-      return false;
+            next, context, region_hint, cid, expected_outcome,
+            guard_depth + 1U)) {
+      return finish(false);
     }
   }
-  return true;
+  return finish(true);
 }
 
 template <int N>
 void DfpnSolver<N>::MidSearch(
     Position<N>& pos, const ProofContext& context,
     const std::optional<BitBoard<N>>& region_hint, uint32_t th_pn,
-    uint32_t th_dn, uint32_t depth,
+    uint32_t th_dn, uint32_t depth, uint64_t node_path_id,
     std::unordered_set<uint64_t>& in_path_hashes, uint32_t* out_pn,
     uint32_t* out_dn, ProofOutcome* out_outcome, bool* out_ko_dependent,
-    ProofCertificateRZ<N>* out_proof_rz,
+    bool* out_has_capture, ProofCertificateRZ<N>* out_proof_rz,
     ProofCertificateRZ<N>* out_disproof_rz, uint32_t* out_dag_node_id,
     int16_t incoming_move) {
   ++report_.num_nodes;
   *out_ko_dependent = false;
+  *out_has_capture = false;
   *out_dag_node_id = kInvalidDagNodeId;
   const bool is_or_node = (pos.ToPlay() == context.root_attacker);
 
@@ -273,6 +464,7 @@ void DfpnSolver<N>::MidSearch(
     *out_pn = is_win ? 0 : kPnDnSaturation;
     *out_dn = is_win ? kPnDnSaturation : 0;
     *out_outcome = is_win ? ProofOutcome::kProvenWin : ProofOutcome::kProvenLoss;
+    *out_has_capture = false;
     if (is_win) {
       *out_proof_rz = ProofCertificateRZ<N>(term.leaf_certificate_rz);
     } else {
@@ -291,6 +483,7 @@ void DfpnSolver<N>::MidSearch(
     dag_node.proof_rz = *out_proof_rz;
     dag_node.disproof_rz = *out_disproof_rz;
     report_.proof_dag_nodes.push_back(dag_node);
+    dag_has_capture_.push_back(false);
     *out_dag_node_id = dag_node.node_id;
     return;
   }
@@ -324,7 +517,7 @@ void DfpnSolver<N>::MidSearch(
     *out_outcome = ProofOutcome::kUnknown;
     return;
   }
-  if (IsMemoryBudgetExceeded()) {
+  if (IsMemoryBudgetExceeded(depth)) {
     report_.resource_exhausted = true;
     report_.unknown_reason = UnknownReason::kMemoryBudget;
     *out_pn = 1;
@@ -336,7 +529,8 @@ void DfpnSolver<N>::MidSearch(
   auto emit_tt_hit_node = [&](uint32_t src_dag_id, uint32_t pn, uint32_t dn,
                               ProofOutcome outcome,
                               const ProofCertificateRZ<N>& p_rz,
-                              const ProofCertificateRZ<N>& d_rz) {
+                              const ProofCertificateRZ<N>& d_rz,
+                              bool inherited_capture) {
     ProofDagNode<N> tt_node;
     tt_node.node_id = static_cast<uint32_t>(report_.proof_dag_nodes.size());
     tt_node.is_or_node = is_or_node;
@@ -350,22 +544,34 @@ void DfpnSolver<N>::MidSearch(
     tt_node.proof_rz = p_rz;
     tt_node.disproof_rz = d_rz;
     report_.proof_dag_nodes.push_back(tt_node);
+    dag_has_capture_.push_back(inherited_capture);
     return tt_node.node_id;
   };
 
+  auto reval_cb = [&](uint32_t src_id, ProofOutcome expected_out) -> bool {
+    return RevalidateSourceProofOnQueryState(pos, context, region_hint, src_id,
+                                             expected_out);
+  };
+
   // Step 4 (FR-6.1, FR-6.3, FR-6.9): History-safe BoardTT & PatternTT lookup.
-  if (auto hit = tt_store_.LookupBoardTT(pos, context); hit.has_value()) {
+  if (auto hit = tt_store_.LookupBoardTT(pos, context, reval_cb);
+      hit.has_value()) {
     if (hit->outcome != ProofOutcome::kUnknown &&
         hit->proof_closure_available &&
         hit->proof_dag_node_id < report_.proof_dag_nodes.size()) {
+      const bool inh_cap =
+          hit->has_capture_in_subtree ||
+          (hit->proof_dag_node_id < dag_has_capture_.size() &&
+           dag_has_capture_[hit->proof_dag_node_id]);
       *out_pn = hit->pn;
       *out_dn = hit->dn;
       *out_outcome = hit->outcome;
+      *out_has_capture = inh_cap;
       *out_proof_rz = hit->proof_rz;
       *out_disproof_rz = hit->disproof_rz;
       *out_dag_node_id = emit_tt_hit_node(
           hit->proof_dag_node_id, hit->pn, hit->dn, hit->outcome,
-          hit->proof_rz, hit->disproof_rz);
+          hit->proof_rz, hit->disproof_rz, inh_cap);
       return;
     }
   }
@@ -373,105 +579,123 @@ void DfpnSolver<N>::MidSearch(
   if (config_.enable_pattern_tt) {
     RadixPatternRecord<N> pat_rec;
     const PatternHitGrade grade =
-        tt_store_.LookupPatternTT(pos, context, &pat_rec);
+        tt_store_.LookupPatternTT(pos, context, &pat_rec, reval_cb);
     if (grade == PatternHitGrade::kProofReusable &&
         pat_rec.proof_dag_node_id < report_.proof_dag_nodes.size()) {
+      const bool inh_cap =
+          pat_rec.has_capture_in_subtree ||
+          (pat_rec.proof_dag_node_id < dag_has_capture_.size() &&
+           dag_has_capture_[pat_rec.proof_dag_node_id]);
       *out_pn = pat_rec.pn;
       *out_dn = pat_rec.dn;
       *out_outcome = pat_rec.outcome;
+      *out_has_capture = inh_cap;
       *out_proof_rz = pat_rec.stored_rz;
       *out_disproof_rz = pat_rec.stored_rz;
       *out_dag_node_id = emit_tt_hit_node(
           pat_rec.proof_dag_node_id, pat_rec.pn, pat_rec.dn, pat_rec.outcome,
-          pat_rec.stored_rz, pat_rec.stored_rz);
-      return;
-    }
-    if (grade == PatternHitGrade::kHeuristicOnly &&
-        pat_rec.proof_closure_available &&
-        pat_rec.proof_dag_node_id < report_.proof_dag_nodes.size() &&
-        RevalidateSourceProofOnQueryState(
-            pos, context, region_hint, pat_rec.proof_dag_node_id,
-            pat_rec.outcome)) {
-      *out_pn = pat_rec.pn;
-      *out_dn = pat_rec.dn;
-      *out_outcome = pat_rec.outcome;
-      *out_proof_rz = pat_rec.stored_rz;
-      *out_disproof_rz = pat_rec.stored_rz;
-      *out_dag_node_id = emit_tt_hit_node(
-          pat_rec.proof_dag_node_id, pat_rec.pn, pat_rec.dn, pat_rec.outcome,
-          pat_rec.stored_rz, pat_rec.stored_rz);
+          pat_rec.stored_rz, pat_rec.stored_rz, inh_cap);
       return;
     }
   }
 
-  // Step 5: Generate legal moves and apply deterministic FastCapture ordering.
-  std::vector<int16_t> legal_moves = pos.GenerateLegalMoves(region_hint);
-  std::vector<SearchChild> children;
-  children.reserve(legal_moves.size());
-  for (int16_t mv : legal_moves) {
-    SearchChild ch;
-    ch.move = mv;
-    ch.tactical_score =
+  // Step 5: Retrieve or initialize persistent CachedNodeFrontier for this exact
+  // search-tree path node so threshold cutoffs preserve child (pn, dn) and RZ!
+  auto frontier_it = node_frontier_cache_.find(node_path_id);
+  if (frontier_it == node_frontier_cache_.end()) {
+    CachedNodeFrontier fresh;
+    std::vector<int16_t> legal_moves = pos.GenerateLegalMoves(region_hint);
+    fresh.children.reserve(legal_moves.size());
+    const NodeTacticalContext tctx =
         config_.enable_fast_capture_ordering
-            ? ScoreMoveFastCapture(pos, context, mv, is_or_node)
-            : 0;
-    children.push_back(ch);
-  }
-  if (config_.enable_fast_capture_ordering) {
-    std::stable_sort(
-        children.begin(), children.end(),
-        [](const SearchChild& a, const SearchChild& b) {
-          return a.tactical_score > b.tactical_score;
-        });
-    for (size_t idx = 0; idx < children.size(); ++idx) {
-      const uint32_t rank_metric =
-          (idx == 0) ? 1U : (idx <= 2 ? 2U : static_cast<uint32_t>(idx + 1));
-      if (is_or_node) {
-        children[idx].pn =
-            (children[idx].move == kPassMove) ? 120U : rank_metric;
-        children[idx].dn = 1U;
-      } else {
-        children[idx].pn = 1U;
-        children[idx].dn =
-            (children[idx].move == kPassMove) ? 2U : rank_metric;
+            ? BuildNodeTacticalContext(pos, context)
+            : NodeTacticalContext{};
+    for (int16_t mv : legal_moves) {
+      SearchChild ch;
+      ch.move = mv;
+      ch.child_path_id = next_path_id_++;
+      ch.tactical_score =
+          config_.enable_fast_capture_ordering
+              ? ScoreMoveFastCapture(pos, context, tctx, mv, is_or_node)
+              : 0;
+      fresh.children.push_back(ch);
+    }
+    if (config_.enable_fast_capture_ordering) {
+      std::stable_sort(
+          fresh.children.begin(), fresh.children.end(),
+          [](const SearchChild& a, const SearchChild& b) {
+            return a.tactical_score > b.tactical_score;
+          });
+      for (size_t idx = 0; idx < fresh.children.size(); ++idx) {
+        const uint32_t rank_metric =
+            (idx == 0) ? 1U : (idx <= 2 ? 2U : static_cast<uint32_t>(idx + 1));
+        if (is_or_node) {
+          fresh.children[idx].pn =
+              (fresh.children[idx].move == kPassMove) ? 120U : rank_metric;
+          fresh.children[idx].dn = 1U;
+        } else {
+          fresh.children[idx].pn = 1U;
+          fresh.children[idx].dn =
+              (fresh.children[idx].move == kPassMove) ? 1U : rank_metric;
+        }
       }
     }
+    node_frontier_cache_.emplace(node_path_id, std::move(fresh));
   }
 
   in_path_hashes.insert(pos.ZobristHash());
 
-  uint32_t widening_level = 0;
-  ProofCertificateRZ<N> active_null_move_rz;
-  bool has_null_move_rz = false;
-  uint32_t representative_dag_id = kInvalidDagNodeId;
-  ProofOutcome representative_outcome = ProofOutcome::kUnknown;
-
   while (true) {
+    CachedNodeFrontier& frontier = node_frontier_cache_.at(node_path_id);
+    auto& children = frontier.children;
     const size_t total_legal = children.size();
+
+    // When a sibling null-move certificate RZ is already known, open the full
+    // widening window immediately so OutsideRZRevalidated can bulk-prune moves.
+    if (frontier.has_null_move_rz && frontier.widening_level < 6U) {
+      frontier.widening_level = 6U;
+    }
+
     size_t window_size = total_legal;
-    if (config_.enable_progressive_widening && widening_level < 4) {
+    if (config_.enable_progressive_widening && frontier.widening_level < 5U) {
       const size_t cap =
-          static_cast<size_t>(config_.widening_base_k) << widening_level;
+          static_cast<size_t>(config_.widening_base_k)
+          << frontier.widening_level;
       if (cap < total_legal) window_size = cap;
     }
 
     // FR-5.5: Try Outside-RZ null-move certificate pruning on unexpanded moves
-    // when an active sibling certificate RZ exists.
-    if (config_.enable_rz_pruning && has_null_move_rz) {
+    // whenever a new/smaller sibling certificate RZ becomes available.
+    if (config_.enable_rz_pruning && frontier.has_null_move_rz &&
+        frontier.checked_null_move_dag_id != frontier.representative_dag_id) {
+      frontier.checked_null_move_dag_id = frontier.representative_dag_id;
       const bool restricted_side =
-          (pos.ToPlay() == context.root_attacker && !context.attacker_allow_ko) ||
-          (pos.ToPlay() != context.root_attacker && !context.defender_allow_ko);
+          (pos.ToPlay() == context.root_attacker &&
+           !context.attacker_allow_ko) ||
+          (pos.ToPlay() != context.root_attacker &&
+           !context.defender_allow_ko);
+      const bool rep_has_cap =
+          frontier.representative_dag_id < dag_has_capture_.size() &&
+          dag_has_capture_[frontier.representative_dag_id];
+      const int prev_opp_cnt =
+          pos.Stones(OppositeColor(pos.ToPlay())).Count();
+
       for (size_t i = 0; i < window_size; ++i) {
         auto& ch = children[i];
         if (ch.expanded || ch.outcome != ProofOutcome::kUnknown) continue;
-        if (rz_engine_.IsOutsideRZCandidate(ch.move, active_null_move_rz)) {
+        if (rz_engine_.IsOutsideRZCandidate(ch.move,
+                                            frontier.active_null_move_rz)) {
           Position<N> next_pos = pos;
           bool is_ko_cap = false;
           if (next_pos.PlayMove(ch.move, &is_ko_cap) &&
               !(is_ko_cap && restricted_side) &&
               RevalidateSourceProofOnQueryState(
-                  next_pos, context, region_hint, representative_dag_id,
-                  representative_outcome)) {
+                  next_pos, context, region_hint,
+                  frontier.representative_dag_id,
+                  frontier.representative_outcome)) {
+            const bool did_cap =
+                next_pos.Stones(OppositeColor(pos.ToPlay())).Count() <
+                prev_opp_cnt;
             ProofDagNode<N> pruned_node;
             pruned_node.node_id =
                 static_cast<uint32_t>(report_.proof_dag_nodes.size());
@@ -479,27 +703,30 @@ void DfpnSolver<N>::MidSearch(
             pruned_node.to_play = next_pos.ToPlay();
             pruned_node.incoming_move = ch.move;
             pruned_node.pn =
-                (representative_outcome == ProofOutcome::kProvenWin)
+                (frontier.representative_outcome == ProofOutcome::kProvenWin)
                     ? 0
                     : kPnDnSaturation;
             pruned_node.dn =
-                (representative_outcome == ProofOutcome::kProvenWin)
+                (frontier.representative_outcome == ProofOutcome::kProvenWin)
                     ? kPnDnSaturation
                     : 0;
-            pruned_node.outcome = representative_outcome;
+            pruned_node.outcome = frontier.representative_outcome;
             pruned_node.is_pruned_outside_rz = true;
-            pruned_node.source_proof_node_id = representative_dag_id;
-            pruned_node.proof_rz = active_null_move_rz;
-            pruned_node.disproof_rz = active_null_move_rz;
+            pruned_node.source_proof_node_id = frontier.representative_dag_id;
+            pruned_node.proof_rz = frontier.active_null_move_rz;
+            pruned_node.disproof_rz = frontier.active_null_move_rz;
             report_.proof_dag_nodes.push_back(pruned_node);
+            dag_has_capture_.push_back(rep_has_cap);
 
             ch.expanded = true;
             ch.pruned_outside_rz = true;
-            ch.outcome = representative_outcome;
+            ch.move_captured = did_cap;
+            ch.subtree_has_capture = rep_has_cap;
+            ch.outcome = frontier.representative_outcome;
             ch.pn = pruned_node.pn;
             ch.dn = pruned_node.dn;
-            ch.proof_rz = active_null_move_rz;
-            ch.disproof_rz = active_null_move_rz;
+            ch.proof_rz = frontier.active_null_move_rz;
+            ch.disproof_rz = frontier.active_null_move_rz;
             ch.dag_node_id = pruned_node.node_id;
             ++report_.pruned_outside_rz_count;
           }
@@ -514,7 +741,7 @@ void DfpnSolver<N>::MidSearch(
         (unexpanded_u > 0)
             ? std::max(is_or_node ? children[window_size].pn
                                   : children[window_size].dn,
-                       8U * (widening_level + 1U))
+                       8U * (frontier.widening_level + 1U))
             : kPnDnSaturation;
     uint32_t cur_pn = 1;
     uint32_t cur_dn = 1;
@@ -530,7 +757,7 @@ void DfpnSolver<N>::MidSearch(
         min_pn = std::min(min_pn, widen_trigger);
       }
       if (sum_dn == 0 && window_size < total_legal) {
-        ++widening_level;
+        ++frontier.widening_level;
         ++report_.widening_upgrades;
         continue;
       }
@@ -547,7 +774,7 @@ void DfpnSolver<N>::MidSearch(
         min_dn = std::min(min_dn, widen_trigger);
       }
       if (sum_pn == 0 && window_size < total_legal) {
-        ++widening_level;
+        ++frontier.widening_level;
         ++report_.widening_upgrades;
         continue;
       }
@@ -560,7 +787,7 @@ void DfpnSolver<N>::MidSearch(
       // Full coverage required for OR->Loss (cur_dn == 0) and AND->Win (cur_pn == 0).
       if (((is_or_node && cur_dn == 0) || (!is_or_node && cur_pn == 0)) &&
           window_size < total_legal) {
-        ++widening_level;
+        ++frontier.widening_level;
         ++report_.widening_upgrades;
         continue;
       }
@@ -572,6 +799,7 @@ void DfpnSolver<N>::MidSearch(
 
       std::vector<uint32_t> proven_child_ids;
       std::vector<int16_t> proven_child_moves;
+      bool node_has_capture = false;
 
       if (is_existential) {
         int witness_idx = -1;
@@ -592,7 +820,8 @@ void DfpnSolver<N>::MidSearch(
           *out_dag_node_id = kInvalidDagNodeId;
           break;
         }
-        const auto& w = children[witness_idx];
+        const auto& w = children[static_cast<size_t>(witness_idx)];
+        node_has_capture = w.move_captured || w.subtree_has_capture;
         if (is_or_node) {
           *out_proof_rz =
               rz_engine_.ComputeSingleWitnessRZ(pos, w.move, w.proof_rz);
@@ -616,6 +845,9 @@ void DfpnSolver<N>::MidSearch(
             all_valid = false;
             break;
           }
+          if (ch.move_captured || ch.subtree_has_capture) {
+            node_has_capture = true;
+          }
           child_rzs.push_back(is_or_node ? ch.disproof_rz : ch.proof_rz);
           proven_child_ids.push_back(ch.dag_node_id);
           proven_child_moves.push_back(ch.move);
@@ -633,11 +865,23 @@ void DfpnSolver<N>::MidSearch(
         } else {
           *out_proof_rz = rz_engine_.ComputeAllChildrenUnionRZ(pos, child_rzs);
         }
+        // Guarantee a verified root bestMove on universal proven roots (LP-R02).
+        if (depth == 0 && !proven_child_moves.empty()) {
+          int16_t chosen_mv = proven_child_moves[0];
+          for (int16_t mv : proven_child_moves) {
+            if (mv != kPassMove) {
+              chosen_mv = mv;
+              break;
+            }
+          }
+          report_.best_move = chosen_mv;
+        }
       }
 
       *out_pn = cur_pn;
       *out_dn = cur_dn;
       *out_outcome = target_outcome;
+      *out_has_capture = node_has_capture;
 
       ProofDagNode<N> dag_node;
       dag_node.node_id = static_cast<uint32_t>(report_.proof_dag_nodes.size());
@@ -652,23 +896,28 @@ void DfpnSolver<N>::MidSearch(
       dag_node.child_node_ids = std::move(proven_child_ids);
       dag_node.child_moves = std::move(proven_child_moves);
       report_.proof_dag_nodes.push_back(dag_node);
+      dag_has_capture_.push_back(node_has_capture);
       *out_dag_node_id = dag_node.node_id;
 
       tt_store_.StoreBoardTT(pos, context, *out_pn, *out_dn, *out_outcome,
                              *out_ko_dependent, true, *out_dag_node_id,
-                             *out_proof_rz, *out_disproof_rz);
+                             *out_proof_rz, *out_disproof_rz,
+                             node_has_capture);
       if (config_.enable_pattern_tt) {
         const ProofCertificateRZ<N>& active_rz =
             (*out_outcome == ProofOutcome::kProvenWin) ? *out_proof_rz
                                                        : *out_disproof_rz;
         tt_store_.StorePatternTT(pos, context, active_rz, *out_pn, *out_dn,
-                                 *out_outcome, *out_dag_node_id, true);
+                                 *out_outcome, *out_dag_node_id, true,
+                                 node_has_capture);
       }
+      // Once proven, free the frontier entry to reclaim memory immediately.
+      node_frontier_cache_.erase(node_path_id);
       break;
     }
 
-    // Threshold cutoff check (FR-4.3: OR condition).
-    if (IsMemoryBudgetExceeded()) {
+    // Threshold cutoff & resource checks (FR-4.3: OR condition).
+    if (IsMemoryBudgetExceeded(depth)) {
       report_.resource_exhausted = true;
       report_.unknown_reason = UnknownReason::kMemoryBudget;
       *out_pn = cur_pn;
@@ -688,6 +937,22 @@ void DfpnSolver<N>::MidSearch(
       break;
     }
 
+    // At AND nodes (defender to play) with 0 consecutive passes and no sibling
+    // RZ yet, probe PASS first to seed OutsideRZRevalidated null-move pruning.
+    int force_expand_pass_idx = -1;
+    if (config_.enable_rz_pruning && !is_or_node &&
+        pos.ConsecutivePasses() == 0 && !frontier.has_null_move_rz &&
+        children.size() > 1U) {
+      for (size_t i = 0; i < window_size; ++i) {
+        if (children[i].move == kPassMove && !children[i].expanded &&
+            !children[i].ko_dependent &&
+            children[i].outcome == ProofOutcome::kUnknown) {
+          force_expand_pass_idx = static_cast<int>(i);
+          break;
+        }
+      }
+    }
+
     // Select most-proving child within current window (skipping ko_dependent barriers).
     int best_idx = -1;
     uint32_t best_metric = kPnDnSaturation;
@@ -705,10 +970,15 @@ void DfpnSolver<N>::MidSearch(
       }
     }
 
+    if (force_expand_pass_idx >= 0) {
+      best_idx = force_expand_pass_idx;
+      best_metric = children[static_cast<size_t>(best_idx)].dn;
+    }
+
     // Progressive Widening upgrade condition (FR-4.4).
-    if (unexpanded_u > 0) {
+    if (unexpanded_u > 0 && force_expand_pass_idx < 0) {
       if (best_idx < 0 || best_metric >= widen_trigger) {
-        ++widening_level;
+        ++frontier.widening_level;
         ++report_.widening_upgrades;
         continue;
       }
@@ -722,8 +992,13 @@ void DfpnSolver<N>::MidSearch(
       break;
     }
 
-    auto& mpc = children[best_idx];
-    if (depth == 0) report_.best_move = mpc.move;
+    const int16_t chosen_move = children[static_cast<size_t>(best_idx)].move;
+    const uint64_t chosen_path_id =
+        children[static_cast<size_t>(best_idx)].child_path_id;
+    const uint32_t chosen_pn = children[static_cast<size_t>(best_idx)].pn;
+    const uint32_t chosen_dn = children[static_cast<size_t>(best_idx)].dn;
+    if (depth == 0) report_.best_move = chosen_move;
+
     const uint32_t eps_bound = ClampSat(std::max<uint64_t>(
         static_cast<uint64_t>(second_best_metric) + 1ULL,
         static_cast<uint64_t>(second_best_metric) * 5ULL / 4ULL + 2ULL));
@@ -731,36 +1006,63 @@ void DfpnSolver<N>::MidSearch(
     uint32_t child_th_dn = th_dn;
     if (is_or_node) {
       child_th_pn = std::min(th_pn, eps_bound);
-      const uint64_t other_dn = cur_dn - mpc.dn;
-      child_th_dn = (th_dn >= kPnDnSaturation)
-                        ? kPnDnSaturation
-                        : ((th_dn > other_dn)
-                               ? std::max(2U, static_cast<uint32_t>(th_dn - other_dn))
-                               : 1U);
+      const uint64_t other_dn = cur_dn - chosen_dn;
+      child_th_dn =
+          (th_dn >= kPnDnSaturation)
+              ? kPnDnSaturation
+              : ((th_dn > other_dn)
+                     ? std::max(2U, static_cast<uint32_t>(th_dn - other_dn))
+                     : 1U);
     } else {
-      const uint64_t other_pn = cur_pn - mpc.pn;
-      child_th_pn = (th_pn >= kPnDnSaturation)
-                        ? kPnDnSaturation
-                        : ((th_pn > other_pn)
-                               ? std::max(2U, static_cast<uint32_t>(th_pn - other_pn))
-                               : 1U);
+      const uint64_t other_pn = cur_pn - chosen_pn;
+      child_th_pn =
+          (th_pn >= kPnDnSaturation)
+              ? kPnDnSaturation
+              : ((th_pn > other_pn)
+                     ? std::max(2U, static_cast<uint32_t>(th_pn - other_pn))
+                     : 1U);
       child_th_dn = std::min(th_dn, eps_bound);
     }
 
+    const int prev_opp_stones =
+        pos.Stones(OppositeColor(pos.ToPlay())).Count();
     bool is_ko_capture = false;
-    if (!pos.PlayMove(mpc.move, &is_ko_capture)) {
+    if (!pos.PlayMove(chosen_move, &is_ko_capture)) {
       *out_pn = 1;
       *out_dn = 1;
       *out_outcome = ProofOutcome::kUnknown;
       *out_dag_node_id = kInvalidDagNodeId;
       break;
     }
+    const bool move_captured =
+        pos.Stones(pos.ToPlay()).Count() < prev_opp_stones;
 
+    uint32_t c_pn = 1;
+    uint32_t c_dn = 1;
+    ProofOutcome c_outcome = ProofOutcome::kUnknown;
     bool child_ko_dep = false;
-    MidSearch(pos, context, region_hint, child_th_pn, child_th_dn, depth + 1,
-              in_path_hashes, &mpc.pn, &mpc.dn, &mpc.outcome, &child_ko_dep,
-              &mpc.proof_rz, &mpc.disproof_rz, &mpc.dag_node_id, mpc.move);
+    bool child_has_capture = false;
+    ProofCertificateRZ<N> c_proof_rz{};
+    ProofCertificateRZ<N> c_disproof_rz{};
+    uint32_t c_dag_id = kInvalidDagNodeId;
+
+    MidSearch(pos, context, region_hint, child_th_pn, child_th_dn, depth + 1U,
+              chosen_path_id, in_path_hashes, &c_pn, &c_dn, &c_outcome,
+              &child_ko_dep, &child_has_capture, &c_proof_rz, &c_disproof_rz,
+              &c_dag_id, chosen_move);
     pos.UndoMove();
+
+    // Re-fetch frontier & child reference safely after recursive MidSearch.
+    CachedNodeFrontier& post_frontier = node_frontier_cache_.at(node_path_id);
+    auto& mpc = post_frontier.children[static_cast<size_t>(best_idx)];
+    mpc.pn = c_pn;
+    mpc.dn = c_dn;
+    mpc.outcome = c_outcome;
+    mpc.move_captured = move_captured;
+    mpc.subtree_has_capture = child_has_capture;
+    mpc.proof_rz = c_proof_rz;
+    mpc.disproof_rz = c_disproof_rz;
+    mpc.dag_node_id = c_dag_id;
 
     // FR-5.7: KoDependent witness barrier check (propagates child_ko_dep too!).
     const bool restricted_side =
@@ -784,20 +1086,24 @@ void DfpnSolver<N>::MidSearch(
     // Never seed OR-node active_null_move_rz from PASS_MOVE (DOUBLE_PASS_RESOLUTION)!
     if (!is_or_node && mpc.pn == 0 && mpc.dag_node_id != kInvalidDagNodeId &&
         mpc.proof_rz.Size() > 0 &&
-        (!has_null_move_rz || mpc.proof_rz.Size() < active_null_move_rz.Size())) {
-      active_null_move_rz = mpc.proof_rz;
-      has_null_move_rz = true;
-      representative_dag_id = mpc.dag_node_id;
-      representative_outcome = ProofOutcome::kProvenWin;
+        (!post_frontier.has_null_move_rz ||
+         mpc.proof_rz.Size() < post_frontier.active_null_move_rz.Size())) {
+      post_frontier.active_null_move_rz = mpc.proof_rz;
+      post_frontier.has_null_move_rz = true;
+      post_frontier.representative_dag_id = mpc.dag_node_id;
+      post_frontier.representative_outcome = ProofOutcome::kProvenWin;
+      post_frontier.checked_null_move_dag_id = kInvalidDagNodeId;
     } else if (is_or_node && mpc.move != kPassMove && mpc.dn == 0 &&
                mpc.dag_node_id != kInvalidDagNodeId &&
                mpc.disproof_rz.Size() > 0 &&
-               (!has_null_move_rz ||
-                mpc.disproof_rz.Size() < active_null_move_rz.Size())) {
-      active_null_move_rz = mpc.disproof_rz;
-      has_null_move_rz = true;
-      representative_dag_id = mpc.dag_node_id;
-      representative_outcome = ProofOutcome::kProvenLoss;
+               (!post_frontier.has_null_move_rz ||
+                mpc.disproof_rz.Size() <
+                    post_frontier.active_null_move_rz.Size())) {
+      post_frontier.active_null_move_rz = mpc.disproof_rz;
+      post_frontier.has_null_move_rz = true;
+      post_frontier.representative_dag_id = mpc.dag_node_id;
+      post_frontier.representative_outcome = ProofOutcome::kProvenLoss;
+      post_frontier.checked_null_move_dag_id = kInvalidDagNodeId;
     }
   }
 

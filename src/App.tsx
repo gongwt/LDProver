@@ -327,8 +327,21 @@ export default function App() {
   const standaloneJsonVerification = useMemo((): VerificationReport | null => {
     if (activeTab !== 'checker' || faultMode !== 'none') return null;
     const checker = new ProofArtifactManager();
-    return checker.verifySerializedLProofJson(solveReport.lproofJson);
-  }, [activeTab, faultMode, solveReport.lproofJson]);
+    const isManualSub = solveManualSubposition && manualMoves.length > 0;
+    return checker.verifySerializedLProofJson(solveReport.lproofJson, {
+      problem: currentProblem,
+      context: proofContext,
+      scope: isManualSub ? 'free_exploration' : 'original_root',
+    });
+  }, [
+    activeTab,
+    faultMode,
+    solveReport.lproofJson,
+    currentProblem,
+    proofContext,
+    solveManualSubposition,
+    manualMoves.length,
+  ]);
 
   const handleSelectProblem = (
     problemId: string,

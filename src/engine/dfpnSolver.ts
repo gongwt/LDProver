@@ -70,12 +70,24 @@ interface CachedNodeFrontier {
   anyKoDependent: boolean;
 }
 
+interface NodeTacticalContext {
+  chainIdAt: Int32Array;
+  chainLibs: Int32Array;
+  chainMinStone: Int32Array;
+  chainIsImmortal: Uint8Array;
+  chainIsCuttingEnemy: Uint8Array;
+  crucialStoneMask: Uint8Array;
+  crucialLibMinLibs: Int32Array;
+  targetColor: Color;
+}
+
 export class DfpnSolver {
   private readonly config: SolverConfig;
   private readonly terminalEval = new BensonTerminalEvaluator();
   private readonly rzEngine = new RelevanceZoneEngine();
   private readonly ttStore = new TranspositionStore();
-  private readonly nodeFrontierCache = new Map<string, CachedNodeFrontier>();
+  private readonly nodeFrontierCache = new Map<number, CachedNodeFrontier>();
+  private readonly revalCache = new Map<string, boolean>();
   private activeAttentionMask: NNAttentionMask | null = null;
 
   private numNodes = 0;
@@ -114,6 +126,7 @@ export class DfpnSolver {
     const startTime = performance.now();
     this.ttStore.clearAll();
     this.nodeFrontierCache.clear();
+    this.revalCache.clear();
     this.numNodes = 0;
     this.prunedOutsideRzCount = 0;
     this.wideningUpgrades = 0;
@@ -446,13 +459,152 @@ export class DfpnSolver {
     this.historyTable = newHistories;
   }
 
+  // Precompute all chain IDs, liberties, crucial-stone liberties, and cutting enemy chains ONCE per frontier node.
+  private buildNodeTacticalContext(
+    pos: GoPosition,
+    context: ProofContext
+  ): NodeTacticalContext {
+    const gridLen = pos.grid.length;
+    const chainIdAt = new Int32Array(gridLen).fill(-1);
+    const maxChains = gridLen;
+    const chainLibs = new Int32Array(maxChains);
+    const chainMinStone = new Int32Array(maxChains);
+    const chainIsImmortal = new Uint8Array(maxChains);
+    const chainIsCuttingEnemy = new Uint8Array(maxChains);
+    const crucialStoneMask = new Uint8Array(gridLen);
+    const crucialLibMinLibs = new Int32Array(gridLen).fill(99);
+
+    const q = new Int32Array(gridLen);
+    const libStamp = new Int32Array(gridLen).fill(-1);
+    const enemyColor = oppositeColor(pos.toPlay);
+    let numChains = 0;
+
+    for (let coord = 0; coord < gridLen; coord++) {
+      const col = pos.grid[coord];
+      if (col === Color.Empty || chainIdAt[coord] !== -1) continue;
+      const cid = numChains++;
+      chainIdAt[coord] = cid;
+      q[0] = coord;
+      let head = 0;
+      let tail = 1;
+      let minStone = coord;
+      let immortal = pos.immortalWallSet.has(coord);
+      let libs = 0;
+
+      while (head < tail) {
+        const cur = q[head++];
+        if (cur < minStone) minStone = cur;
+        const nbs = pos.orthogonalNeighbors(cur);
+        for (let i = 0; i < nbs.length; i++) {
+          const nb = nbs[i];
+          const st = pos.grid[nb];
+          if (st === col) {
+            if (chainIdAt[nb] === -1) {
+              chainIdAt[nb] = cid;
+              if (!immortal && pos.immortalWallSet.has(nb)) immortal = true;
+              q[tail++] = nb;
+            }
+          } else if (st === Color.Empty) {
+            if (libStamp[nb] !== cid) {
+              libStamp[nb] = cid;
+              libs++;
+            }
+          }
+        }
+      }
+
+      chainLibs[cid] = libs;
+      chainMinStone[cid] = minStone;
+      chainIsImmortal[cid] = immortal ? 1 : 0;
+    }
+
+    // Mark cutting enemy chains (non-immortal enemy chains with <= 3 liberties touching >= 2 friendly chains)
+    const seenEnemyChain = new Uint8Array(numChains);
+    for (let coord = 0; coord < gridLen; coord++) {
+      if (pos.grid[coord] !== enemyColor) continue;
+      const cid = chainIdAt[coord];
+      if (
+        cid < 0 ||
+        seenEnemyChain[cid] ||
+        chainIsImmortal[cid] ||
+        chainLibs[cid] > 3
+      ) {
+        continue;
+      }
+      seenEnemyChain[cid] = 1;
+      // Scan this enemy chain's orthogonal friendly neighbors
+      let firstFriendlyCid = -1;
+      let secondFriendlyFound = false;
+      for (let p = coord; p < gridLen && !secondFriendlyFound; p++) {
+        if (chainIdAt[p] !== cid) continue;
+        const nbs = pos.orthogonalNeighbors(p);
+        for (let i = 0; i < nbs.length; i++) {
+          const nb = nbs[i];
+          if (pos.grid[nb] === pos.toPlay) {
+            const fcid = chainIdAt[nb];
+            if (firstFriendlyCid === -1) {
+              firstFriendlyCid = fcid;
+            } else if (fcid !== firstFriendlyCid) {
+              secondFriendlyFound = true;
+              break;
+            }
+          }
+        }
+      }
+      if (secondFriendlyFound) {
+        chainIsCuttingEnemy[cid] = 1;
+      }
+    }
+
+    // Mark surviving crucial target chains and their liberties
+    const seenCrucialChains = new Set<number>();
+    for (let idx = 0; idx < context.initialTokens.length; idx++) {
+      if ((pos.survivingTargetTokensMask & (1 << idx)) === 0) continue;
+      const tok = context.initialTokens[idx];
+      const cid = chainIdAt[tok.initialCoord];
+      if (cid < 0 || seenCrucialChains.has(cid)) continue;
+      seenCrucialChains.add(cid);
+      const libs = chainLibs[cid];
+      for (let p = 0; p < gridLen; p++) {
+        if (chainIdAt[p] !== cid) continue;
+        crucialStoneMask[p] = 1;
+        const nbs = pos.orthogonalNeighbors(p);
+        for (let i = 0; i < nbs.length; i++) {
+          const nb = nbs[i];
+          if (pos.grid[nb] === Color.Empty && libs < crucialLibMinLibs[nb]) {
+            crucialLibMinLibs[nb] = libs;
+          }
+        }
+      }
+    }
+
+    const targetColor =
+      context.initialTokens.length > 0
+        ? context.initialTokens[0].stoneColor
+        : context.attackerGoal === SearchGoal.ToLive
+        ? context.rootAttacker
+        : oppositeColor(context.rootAttacker);
+
+    return {
+      chainIdAt,
+      chainLibs,
+      chainMinStone,
+      chainIsImmortal,
+      chainIsCuttingEnemy,
+      crucialStoneMask,
+      crucialLibMinLibs,
+      targetColor,
+    };
+  }
+
   // FR-4.10: Fast tactical move ordering & heuristic initial (pn, dn) estimation
   private evaluateCandidateMove(
     pos: GoPosition,
     context: ProofContext,
     move: number,
     isOrNode: boolean,
-    parentEyeLikeCount: number
+    parentEyeLikeCount: number,
+    tacCtx: NodeTacticalContext
   ): {
     score: number;
     immediateWin: boolean;
@@ -463,7 +615,7 @@ export class DfpnSolver {
       if (pos.consecutivePasses >= 1) {
         const probe = pos.clone();
         probe.playMove(PASS_MOVE);
-        const term = this.terminalEval.evaluateTerminal(probe, context);
+        const term = this.terminalEval.evaluateTerminal(probe, context, false);
         if (isOrNode && term.status === TerminalStatus.Win) {
           return {
             score: 60000,
@@ -481,21 +633,19 @@ export class DfpnSolver {
           };
         }
       }
-      // At AND nodes (consecutivePasses === 0), keep Null-Move (PASS) inside the initial window:
-      // #1 priority when attacker already has >= 2 eye-like pockets, or mid-window (#4..#6)
-      // otherwise so W[pass] establishes a compact activeNullMoveRz for OutsideRZRevalidated
-      // across the full 153-point region once urgent tactical refutations fail!
+      // At AND nodes (consecutivePasses === 0), prioritize Null-Move (PASS) inside the initial
+      // window so `activeNullMoveRz` is seeded early for OutsideRZRevalidated pruning!
       if (!isOrNode && pos.consecutivePasses === 0) {
         if (parentEyeLikeCount >= 2) {
           return {
-            score: 1650,
+            score: 1950,
             immediateWin: false,
             immediateLoss: false,
             inAttention: true,
           };
         }
         return {
-          score: 360,
+          score: this.config.enableRzPruning ? 1050 : 360,
           immediateWin: false,
           immediateLoss: false,
           inAttention: true,
@@ -513,13 +663,13 @@ export class DfpnSolver {
       ? this.activeAttentionMask.coords.has(move)
       : true;
 
-    // Fast O(1) path for outer buffer-moat moves (`!inAttention`) that touch no tactical
-    // (non-immortal) stones: prevents outer-wall contact from out-scoring local eye/Null-Move!
+    const orthoNbs = pos.orthogonalNeighbors(move);
+
+    // Fast O(1) path for outer buffer-moat moves (`!inAttention`) that touch no tactical stones
     if (!inAttention) {
       let touchesTacticalStone = false;
-      const nbs = pos.orthogonalNeighbors(move);
-      for (let i = 0; i < nbs.length; i++) {
-        const nb = nbs[i];
+      for (let i = 0; i < orthoNbs.length; i++) {
+        const nb = orthoNbs[i];
         if (pos.grid[nb] !== Color.Empty && !pos.immortalWallSet.has(nb)) {
           touchesTacticalStone = true;
           break;
@@ -536,56 +686,73 @@ export class DfpnSolver {
     }
 
     let score = inAttention ? 150 : -950;
-
-    // 1. Proximity to crucial target chains and their liberties
-    context.initialTokens.forEach((tok, idx) => {
-      if ((pos.survivingTargetTokensMask & (1 << idx)) === 0) return;
-      const { stones, liberties } = pos.floodFillChain(tok.initialCoord);
-      if (liberties.has(move)) {
-        score += 550;
-        if (liberties.size === 1) score += 1350;
-        else if (liberties.size === 2) score += 720;
-      }
-      const adjCount = pos
-        .orthogonalNeighbors(move)
-        .filter((n) => stones.has(n)).length;
-      if (adjCount >= 2) score += 620;
-    });
-
     const enemyColor = oppositeColor(pos.toPlay);
 
-    // Pre-move liberty count of adjacent non-immortal enemy chains (Semeai / cutting stones)
+    // 1. O(1) Precomputed proximity to crucial target chains and their liberties
+    const r = Math.floor(move / pos.boardSize);
+    const c = move % pos.boardSize;
+    const distR = Math.min(r, pos.boardSize - 1 - r);
+    const distC = Math.min(c, pos.boardSize - 1 - c);
+    const distEdge = Math.min(distR, distC);
+
+    const cLibs = tacCtx.crucialLibMinLibs[move];
+    if (cLibs < 99) {
+      if (cLibs === 1) score += 1750;
+      else if (cLibs === 2) score += 1080;
+      else if (cLibs <= 4 || distEdge <= 2) score += 480;
+      else score += 220;
+    }
+    let adjCrucialCount = 0;
+    for (let i = 0; i < orthoNbs.length; i++) {
+      if (tacCtx.crucialStoneMask[orthoNbs[i]]) adjCrucialCount++;
+    }
+    if (adjCrucialCount >= 2) score += 580;
+
+    // Pre-move neighbor chain inspection (O(1) via NodeTacticalContext — zero floodFill!)
     let tightenedLowLibEnemy = false;
     let tightenedCuttingEnemy = false;
     let minEnemyLibBefore = 99;
-    const seenEnemyBefore = new Set<number>();
-    for (const nb of pos.orthogonalNeighbors(move)) {
-      if (
-        pos.stoneAt(nb) === enemyColor &&
-        !pos.immortalWallSet.has(nb) &&
-        !seenEnemyBefore.has(nb)
-      ) {
-        const echBefore = pos.floodFillChain(nb);
-        for (const s of echBefore.stones) seenEnemyBefore.add(s);
-        if (echBefore.liberties.size < minEnemyLibBefore) {
-          minEnemyLibBefore = echBefore.liberties.size;
+    let friendlyOrthoCount = 0;
+    let enemyOrthoCount = 0;
+    let hasTacticalFriendlyAdj = false;
+    let firstFriendlyCid = -1;
+    let connectsDistinctFriendly = false;
+    let emptyOrthoCount = 0;
+    let targetOrthoCount = 0;
+    let oppTargetOrthoCount = 0;
+    const oppTargetColor = oppositeColor(tacCtx.targetColor);
+
+    for (let i = 0; i < orthoNbs.length; i++) {
+      const nb = orthoNbs[i];
+      const st = pos.grid[nb];
+      if (st === Color.Empty) {
+        emptyOrthoCount++;
+      } else if (st === pos.toPlay) {
+        friendlyOrthoCount++;
+        const fcid = tacCtx.chainIdAt[nb];
+        if (!tacCtx.chainIsImmortal[fcid]) {
+          hasTacticalFriendlyAdj = true;
         }
-        if (echBefore.liberties.size <= 3) {
-          tightenedLowLibEnemy = true;
-          const adjFriendlyRoots = new Set<number>();
-          for (const es of echBefore.stones) {
-            for (const enb of pos.orthogonalNeighbors(es)) {
-              if (pos.stoneAt(enb) === pos.toPlay) {
-                const fch = pos.floodFillChain(enb);
-                adjFriendlyRoots.add(Math.min(...Array.from(fch.stones)));
-              }
+        if (tacCtx.chainLibs[fcid] >= 2) {
+          if (firstFriendlyCid === -1) firstFriendlyCid = fcid;
+          else if (firstFriendlyCid !== fcid) connectsDistinctFriendly = true;
+        }
+      } else if (st === enemyColor) {
+        enemyOrthoCount++;
+        const ecid = tacCtx.chainIdAt[nb];
+        if (!tacCtx.chainIsImmortal[ecid]) {
+          const elibs = tacCtx.chainLibs[ecid];
+          if (elibs < minEnemyLibBefore) minEnemyLibBefore = elibs;
+          if (elibs <= 3) {
+            tightenedLowLibEnemy = true;
+            if (tacCtx.chainIsCuttingEnemy[ecid]) {
+              tightenedCuttingEnemy = true;
             }
-          }
-          if (adjFriendlyRoots.size >= 2) {
-            tightenedCuttingEnemy = true;
           }
         }
       }
+      if (st === tacCtx.targetColor) targetOrthoCount++;
+      else if (st === oppTargetColor) oppTargetOrthoCount++;
     }
 
     // 2. Simulate move on probe for fast capture & chain liberty checks
@@ -647,106 +814,130 @@ export class DfpnSolver {
         }
       }
       if (isTesujiThrowIn) {
-        score += 920;
+        score += 780;
       } else {
-        const adjStone = pos
-          .orthogonalNeighbors(move)
-          .some((n) => probe.stoneAt(n) !== Color.Empty);
-        score += adjStone ? -180 : -750;
+        const adjStone = orthoNbs.some((n) => probe.grid[n] !== Color.Empty);
+        score += adjStone ? -240 : -780;
       }
     } else if (ourChain.liberties.size >= 3) {
       score += 240;
     }
 
     if (tightenedLowLibEnemy && ourChain.liberties.size >= 2) {
-      score += tightenedCuttingEnemy ? 780 : 420;
+      score += tightenedCuttingEnemy ? 740 : 380;
     }
 
-    for (const nb of pos.orthogonalNeighbors(move)) {
-      if (probe.stoneAt(nb) === enemyColor && !probe.immortalWallSet.has(nb)) {
-        const enemyCh = probe.floodFillChain(nb);
-        if (enemyCh.liberties.size === 1) {
-          score += 760;
-        } else if (
-          enemyCh.liberties.size === 2 &&
-          enemyCh.liberties.size < minEnemyLibBefore
-        ) {
-          score += 360;
+    if (enemyOrthoCount > 0) {
+      for (let i = 0; i < orthoNbs.length; i++) {
+        const nb = orthoNbs[i];
+        if (probe.grid[nb] === enemyColor && !probe.immortalWallSet.has(nb)) {
+          const enemyCh = probe.floodFillChain(nb);
+          if (enemyCh.liberties.size === 1) {
+            score += 740;
+          } else if (
+            enemyCh.liberties.size === 2 &&
+            enemyCh.liberties.size < minEnemyLibBefore
+          ) {
+            score += 340;
+          }
         }
       }
     }
 
-    // 3. Corner / Edge vital geometry heuristics
-    const r = Math.floor(move / pos.boardSize);
-    const c = move % pos.boardSize;
-    const distR = Math.min(r, pos.boardSize - 1 - r);
-    const distC = Math.min(c, pos.boardSize - 1 - c);
-    const distEdge = Math.min(distR, distC);
-
+    // 3. Corner / Edge & Symmetric Eye-Vitality Geometry Heuristics
+    // ("My opponent's vital point is my vital point": evaluate eye-making/splitting for BOTH sides!)
     if (distR === 1 && distC === 1) {
-      score += 440;
+      score += 560; // 2-2 vital corner point
     } else if (distEdge === 1) {
-      score += 240;
+      score += 300; // 2nd-line base / eye-space point
     } else if (distEdge === 0) {
-      score += 160;
+      score += 260; // 1st-line hane / descent / skirt point
     }
 
-    const friendlyChainRoots = new Set<number>();
-    let hasTacticalFriendlyAdj = false;
-    let friendlyOrthoCount = 0;
-    let enemyOrthoCount = 0;
-    for (const nb of pos.orthogonalNeighbors(move)) {
-      const st = pos.stoneAt(nb);
-      if (st === pos.toPlay) {
-        friendlyOrthoCount++;
-        if (!pos.immortalWallSet.has(nb)) {
-          hasTacticalFriendlyAdj = true;
-        }
-        const ch = pos.floodFillChain(nb);
-        if (ch.liberties.size >= 2) {
-          friendlyChainRoots.add(Math.min(...Array.from(ch.stones)));
-        }
-      } else if (st === enemyColor) {
-        enemyOrthoCount++;
-      }
-    }
-    if (friendlyChainRoots.size >= 2 && hasTacticalFriendlyAdj) {
-      score += 860;
+    if (connectsDistinctFriendly && hasTacticalFriendlyAdj) {
+      score += 820;
     }
 
+    const diagNbs = pos.diagonalNeighbors(move);
     let friendlyDiagCount = 0;
     let enemyDiagCount = 0;
-    for (const d of pos.diagonalNeighbors(move)) {
-      const st = pos.stoneAt(d);
+    let targetDiagCount = 0;
+    for (let i = 0; i < diagNbs.length; i++) {
+      const st = pos.grid[diagNbs[i]];
       if (st === pos.toPlay) friendlyDiagCount++;
       else if (st === enemyColor) enemyDiagCount++;
+      if (st === tacCtx.targetColor) targetDiagCount++;
     }
-    const emptyOrthoNbs = pos
-      .orthogonalNeighbors(move)
-      .filter((n) => pos.stoneAt(n) === Color.Empty);
-    if (emptyOrthoNbs.length >= 2 && inAttention) {
+
+    if (emptyOrthoCount >= 2 && inAttention) {
       // Check if two empty orthogonal neighbors are separated (vital eye-splitting / nakade point!)
       let splitsEyeCavity = false;
-      for (let i = 0; i < emptyOrthoNbs.length && !splitsEyeCavity; i++) {
-        for (let j = i + 1; j < emptyOrthoNbs.length; j++) {
-          const a = emptyOrthoNbs[i];
-          const b = emptyOrthoNbs[j];
-          const sharedEmpty = pos
-            .orthogonalNeighbors(a)
-            .some(
-              (x) =>
-                x !== move &&
-                pos.stoneAt(x) === Color.Empty &&
-                pos.orthogonalNeighbors(b).includes(x)
-            );
+      for (let i = 0; i < orthoNbs.length && !splitsEyeCavity; i++) {
+        const a = orthoNbs[i];
+        if (pos.grid[a] !== Color.Empty) continue;
+        const aNbs = pos.orthogonalNeighbors(a);
+        for (let j = i + 1; j < orthoNbs.length; j++) {
+          const b = orthoNbs[j];
+          if (pos.grid[b] !== Color.Empty) continue;
+          const bNbs = pos.orthogonalNeighbors(b);
+          let sharedEmpty = false;
+          for (let x = 0; x < aNbs.length; x++) {
+            const cand = aNbs[x];
+            if (
+              cand !== move &&
+              pos.grid[cand] === Color.Empty &&
+              bNbs.includes(cand)
+            ) {
+              sharedEmpty = true;
+              break;
+            }
+          }
           if (!sharedEmpty) {
             splitsEyeCavity = true;
             break;
           }
         }
       }
-      if (splitsEyeCavity && (friendlyOrthoCount >= 1 || enemyOrthoCount >= 1 || friendlyDiagCount >= 2 || enemyDiagCount >= 2)) {
-        score += 950;
+      if (
+        splitsEyeCavity &&
+        (friendlyOrthoCount >= 1 ||
+          enemyOrthoCount >= 1 ||
+          friendlyDiagCount >= 2 ||
+          enemyDiagCount >= 2)
+      ) {
+        score += 960;
+      }
+    }
+
+    // Calm eye-making / eye-destroying vital point along target group's 1st/2nd-line cavity
+    if (
+      inAttention &&
+      ourChain.liberties.size >= 2 &&
+      distEdge <= 1 &&
+      (targetDiagCount >= 1 || targetOrthoCount >= 1)
+    ) {
+      // Counts empty neighbors that become enclosed pockets around the target group
+      let enclosedEdgePockets = 0;
+      for (let i = 0; i < orthoNbs.length; i++) {
+        const enb = orthoNbs[i];
+        if (pos.grid[enb] !== Color.Empty) continue;
+        const enbNbs = pos.orthogonalNeighbors(enb);
+        let targetWalls = 0;
+        for (let j = 0; j < enbNbs.length; j++) {
+          const nn = enbNbs[j];
+          if (nn === move || pos.grid[nn] === tacCtx.targetColor) {
+            targetWalls++;
+          }
+        }
+        if (targetWalls >= enbNbs.length - 1) {
+          enclosedEdgePockets++;
+        }
+      }
+      if (enclosedEdgePockets >= 1) {
+        score += 480 + (enclosedEdgePockets >= 2 ? 360 : 0);
+      } else if (distEdge === 0 && emptyOrthoCount >= 1 && (targetOrthoCount >= 1 || oppTargetOrthoCount >= 1)) {
+        // 1st-line descent / hane extending or blocking eye base
+        score += 340;
       }
     }
 
@@ -754,36 +945,49 @@ export class DfpnSolver {
       friendlyDiagCount >= 2 &&
       enemyOrthoCount === 0 &&
       (friendlyOrthoCount === 0 ||
-        friendlyChainRoots.size >= 2 ||
+        connectsDistinctFriendly ||
         enemyDiagCount >= 1)
     ) {
-      score += 500;
-      for (const enb of pos.orthogonalNeighbors(move)) {
-        if (pos.stoneAt(enb) === Color.Empty) {
-          const enbFriendlyWalls = pos
-            .orthogonalNeighbors(enb)
-            .filter((n) => n === move || pos.stoneAt(n) === pos.toPlay).length;
+      score += 520;
+      for (let i = 0; i < orthoNbs.length; i++) {
+        const enb = orthoNbs[i];
+        if (pos.grid[enb] === Color.Empty) {
+          const enbNbs = pos.orthogonalNeighbors(enb);
+          let enbFriendlyWalls = 0;
+          for (let j = 0; j < enbNbs.length; j++) {
+            const n = enbNbs[j];
+            if (n === move || pos.grid[n] === pos.toPlay) enbFriendlyWalls++;
+          }
           if (enbFriendlyWalls >= 3) {
-            score += 680;
+            score += 620;
           }
         }
       }
     } else if (
-      emptyOrthoNbs.length <= 1 &&
+      enemyDiagCount >= 2 &&
+      friendlyOrthoCount === 0 &&
+      ourChain.liberties.size >= 2 &&
+      inAttention
+    ) {
+      // Symmetric opponent eye-vitality point (nakade / eye-stealing placement!)
+      score += 560;
+    } else if (
+      emptyOrthoCount <= 1 &&
       friendlyOrthoCount >= 1 &&
-      friendlyChainRoots.size <= 1 &&
+      !connectsDistinctFriendly &&
       friendlyDiagCount >= 2 &&
       enemyOrthoCount === 0 &&
       enemyDiagCount === 0
     ) {
       // Pure 1- or 2-point internal eye space under a single solid chain — avoid self-filling eye!
-      score -= 320;
+      score -= 340;
     }
+
     if (friendlyOrthoCount >= 1 && enemyOrthoCount >= 1) {
-      score += 380;
+      score += 340;
     }
     if (friendlyOrthoCount >= 1 && enemyDiagCount >= 1) {
-      score += 320;
+      score += 290;
     }
 
     return {
@@ -845,7 +1049,7 @@ export class DfpnSolver {
     }
   }
 
-  // FR-5.5: Revalidate source proof subgraph under QueryState + HistorySet (both witness & full-coverage!)
+  // FR-5.5: Memoized revalidation of source proof subgraph under QueryState + HistorySet
   private revalidateSourceProofOnQueryState(
     queryPos: GoPosition,
     context: ProofContext,
@@ -877,7 +1081,28 @@ export class DfpnSolver {
     }
     if (!sourceNode || sourceNode.outcome !== expectedOutcome) return false;
 
-    const checkEarlyTerminal = (): boolean | null => {
+    const resolvedId = sourceNode.nodeId;
+    const histTag = queryPos.isCaptureFreeMonotonicHistory()
+      ? 'M'
+      : queryPos.computeCanonicalHistoryKey();
+    const cacheKey = `${queryPos.computeZobristHex()}:${queryPos.toPlay}:${
+      queryPos.koPoint
+    }:${queryPos.consecutivePasses}:${
+      queryPos.survivingTargetTokensMask
+    }:${histTag}:${resolvedId}:${expectedOutcome}`;
+    const cached = this.revalCache.get(cacheKey);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const finish = (ok: boolean): boolean => {
+      if (ok || guardDepth <= 40) {
+        this.revalCache.set(cacheKey, ok);
+      }
+      return ok;
+    };
+
+    const checkEarlyTerminal = (): boolean => {
       const term = this.terminalEval.evaluateTerminal(queryPos, context, false);
       if (term.status === TerminalStatus.Win) {
         return expectedOutcome === ProofOutcome.ProvenWin;
@@ -885,11 +1110,11 @@ export class DfpnSolver {
       if (term.status === TerminalStatus.Loss) {
         return expectedOutcome === ProofOutcome.ProvenLoss;
       }
-      return null;
+      return false;
     };
 
     if (sourceNode.childNodeIds.length === 0 || queryPos.isAtDoublePass()) {
-      return checkEarlyTerminal() === true;
+      return finish(checkEarlyTerminal());
     }
 
     const isOr = queryPos.toPlay === context.rootAttacker;
@@ -926,10 +1151,10 @@ export class DfpnSolver {
             guardDepth + 1
           )
         ) {
-          return true;
+          return finish(true);
         }
       }
-      return checkEarlyTerminal() === true;
+      return finish(checkEarlyTerminal());
     }
 
     // Case 2: Full-coverage node (AND -> ProvenWin, or OR -> ProvenLoss)
@@ -940,10 +1165,11 @@ export class DfpnSolver {
     }
 
     const queryLegalMoves = queryPos.generateLegalMoves(regionCoords);
-    for (const mv of queryLegalMoves) {
+    for (let i = 0; i < queryLegalMoves.length; i++) {
+      const mv = queryLegalMoves[i];
       const childDagId = moveMap.get(mv);
       if (childDagId === undefined) {
-        return checkEarlyTerminal() === true;
+        return finish(checkEarlyTerminal());
       }
       const nextPos = queryPos.clone();
       const playRes = nextPos.playMove(mv);
@@ -958,11 +1184,11 @@ export class DfpnSolver {
           guardDepth + 1
         )
       ) {
-        return checkEarlyTerminal() === true;
+        return finish(checkEarlyTerminal());
       }
     }
 
-    return true;
+    return finish(true);
   }
 
   private isMemoryBudgetExceeded(): boolean {
@@ -1193,7 +1419,18 @@ export class DfpnSolver {
     }
 
     if (this.config.ttMode === 'pattern-tt') {
-      const patHit = this.ttStore.lookupPatternTT(pos, context);
+      const patHit = this.ttStore.lookupPatternTT(
+        pos,
+        context,
+        (dagNodeId, outcome) =>
+          this.revalidateSourceProofOnQueryState(
+            pos,
+            context,
+            regionCoords,
+            dagNodeId,
+            outcome
+          )
+      );
       if (
         patHit.grade === 'PROOF_REUSABLE' &&
         patHit.record &&
@@ -1217,45 +1454,11 @@ export class DfpnSolver {
           dagNodeId: ttNodeId,
         };
       }
-      if (
-        patHit.grade === 'HEURISTIC_ONLY' &&
-        patHit.record &&
-        patHit.record.proofClosureAvailable &&
-        patHit.record.proofDagNodeId >= 0 &&
-        this.revalidateSourceProofOnQueryState(
-          pos,
-          context,
-          regionCoords,
-          patHit.record.proofDagNodeId,
-          patHit.record.outcome
-        )
-      ) {
-        this.ttStore.patternProofReusableHits++;
-        const ttNodeId = emitTtHitNode(
-          patHit.record.proofDagNodeId,
-          patHit.record.pn,
-          patHit.record.dn,
-          patHit.record.outcome,
-          patHit.record.storedRz,
-          patHit.record.storedRz
-        );
-        return {
-          pn: patHit.record.pn,
-          dn: patHit.record.dn,
-          outcome: patHit.record.outcome,
-          koDependent: false,
-          proofRz: patHit.record.storedRz,
-          disproofRz: patHit.record.storedRz,
-          dagNodeId: ttNodeId,
-        };
-      }
     }
 
-    // Step 5: Lookup or initialize history-isolated cached frontier node for persistent DFPN bounds.
-    // Includes `computeCanonicalHistoryKey()` so SSK/PSK histories never share cached child outcomes!
-    const historyKey = pos.computeCanonicalHistoryKey();
-    const frontierKey = `${zHex}:${pos.toPlay}:${pos.koPoint}:${pos.consecutivePasses}:${pos.survivingTargetTokensMask}:${historyKey}`;
-    let frontier = this.nodeFrontierCache.get(frontierKey);
+    // Step 5: Lookup or initialize cached frontier keyed by exact path-unique `currentStateId`
+    // (O(1) lookup, zero string serialization, 100% guarantees childState.parentStateId === node.stateId).
+    let frontier = this.nodeFrontierCache.get(currentStateId);
     if (!frontier) {
       const parentShape =
         !isOrNode && pos.consecutivePasses === 0 && this.config.enableFastCaptureOrdering
@@ -1264,22 +1467,27 @@ export class DfpnSolver {
               context.initialTokens
             )
           : { eyeLikeCount: 0, minCrucialLiberties: 0, minAdjacentEnemyLiberties: 99 };
+      const tacCtx = this.config.enableFastCaptureOrdering
+        ? this.buildNodeTacticalContext(pos, context)
+        : null;
       const legalMoves = pos.generateLegalMoves(regionCoords);
       const scored = legalMoves.map((mv) => {
-        const meta = this.config.enableFastCaptureOrdering
-          ? this.evaluateCandidateMove(
-              pos,
-              context,
-              mv,
-              isOrNode,
-              parentShape.eyeLikeCount
-            )
-          : {
-              score: 0,
-              immediateWin: false,
-              immediateLoss: false,
-              inAttention: true,
-            };
+        const meta =
+          this.config.enableFastCaptureOrdering && tacCtx
+            ? this.evaluateCandidateMove(
+                pos,
+                context,
+                mv,
+                isOrNode,
+                parentShape.eyeLikeCount,
+                tacCtx
+              )
+            : {
+                score: 0,
+                immediateWin: false,
+                immediateLoss: false,
+                inAttention: true,
+              };
         return { mv, meta };
       });
 
@@ -1321,7 +1529,7 @@ export class DfpnSolver {
         representativeOutcome: ProofOutcome.Unknown,
         anyKoDependent: false,
       };
-      this.nodeFrontierCache.set(frontierKey, frontier);
+      this.nodeFrontierCache.set(currentStateId, frontier);
     }
 
     const children = frontier.children;
@@ -1598,6 +1806,21 @@ export class DfpnSolver {
         const recordedChildren = children.filter(
           (c) => c.expanded && c.dagNodeId >= 0
         );
+        if (
+          depth === 0 &&
+          ((isOrNode && curDn === 0) || (!isOrNode && curPn === 0))
+        ) {
+          // Universal root: ensure rootBestMove is a valid verified child move (or PASS_MOVE)
+          const hasCur = recordedChildren.some(
+            (c) => c.move === this.rootBestMove
+          );
+          if (!hasCur) {
+            this.rootBestMove =
+              recordedChildren.length > 0
+                ? recordedChildren[0].move
+                : PASS_MOVE;
+          }
+        }
 
         this.proofDagNodes.push({
           nodeId: finalDagNodeId,

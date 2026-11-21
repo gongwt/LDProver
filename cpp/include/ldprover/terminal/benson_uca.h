@@ -66,7 +66,8 @@ class BensonTerminalEvaluator {
       const Position<N>& pos, Color color,
       std::vector<StoneChainInfo<N>>* out_chains = nullptr,
       std::vector<EyeSpaceRegion<N>>* out_regions = nullptr,
-      BitBoard<N>* out_vital_rz = nullptr) const;
+      BitBoard<N>* out_vital_rz = nullptr,
+      const BitBoard<N>* target_anchor_mask = nullptr) const;
 
   // FR-3.2, FR-3.3, FR-3.8: Unified four-valued terminal evaluation.
   // Evaluates relative to root proposition (attacker_goal) and generates

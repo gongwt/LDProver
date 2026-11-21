@@ -233,7 +233,8 @@ export class BensonTerminalEvaluator {
   public computeBensonUca(
     pos: GoPosition,
     color: Color,
-    includeDiagnostics = true
+    includeDiagnostics = true,
+    targetCoords?: number[]
   ): {
     ucaStones: Set<number>;
     chains: BensonChainInfo[];
@@ -490,13 +491,64 @@ export class BensonTerminalEvaluator {
       ch.isUcaAlive = true;
       for (const s of ch.stones) {
         ucaStones.add(s);
-        vitalRz.add(s);
+      }
+    }
+
+    // Minimal target-anchored vitalRz (excludes unrelated alive chains & outer immortalWall shells)
+    const rzChainQueue: number[] = [];
+    const visitedRzChains = new Set<number>();
+    if (targetCoords && targetCoords.length > 0) {
+      for (const tc of targetCoords) {
+        if (tc >= 0 && tc < gridLen && pos.grid[tc] === color) {
+          const cid = stoneToChainId[tc];
+          if (cid >= 0 && activeChains.has(cid) && !visitedRzChains.has(cid)) {
+            visitedRzChains.add(cid);
+            rzChainQueue.push(cid);
+          }
+        }
+      }
+    }
+    if (rzChainQueue.length === 0) {
+      for (const cid of activeChains) {
+        if (!isImmortalChain[cid] && !visitedRzChains.has(cid)) {
+          visitedRzChains.add(cid);
+          rzChainQueue.push(cid);
+        }
+      }
+    }
+
+    let qIdx = 0;
+    while (qIdx < rzChainQueue.length) {
+      const cid = rzChainQueue[qIdx++];
+      const ch = chains[cid];
+      if (!isImmortalChain[cid]) {
+        for (const s of ch.stones) {
+          vitalRz.add(s);
+        }
       }
       for (const rid of ch.vitalRegionIds) {
-        for (const p of regions[rid].emptyPoints) vitalRz.add(p);
-        for (const e of regions[rid].enemyStones) vitalRz.add(e);
-        for (const bcid of regions[rid].boundaryChainIds) {
-          for (const bs of chains[bcid].stones) vitalRz.add(bs);
+        const reg = regions[rid];
+        for (const p of reg.emptyPoints) vitalRz.add(p);
+        for (const e of reg.enemyStones) vitalRz.add(e);
+        for (const bcid of reg.boundaryChainIds) {
+          if (!isImmortalChain[bcid]) {
+            if (!visitedRzChains.has(bcid)) {
+              visitedRzChains.add(bcid);
+              rzChainQueue.push(bcid);
+            }
+          } else {
+            // Only include immortal boundary stones directly adjacent to the vital region
+            for (const p of reg.emptyPoints) {
+              for (const nb of pos.orthogonalNeighbors(p)) {
+                if (stoneToChainId[nb] === bcid) vitalRz.add(nb);
+              }
+            }
+            for (const e of reg.enemyStones) {
+              for (const nb of pos.orthogonalNeighbors(e)) {
+                if (stoneToChainId[nb] === bcid) vitalRz.add(nb);
+              }
+            }
+          }
         }
       }
     }
@@ -663,10 +715,21 @@ export class BensonTerminalEvaluator {
 
     if (canSatisfyBenson || includeDiagnostics) {
       const targetColor = context.initialTokens[0].stoneColor;
+      const survivingTargetCoords: number[] = [];
+      for (let idx = 0; idx < context.initialTokens.length; idx++) {
+        const tok = context.initialTokens[idx];
+        if (
+          (pos.survivingTargetTokensMask & (1 << idx)) !== 0 &&
+          pos.stoneAt(tok.initialCoord) === tok.stoneColor
+        ) {
+          survivingTargetCoords.push(tok.initialCoord);
+        }
+      }
       const bensonRes = this.computeBensonUca(
         pos,
         targetColor,
-        includeDiagnostics
+        includeDiagnostics,
+        survivingTargetCoords
       );
       ucaStones = bensonRes.ucaStones;
       regions = bensonRes.regions;

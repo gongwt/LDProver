@@ -23,9 +23,12 @@ void TranspositionStore<N>::ClearAll() noexcept {
 
 template <int N>
 std::optional<BoardTTEntry<N>> TranspositionStore<N>::LookupBoardTT(
-    const Position<N>& pos, const ProofContext& context) {
+    const Position<N>& pos, const ProofContext& context,
+    const RevalidateFn& revalidate_fn) {
   auto it = board_buckets_.find(pos.ZobristHash());
   if (it == board_buckets_.end()) return std::nullopt;
+
+  const bool query_monotonic = pos.IsCaptureFreeMonotonicHistory();
 
   for (const auto& entry : it->second) {
     // FR-6.1 & C-6: Hash only locates bucket; verify full structural equality.
@@ -40,26 +43,43 @@ std::optional<BoardTTEntry<N>> TranspositionStore<N>::LookupBoardTT(
       continue;
     }
 
-    // Verify canonical HistorySet equality under active KoRule.
+    // Verify canonical HistorySet equality under active KoRule, with O(1)
+    // monotonic stone-count certificate & GHI revalidation fallback.
     if (context.ko_rule != KoRule::kSimpleKoOnly) {
-      const auto& query_hist = pos.HistorySnapshots();
-      if (entry.history_snapshots.size() != query_hist.size()) continue;
-      bool hist_ok = true;
-      for (size_t i = 0; i < query_hist.size(); ++i) {
-        bool found = false;
-        for (size_t j = 0; j < entry.history_snapshots.size(); ++j) {
-          if (query_hist[i].MatchesUnderRule(entry.history_snapshots[j],
-                                             context.ko_rule)) {
-            found = true;
-            break;
+      const bool monotonic_safe = query_monotonic &&
+                                  entry.source_monotonic_history &&
+                                  !entry.has_capture_in_subtree;
+      if (!monotonic_safe) {
+        const auto& query_hist = pos.HistorySnapshots();
+        bool hist_ok = (entry.history_snapshots.size() == query_hist.size());
+        if (hist_ok) {
+          for (size_t i = 0; i < query_hist.size(); ++i) {
+            bool found = false;
+            for (size_t j = 0; j < entry.history_snapshots.size(); ++j) {
+              if (query_hist[i].MatchesUnderRule(entry.history_snapshots[j],
+                                                 context.ko_rule)) {
+                found = true;
+                break;
+              }
+            }
+            if (!found) {
+              hist_ok = false;
+              break;
+            }
           }
         }
-        if (!found) {
-          hist_ok = false;
-          break;
+        if (!hist_ok) {
+          if (entry.proof_closure_available &&
+              entry.outcome != ProofOutcome::kUnknown && revalidate_fn) {
+            if (!revalidate_fn(entry.proof_dag_node_id, entry.outcome)) {
+              ++ghi_rejected_count_;
+              continue;
+            }
+          } else {
+            continue;
+          }
         }
       }
-      if (!hist_ok) continue;
     }
 
     ++board_hits_;
@@ -74,7 +94,7 @@ void TranspositionStore<N>::StoreBoardTT(
     uint32_t dn, ProofOutcome outcome, bool is_ko_dependent,
     bool proof_closure_available, uint32_t proof_dag_node_id,
     const ProofCertificateRZ<N>& proof_rz,
-    const ProofCertificateRZ<N>& disproof_rz) {
+    const ProofCertificateRZ<N>& disproof_rz, bool has_capture_in_subtree) {
   // FR-5.7: KoDependent states must never be stored as decisive proof entries.
   if (is_ko_dependent && outcome != ProofOutcome::kUnknown) return;
 
@@ -106,6 +126,8 @@ void TranspositionStore<N>::StoreBoardTT(
         existing.black_stones == pos.Stones(Color::kBlack) &&
         existing.white_stones == pos.Stones(Color::kWhite) &&
         history_sets_equal(existing.history_snapshots, pos.HistorySnapshots())) {
+      existing.source_monotonic_history = pos.IsCaptureFreeMonotonicHistory();
+      existing.has_capture_in_subtree = has_capture_in_subtree;
       existing.pn = pn;
       existing.dn = dn;
       existing.outcome = outcome;
@@ -129,6 +151,8 @@ void TranspositionStore<N>::StoreBoardTT(
   entry.consecutive_passes = pos.ConsecutivePasses();
   entry.surviving_tokens_mask = pos.SurvivingTargetTokensMask();
   entry.history_snapshots = pos.HistorySnapshots();
+  entry.source_monotonic_history = pos.IsCaptureFreeMonotonicHistory();
+  entry.has_capture_in_subtree = has_capture_in_subtree;
   entry.pn = pn;
   entry.dn = dn;
   entry.outcome = outcome;
@@ -143,8 +167,13 @@ void TranspositionStore<N>::StoreBoardTT(
 template <int N>
 PatternHitGrade TranspositionStore<N>::LookupPatternTT(
     const Position<N>& pos, const ProofContext& context,
-    RadixPatternRecord<N>* out_record) {
-  for (auto& rec : pattern_entries_) {
+    RadixPatternRecord<N>* out_record, const RevalidateFn& revalidate_fn) {
+  const RadixPatternRecord<N>* first_heuristic = nullptr;
+  int reval_attempts = 0;
+  constexpr int kMaxRevalAttempts = 6;
+
+  for (size_t idx = pattern_entries_.size(); idx-- > 0;) {
+    auto& rec = pattern_entries_[idx];
     if (rec.proof_context_id != context.context_id ||
         rec.to_play != pos.ToPlay() ||
         rec.consecutive_passes != pos.ConsecutivePasses() ||
@@ -154,6 +183,7 @@ PatternHitGrade TranspositionStore<N>::LookupPatternTT(
 
     // Project current position onto stored_rz (FR-6.3, FR-6.5 same-coordinate).
     const BitBoard<N>& zone_bits = rec.stored_rz.Bits();
+    if (zone_bits.None()) continue;
     const BitBoard<N> query_b = pos.Stones(Color::kBlack) & zone_bits;
     const BitBoard<N> query_w = pos.Stones(Color::kWhite) & zone_bits;
     if (rec.history_snapshots.empty()) continue;
@@ -174,12 +204,8 @@ PatternHitGrade TranspositionStore<N>::LookupPatternTT(
 
     rec.last_touch_seq = ++touch_seq_;
     ++pattern_hits_;
-    if (out_record != nullptr) *out_record = rec;
 
     // Two-grade classification (FR-6.3, FR-6.9):
-    // Direct kProofReusable requires full-board equality AND full canonical
-    // HistorySet equality; any outside-zone stone difference returns
-    // kHeuristicOnly so DfpnSolver executes RevalidateSourceProofOnQueryState!
     const bool full_board_equal =
         (stored_curr.black_stones == pos.Stones(Color::kBlack)) &&
         (stored_curr.white_stones == pos.Stones(Color::kWhite)) &&
@@ -206,8 +232,30 @@ PatternHitGrade TranspositionStore<N>::LookupPatternTT(
     if (full_board_equal && full_hist_equal && rec.proof_closure_available &&
         !rec.ghi_flag) {
       ++pattern_proof_reusable_hits_;
+      if (out_record != nullptr) *out_record = rec;
       return PatternHitGrade::kProofReusable;
     }
+
+    if (revalidate_fn && rec.proof_closure_available && !rec.ghi_flag &&
+        reval_attempts < kMaxRevalAttempts) {
+      ++reval_attempts;
+      if (revalidate_fn(rec.proof_dag_node_id, rec.outcome)) {
+        ++pattern_proof_reusable_hits_;
+        if (out_record != nullptr) *out_record = rec;
+        return PatternHitGrade::kProofReusable;
+      }
+    }
+
+    if (first_heuristic == nullptr) {
+      first_heuristic = &rec;
+    }
+    if (reval_attempts >= kMaxRevalAttempts) {
+      break;
+    }
+  }
+
+  if (first_heuristic != nullptr) {
+    if (out_record != nullptr) *out_record = *first_heuristic;
     return PatternHitGrade::kHeuristicOnly;
   }
   return PatternHitGrade::kMiss;
@@ -218,8 +266,8 @@ void TranspositionStore<N>::StorePatternTT(
     const Position<N>& pos, const ProofContext& context,
     const ProofCertificateRZ<N>& zone, uint32_t pn, uint32_t dn,
     ProofOutcome outcome, uint32_t proof_dag_node_id,
-    bool proof_closure_available) {
-  if (outcome == ProofOutcome::kUnknown) return;
+    bool proof_closure_available, bool has_capture_in_subtree) {
+  if (outcome == ProofOutcome::kUnknown || zone.Size() == 0) return;
   RadixPatternRecord<N> rec;
   rec.proof_context_id = context.context_id;
   rec.to_play = pos.ToPlay();
@@ -228,6 +276,8 @@ void TranspositionStore<N>::StorePatternTT(
   rec.surviving_tokens_mask = pos.SurvivingTargetTokensMask();
   rec.history_snapshots = pos.HistorySnapshots();
   rec.stored_rz = zone;
+  rec.source_monotonic_history = pos.IsCaptureFreeMonotonicHistory();
+  rec.has_capture_in_subtree = has_capture_in_subtree;
   rec.pn = pn;
   rec.dn = dn;
   rec.outcome = outcome;

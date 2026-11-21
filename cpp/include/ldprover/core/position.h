@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "ldprover/core/types.h"
@@ -82,6 +83,34 @@ class Position {
     return history_snapshots_;
   }
   bool HasIdenticalHistorySet(const Position<N>& other) const noexcept;
+
+  bool IsCaptureFreeMonotonicHistory() const noexcept {
+    if (history_snapshots_.size() <= 1U) return true;
+    for (size_t i = 1U; i < history_snapshots_.size(); ++i) {
+      const int prev_cnt = history_snapshots_[i - 1U].black_stones.Count() +
+                           history_snapshots_[i - 1U].white_stones.Count();
+      const int cur_cnt = history_snapshots_[i].black_stones.Count() +
+                          history_snapshots_[i].white_stones.Count();
+      if (cur_cnt != prev_cnt + 1) return false;
+    }
+    return true;
+  }
+
+  std::string ComputeCanonicalHistoryKey() const {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string key;
+    key.reserve(history_snapshots_.size() * 19U);
+    for (size_t i = 0U; i < history_snapshots_.size(); ++i) {
+      if (i > 0U) key.push_back('|');
+      const uint64_t h = history_snapshots_[i].zobrist_hash;
+      for (int shift = 60; shift >= 0; shift -= 4) {
+        key.push_back(kHex[(h >> shift) & 0xFULL]);
+      }
+      key.push_back(':');
+      key.push_back(history_snapshots_[i].to_play == Color::kWhite ? 'W' : 'B');
+    }
+    return key;
+  }
 
   CanonicalSnapshot<N> CurrentCanonicalSnapshot() const noexcept {
     return CanonicalSnapshot<N>{black_stones_, white_stones_, to_play_,
