@@ -165,8 +165,9 @@ bool ValidateSgfStructureAndSize(const std::string& sgf, int expected_size,
     break;
   }
 
-  // Validate AB[...] and AW[...] coordinate tokens fall within expected_size.
-  for (const std::string& prop : {std::string("AB"), std::string("AW")}) {
+  // Validate AB[...], AW[...], and MA[...] coordinate tokens fall within expected_size.
+  for (const std::string& prop :
+       {std::string("AB"), std::string("AW"), std::string("MA")}) {
     size_t p = 0;
     while (p < trimmed.size()) {
       const size_t found = trimmed.find(prop + "[", p);

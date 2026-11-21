@@ -108,7 +108,26 @@ export class DfpnSolver {
     this.config = { ...config };
   }
 
+  private static assertRegionHintConsistent(problem: TsumegoProblemSpec): void {
+    if (
+      problem.hasRegionHint !== undefined &&
+      typeof problem.hasRegionHint !== 'boolean'
+    ) {
+      throw new Error(
+        `LP-J02: Invalid non-boolean TsumegoProblemSpec.hasRegionHint=${String(
+          problem.hasRegionHint
+        )}.`
+      );
+    }
+    if (problem.hasRegionHint === false && problem.regionCoords.length > 0) {
+      throw new Error(
+        `LP-J02: Contradictory TsumegoProblemSpec: hasRegionHint=false with non-empty regionCoords (length=${problem.regionCoords.length}).`
+      );
+    }
+  }
+
   public solveProblem(problem: TsumegoProblemSpec): SolveReport {
+    DfpnSolver.assertRegionHintConsistent(problem);
     const context = DfpnSolver.buildProofContext(problem, this.config);
     const initialPos = DfpnSolver.buildInitialPosition(problem, context);
     return this.solveFromPosition(problem, initialPos, context);
@@ -123,6 +142,7 @@ export class DfpnSolver {
     initialPos: GoPosition,
     context: ProofContext
   ): SolveReport {
+    DfpnSolver.assertRegionHintConsistent(problem);
     const startTime = performance.now();
     this.ttStore.clearAll();
     this.nodeFrontierCache.clear();

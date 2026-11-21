@@ -524,11 +524,10 @@ export function extractReferencePvFromRawSgf(
 }
 
 /**
- * Computes exact `immortalWallCoords` (strictly `!rawRegionSet.has(stone)`),
- * full uncropped `regionCoords` (`rawRegionSet` from JSON so universal obligations cover
- * 100% of the original problem's region!), and `attentionCoords` (`NNAttentionMask`:
- * tight corner/edge tactical core guiding move ordering while `OutsideRZRevalidated`
- * formally proves and eliminates outer-moat responses).
+ * Computes exact `hasRegionHint`, `immortalWallCoords` (strictly `!rawRegionSet.has(stone)`
+ * ONLY when an explicit region or SGF `MA[...]` exists; otherwise empty so unrestricted
+ * full-board problems never fabricate immortal walls — R8 §1), full uncropped `regionCoords`
+ * (`rawRegionSet` when bounded, `[]` when unrestricted), and `attentionCoords`.
  */
 export function computeActiveTacticalRegion(
   blackCoords: number[],
@@ -537,6 +536,7 @@ export function computeActiveTacticalRegion(
   rawRegionStr?: string,
   maskedSgfStr?: string
 ): {
+  hasRegionHint: boolean;
   rawRegionSet: Set<number>;
   rawRegionCoords: number[];
   regionCoords: number[];
@@ -549,26 +549,32 @@ export function computeActiveTacticalRegion(
 
   const rawRegionSet = new Set<number>();
   if (rawRegionStr && rawRegionStr.trim().length > 0) {
-    for (const tok of rawRegionStr.split(',')) {
-      const c = sgfToCoord(tok.trim(), 19);
+    for (const tok of rawRegionStr.split(/[,\s&|]+/)) {
+      const trimmed = tok.trim();
+      if (!trimmed) continue;
+      const c = sgfToCoord(trimmed, 19);
       if (c >= 0) rawRegionSet.add(c);
     }
   } else if (maskedSgfStr) {
-    const maMatch = maskedSgfStr.match(/MA((?:\[[a-s]{2}\])+)/);
-    if (maMatch) {
-      const tokens = maMatch[1].match(/\[([a-s]{2})\]/g) || [];
-      for (const tok of tokens) {
-        const c = sgfToCoord(tok.slice(1, 3), 19);
+    const maPropRegex = /(?:^|[^A-Z])MA((?:\s*\[[^\]]*\])+)/g;
+    let maMatch: RegExpExecArray | null;
+    while ((maMatch = maPropRegex.exec(maskedSgfStr)) !== null) {
+      const itemRegex = /\[([^\]]*)\]/g;
+      let itemMatch: RegExpExecArray | null;
+      while ((itemMatch = itemRegex.exec(maMatch[1])) !== null) {
+        const c = sgfToCoord(itemMatch[1].trim().toLowerCase(), 19);
         if (c >= 0) rawRegionSet.add(c);
       }
     }
   }
 
-  // Outer mask_sgf shell stones are strictly those outside `rawRegionSet`
-  const immortalWallCoords =
-    rawRegionSet.size > 0
-      ? allStones.filter((pt) => !rawRegionSet.has(pt))
-      : allStones.filter((pt) => rowOf(pt, 19) < 12 || colOf(pt, 19) < 9);
+  const hasRegionHint = rawRegionSet.size > 0;
+
+  // R8 §1: Outer shell stones are immortal ONLY when a bounded region (`region` or `MA[...]`)
+  // is declared. Unrestricted full-board problems MUST have zero fabricated immortal walls.
+  const immortalWallCoords = hasRegionHint
+    ? allStones.filter((pt) => !rawRegionSet.has(pt))
+    : [];
   const immortalSet = new Set<number>(immortalWallCoords);
 
   const tacticalStones = allStones.filter((pt) => !immortalSet.has(pt));
@@ -585,68 +591,81 @@ export function computeActiveTacticalRegion(
   const anchorStones = winStones.length > 0 ? winStones : tacticalStones;
 
   let minR = 18;
-  const maxR = 18;
+  let maxR = 0;
   let minC = 18;
-  const maxC = 18;
-
-  for (const pt of [...anchorStones, ...crucialCoords]) {
-    const r = rowOf(pt, 19);
-    const col = colOf(pt, 19);
-    if (r < minR) minR = r;
-    if (col < minC) minC = col;
-  }
-  minR = Math.max(0, minR - 2);
-  minC = Math.max(0, minC - 2);
-
-  // Preserve 100% of the JSON's `rawRegionSet` in `regionCoords` (including initially occupied
-  // tactical stones so snapbacks/recaptures are legal, AND all outer-moat points in `region`
-  // so universal AND/OR proof obligations cover the complete original region!).
-  const rawRegionCoords = Array.from(rawRegionSet)
-    .filter((pt) => !immortalSet.has(pt))
-    .sort((a, b) => a - b);
-
-  const fallbackBoxCoords: number[] = [];
-  if (rawRegionCoords.length === 0) {
-    for (let r = minR; r <= maxR; r++) {
-      for (let col = minC; col <= maxC; col++) {
-        const pt = coordFromRowCol(r, col, 19);
-        if (!immortalSet.has(pt)) fallbackBoxCoords.push(pt);
-      }
+  let maxC = 0;
+  const boundAnchors = [...anchorStones, ...crucialCoords];
+  if (boundAnchors.length === 0) {
+    minR = 0;
+    maxR = 18;
+    minC = 0;
+    maxC = 18;
+  } else {
+    for (const pt of boundAnchors) {
+      const r = rowOf(pt, 19);
+      const col = colOf(pt, 19);
+      if (r < minR) minR = r;
+      if (r > maxR) maxR = r;
+      if (col < minC) minC = col;
+      if (col > maxC) maxC = col;
     }
   }
-  const regionCoords =
-    rawRegionCoords.length > 0 ? rawRegionCoords : fallbackBoxCoords;
+  const attMinR = Math.max(0, minR - 2);
+  const attMinC = Math.max(0, minC - 2);
 
-  // NNAttentionMask: tight tactical core within `[minR..18, minC..18]` and Chebyshev <= 1
-  // of target-side stones, guiding move ordering while keeping full `regionCoords` legal.
+  // Preserve 100% of the JSON's `rawRegionSet` in `regionCoords` when bounded;
+  // leave empty (`hasRegionHint = false`) when unrestricted.
+  const rawRegionCoords = hasRegionHint
+    ? Array.from(rawRegionSet).sort((a, b) => a - b)
+    : [];
+  const regionCoords = rawRegionCoords.slice();
+
+  // NNAttentionMask: tight tactical core for bounded corner/edge problems;
+  // empty for unrestricted problems so full-board search is not artificially skewed.
   const attentionAnchors = [...anchorStones, ...crucialCoords];
-  const attentionCoords = regionCoords.filter((pt) => {
+  const attentionCoords = hasRegionHint
+    ? regionCoords.filter((pt) => {
+        const r = rowOf(pt, 19);
+        const col = colOf(pt, 19);
+        if (r < attMinR || col < attMinC) return false;
+        if (r >= 17 && col >= attMinC + 1) return true;
+        return attentionAnchors.some(
+          (st) =>
+            Math.abs(rowOf(st, 19) - r) <= 1 && Math.abs(colOf(st, 19) - col) <= 1
+        );
+      })
+    : [];
+
+  // Compute viewport from tactical stones (keeps bottom-right corner anchored to 18 when
+  // stones sit in the bottom-right quadrant, and adapts cleanly to top-left/other quadrants).
+  let vpMinR = attMinR;
+  let vpMaxR = maxR;
+  let vpMinC = attMinC;
+  let vpMaxC = maxC;
+  for (const pt of tacticalStones) {
     const r = rowOf(pt, 19);
     const col = colOf(pt, 19);
-    if (r < minR || col < minC) return false;
-    if (r >= 17 && col >= minC + 1) return true;
-    return attentionAnchors.some(
-      (st) =>
-        Math.abs(rowOf(st, 19) - r) <= 1 && Math.abs(colOf(st, 19) - col) <= 1
-    );
-  });
-
-  // Compute viewport from all tactical stones so surrounding walls remain visible in UI
-  let vpMinR = minR;
-  let vpMinC = minC;
-  for (const pt of tacticalStones) {
-    vpMinR = Math.min(vpMinR, rowOf(pt, 19));
-    vpMinC = Math.min(vpMinC, colOf(pt, 19));
+    if (r < vpMinR) vpMinR = r;
+    if (r > vpMaxR) vpMaxR = r;
+    if (col < vpMinC) vpMinC = col;
+    if (col > vpMaxC) vpMaxC = col;
   }
+  const bottomRightAnchored = vpMaxR >= 12 || vpMaxC >= 12;
+  const viewportRows: [number, number] = bottomRightAnchored
+    ? [Math.max(0, vpMinR - 1), 18]
+    : [Math.max(0, vpMinR - 1), Math.min(18, Math.max(vpMaxR + 3, 5))];
+  const viewportCols: [number, number] = bottomRightAnchored
+    ? [Math.max(0, vpMinC - 1), 18]
+    : [Math.max(0, vpMinC - 1), Math.min(18, Math.max(vpMaxC + 3, 5))];
 
   return {
+    hasRegionHint,
     rawRegionSet,
-    rawRegionCoords:
-      rawRegionCoords.length > 0 ? rawRegionCoords : regionCoords,
+    rawRegionCoords,
     regionCoords,
     attentionCoords,
-    viewportRows: [Math.max(0, vpMinR - 1), 18],
-    viewportCols: [Math.max(0, vpMinC - 1), 18],
+    viewportRows,
+    viewportCols,
     immortalWallCoords,
   };
 }
@@ -766,8 +785,8 @@ export function validateStudyLdRzContract(
     }
   }
 
-  // Validate every AB/AW coordinate token inside SGF against declaredBoardSize
-  const propRegex = /(?:^|[^A-Z])(AB|AW)((?:\s*\[[^\]]*\])+)/g;
+  // Validate every AB/AW/MA coordinate token inside SGF against declaredBoardSize
+  const propRegex = /(?:^|[^A-Z])(AB|AW|MA)((?:\s*\[[^\]]*\])+)/g;
   let propMatch: RegExpExecArray | null;
   while ((propMatch = propRegex.exec(sgfTrimmed)) !== null) {
     const valBlock = propMatch[2];
@@ -781,6 +800,22 @@ export function validateStudyLdRzContract(
           warning: false,
           code: 'FR1-INVALID-SGF-COORD (ExitCode=2)',
           summary: `拒题保护触发（FR-1.1）：SGF ${propMatch[1]}[${itemMatch[1]}] 坐标非法或超出 ${declaredBoardSize}x${declaredBoardSize} 范围。`,
+        };
+      }
+    }
+  }
+
+  // Validate optional `region` coordinates against declaredBoardSize (matches C++ FR1-INVALID-REGION-COORD)
+  if (typeof raw.region === 'string' && raw.region.trim().length > 0) {
+    for (const part of raw.region.split(/[,\s&|]+/)) {
+      const tok = part.trim().toLowerCase();
+      if (!tok) continue;
+      if (tok.length !== 2 || sgfToCoord(tok, declaredBoardSize) < 0) {
+        return {
+          valid: false,
+          warning: false,
+          code: 'FR1-INVALID-REGION-COORD (ExitCode=2)',
+          summary: `拒题保护触发（FR-1.1）：region 包含非法或越界坐标 "${part.trim()}"。`,
         };
       }
     }
@@ -941,10 +976,20 @@ export function parseStudyLdRzJsonToProblemSpec(
 
   const cleanId = filename.replace(/\.json$/i, '');
   const { blackCoords, whiteCoords } = parseSgfInitialStones(raw.masked_sgf_str);
-  const turnColor: 'B' | 'W' =
-    raw.turn_color.toUpperCase() === 'W' ? 'W' : 'B';
+  const sgfPlMatch = raw.masked_sgf_str.match(/(?:^|[^A-Z])PL\[([BWbw])\]/);
+  const sgfPl = sgfPlMatch
+    ? (sgfPlMatch[1].toUpperCase() as 'B' | 'W')
+    : undefined;
   const winningColor: 'B' | 'W' =
     raw.winning_color.toUpperCase() === 'W' ? 'W' : 'B';
+  const rawTurn =
+    typeof raw.turn_color === 'string'
+      ? raw.turn_color.trim().toUpperCase()
+      : '';
+  const turnColor: 'B' | 'W' =
+    rawTurn === 'W' || rawTurn === 'B'
+      ? rawTurn
+      : sgfPl ?? winningColor;
   const blackSearchGoal =
     raw.black_search_goal === 'TOKILL' ? SearchGoal.ToKill : SearchGoal.ToLive;
   const whiteSearchGoal =
@@ -964,6 +1009,7 @@ export function parseStudyLdRzJsonToProblemSpec(
   const defenderAllowKo = winningColor === 'B' ? whiteAllowKo : blackAllowKo;
 
   const {
+    hasRegionHint,
     rawRegionSet,
     rawRegionCoords,
     regionCoords,
@@ -1043,6 +1089,7 @@ export function parseStudyLdRzJsonToProblemSpec(
     defaultAllowKo: attackerAllowKo,
     attackerAllowKo,
     defenderAllowKo,
+    hasRegionHint,
     regionCoords,
     rawRegionCoords,
     attentionCoords,
@@ -1051,7 +1098,11 @@ export function parseStudyLdRzJsonToProblemSpec(
     immortalWallCoords,
     description:
       overrides?.description ??
-      `直读 public/tsumego/${filename} 原始数据（region=${regionCoords.length} 点全覆盖，D8=${d8Index} 匹配 ${d8Audit.matchedStones}/${d8Audit.totalRawStones} 子）。关键子谓词：${activeCrucial}，JSON 标注首手：${groundTruthFirstMoves.join(
+      `直读 public/tsumego/${filename} 原始数据（${
+        hasRegionHint
+          ? `region=${regionCoords.length} 点全覆盖`
+          : '全盘无区域限制'
+      }，D8=${d8Index} 匹配 ${d8Audit.matchedStones}/${d8Audit.totalRawStones} 子）。关键子谓词：${activeCrucial}，JSON 标注首手：${groundTruthFirstMoves.join(
         ', '
       )}，rawsgf 映射参考首手：${verifiedGroundTruthFirstMoves.join(', ')}。`,
     expectedOutcome: overrides?.expectedOutcome ?? ProofOutcome.ProvenWin,

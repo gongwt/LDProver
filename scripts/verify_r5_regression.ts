@@ -16,6 +16,11 @@ import {
   sha256Hex,
 } from '../src/engine/proofChecker';
 import {
+  parseStudyLdRzJsonToProblemSpec,
+  RawStudyLdRzProblemJson,
+  validateStudyLdRzContract,
+} from '../src/engine/studyLdRzCatalog';
+import {
   KoRule,
   ProofOutcome,
   SolverConfig,
@@ -890,6 +895,205 @@ runSection('5. R7 Protocol Edge Cases (§2 Empty Region, §3 NULL_MOVE, §4 Unic
     'R7 §4 lone UTF-16 high/low surrogates rejected -> LP-J01',
     `high=${loneHighVer.errorCode}, low=${loneLowVer.errorCode}`
   );
+});
+
+// =============================================================================
+// Section 6: R8 Original Problem Contract Parity, Reverse-Witness & Type Safety
+// =============================================================================
+runSection('Section 6: R8 Problem Contract, Reverse-Witness & Contradictory Region', () => {
+  const checker = new ProofArtifactManager();
+  const baseRawJson =
+    '{"masked_sgf_str":"(;GM[1]FF[4]SZ[19]PL[B]AB[ab]AW[aa])","winning_color":"B","turn_color":"B","black_search_goal":"TOKILL","white_search_goal":"TOLIVE","black_crucial_stone":"aa","white_crucial_stone":"aa","black_ko_rule":"allow_ko","white_ko_rule":"allow_ko"}';
+  const emptyRegionRawJson =
+    '{"masked_sgf_str":"(;GM[1]FF[4]SZ[19]PL[B]AB[ab]AW[aa])","winning_color":"B","turn_color":"B","black_search_goal":"TOKILL","white_search_goal":"TOLIVE","black_crucial_stone":"aa","white_crucial_stone":"aa","black_ko_rule":"allow_ko","white_ko_rule":"allow_ko","region":""}';
+  const maRegionRawJson =
+    '{"masked_sgf_str":"(;GM[1]FF[4]SZ[19]PL[B]AB[ab]AW[aa]MA[aa][ab][ba])","winning_color":"B","turn_color":"B","black_search_goal":"TOKILL","white_search_goal":"TOLIVE","black_crucial_stone":"aa","white_crucial_stone":"aa","black_ko_rule":"allow_ko","white_ko_rule":"allow_ko"}';
+  const explicitRegionRawJson =
+    '{"masked_sgf_str":"(;GM[1]FF[4]SZ[19]PL[B]AB[ab]AW[aa])","winning_color":"B","turn_color":"B","black_search_goal":"TOKILL","white_search_goal":"TOLIVE","black_crucial_stone":"aa","white_crucial_stone":"aa","black_ko_rule":"allow_ko","white_ko_rule":"allow_ko","region":"aa,ab,ba"}';
+  const invalidRegionRawJson =
+    '{"masked_sgf_str":"(;GM[1]FF[4]SZ[19]PL[B]AB[ab]AW[aa])","winning_color":"B","turn_color":"B","black_search_goal":"TOKILL","white_search_goal":"TOLIVE","black_crucial_stone":"aa","white_crucial_stone":"aa","black_ko_rule":"allow_ko","white_ko_rule":"allow_ko","region":"aa,zz"}';
+
+  const specAbsent = parseStudyLdRzJsonToProblemSpec(
+    'r8_two_stone_absent.json',
+    JSON.parse(baseRawJson) as RawStudyLdRzProblemJson
+  );
+  const specEmpty = parseStudyLdRzJsonToProblemSpec(
+    'r8_two_stone_empty.json',
+    JSON.parse(emptyRegionRawJson) as RawStudyLdRzProblemJson
+  );
+  const specMa = parseStudyLdRzJsonToProblemSpec(
+    'r8_two_stone_ma.json',
+    JSON.parse(maRegionRawJson) as RawStudyLdRzProblemJson
+  );
+  const specExplicit = parseStudyLdRzJsonToProblemSpec(
+    'r8_two_stone_explicit.json',
+    JSON.parse(explicitRegionRawJson) as RawStudyLdRzProblemJson
+  );
+  const invalidRegionVal = validateStudyLdRzContract(
+    JSON.parse(invalidRegionRawJson) as Partial<RawStudyLdRzProblemJson>
+  );
+
+  // R8 §1: Absent and empty `region` without MA[...] must be unrestricted with ZERO fabricated immortal walls
+  check(
+    specAbsent.hasRegionHint === false &&
+      specAbsent.regionCoords.length === 0 &&
+      specAbsent.immortalWallCoords.length === 0,
+    'R8 §1 absent region -> hasRegionHint=false, regionCoords=[], immortalWallCoords=[]',
+    `hasRegionHint=${String(specAbsent.hasRegionHint)}, region=${specAbsent.regionCoords.length}, wall=${specAbsent.immortalWallCoords.length}`
+  );
+  check(
+    specEmpty.hasRegionHint === false &&
+      specEmpty.regionCoords.length === 0 &&
+      specEmpty.immortalWallCoords.length === 0,
+    'R8 §1 empty region="" -> hasRegionHint=false, regionCoords=[], immortalWallCoords=[]',
+    `hasRegionHint=${String(specEmpty.hasRegionHint)}, region=${specEmpty.regionCoords.length}, wall=${specEmpty.immortalWallCoords.length}`
+  );
+  check(
+    specMa.hasRegionHint === true &&
+      specMa.regionCoords.join(',') === '0,1,19' &&
+      specMa.immortalWallCoords.length === 0,
+    'R8 §1 SGF MA[aa][ab][ba] -> hasRegionHint=true, regionCoords=[0,1,19], immortalWallCoords=[]',
+    `hasRegionHint=${String(specMa.hasRegionHint)}, region=[${specMa.regionCoords.join(',')}], wall=${specMa.immortalWallCoords.length}`
+  );
+  check(
+    specExplicit.hasRegionHint === true &&
+      specExplicit.regionCoords.join(',') === '0,1,19' &&
+      specExplicit.immortalWallCoords.length === 0,
+    'R8 §1 explicit region="aa,ab,ba" -> hasRegionHint=true, regionCoords=[0,1,19], immortalWallCoords=[]',
+    `hasRegionHint=${String(specExplicit.hasRegionHint)}, region=[${specExplicit.regionCoords.join(',')}], wall=${specExplicit.immortalWallCoords.length}`
+  );
+  check(
+    !invalidRegionVal.valid &&
+      invalidRegionVal.code.startsWith('FR1-INVALID-REGION-COORD'),
+    'R8 §1 invalid region coordinate "zz" rejected -> FR1-INVALID-REGION-COORD',
+    `valid=${invalidRegionVal.valid}, code=${invalidRegionVal.code}`
+  );
+
+  // Solve & verify all 4 variants: all must prove PROVEN_WIN with B[ba] (coord 1) in 2 nodes!
+  const r8Cfg: SolverConfig = { ...defaultConfig(200), useProblemDefaultKo: true };
+  for (const [label, spec] of [
+    ['absent', specAbsent],
+    ['empty', specEmpty],
+    ['MA', specMa],
+    ['explicit', specExplicit],
+  ] as const) {
+    const solver = new DfpnSolver(r8Cfg);
+    const rep = solver.solveProblem(spec);
+    check(
+      rep.rootStatus === ProofOutcome.ProvenWin &&
+        rep.bestMove === 1 &&
+        rep.bestMoveSgf === 'ba' &&
+        rep.numNodes <= 4 &&
+        rep.proofDagNodes.length === 2,
+      `R8 §1 two-stone (${label}) solves to PROVEN_WIN bestMove=ba (coord 1) in 2 DAG nodes`,
+      `status=${rep.rootStatus}, best=${rep.bestMoveSgf}(${rep.bestMove}), numNodes=${rep.numNodes}, dag=${rep.proofDagNodes.length}`
+    );
+    const ctx = DfpnSolver.buildProofContext(spec, r8Cfg);
+    const initPos = DfpnSolver.buildInitialPosition(spec, ctx);
+    const memVer = checker.verifyProofDag(initPos, ctx, rep);
+    const fileVer = checker.verifySerializedLProofJson(rep.lproofJson, {
+      problem: spec,
+      scope: 'original_root',
+    });
+    check(
+      memVer.passed &&
+        fileVer.passed &&
+        memVer.canonicalDagChecksum === fileVer.canonicalDagChecksum,
+      `R8 §1 two-stone (${label}) passes memory & external-bound file verification with identical canonical digest`,
+      `mem=${memVer.errorCode}, file=${fileVer.errorCode}`
+    );
+  }
+
+  // R8 §1 cross-binding: absent-region proof binds cleanly to empty-region spec (both unrestricted)
+  const solverAbsent = new DfpnSolver(r8Cfg);
+  const repAbsent = solverAbsent.solveProblem(specAbsent);
+  const crossBindEmpty = checker.verifySerializedLProofJson(
+    repAbsent.lproofJson,
+    { problem: specEmpty, scope: 'original_root' }
+  );
+  const crossBindExplicit = checker.verifySerializedLProofJson(
+    repAbsent.lproofJson,
+    { problem: specExplicit, scope: 'original_root' }
+  );
+  check(
+    crossBindEmpty.passed &&
+      !crossBindExplicit.passed &&
+      crossBindExplicit.errorCode === 'LP-P01',
+    'R8 §1 absent-region proof binds to empty-region spec (PASS) and rejects explicit-region spec (LP-P01)',
+    `empty=${crossBindEmpty.errorCode}, explicit=${crossBindExplicit.errorCode}`
+  );
+
+  // R8 §2: Reverse witness on full_state_table (p001 ba with hasRegionHint=true, regionCoords=[]) -> LP-R02
+  const p001 = getSpec('p001');
+  const solver1 = new DfpnSolver(defaultConfig(500));
+  const rep1 = solver1.solveProblem(p001);
+  const revFullObj = JSON.parse(rep1.lproofJson) as Record<string, unknown>;
+  const revFullSetup = revFullObj.problemSetup as Record<string, unknown>;
+  revFullSetup.hasRegionHint = true;
+  revFullSetup.regionCoords = [];
+  revFullSetup.rawRegionPointCount = 0;
+  const revFullVer = checker.verifySerializedLProofJson(
+    resignLProof(revFullObj).json
+  );
+  check(
+    !revFullVer.passed && revFullVer.errorCode === 'LP-R02',
+    'R8 §2 full_state_table reverse witness (p001 ba with hasRegionHint=true, regionCoords=[]) -> LP-R02',
+    `code=${revFullVer.errorCode}`
+  );
+
+  // R8 §3: Contradictory hasRegionHint=false + non-empty regionCoords rejected across ALL TS object entrypoints
+  const badSpec: TsumegoProblemSpec = {
+    ...p001,
+    hasRegionHint: false,
+    regionCoords: [0, 1, 2],
+  };
+  let solverThrew = false;
+  try {
+    new DfpnSolver(defaultConfig(100)).solveProblem(badSpec);
+  } catch (err) {
+    solverThrew = String(err).includes('LP-J02');
+  }
+  check(
+    solverThrew,
+    'R8 §3 DfpnSolver.solveProblem rejects contradictory hasRegionHint=false + non-empty regionCoords (LP-J02)'
+  );
+
+  const ctx1 = DfpnSolver.buildProofContext(p001, defaultConfig(500));
+  const pos1 = DfpnSolver.buildInitialPosition(p001, ctx1);
+  const contraMemVer = checker.verifyProofDag(pos1, ctx1, {
+    ...rep1,
+    hasRegionHint: false,
+    regionCoords: [0, 1, 2],
+  });
+  check(
+    !contraMemVer.passed && contraMemVer.errorCode === 'LP-J02',
+    'R8 §3 verifyProofDag memory entrypoint rejects contradictory hasRegionHint=false + non-empty regionCoords -> LP-J02',
+    `code=${contraMemVer.errorCode}`
+  );
+
+  const contraBindVer = checker.verifySerializedLProofJson(rep1.lproofJson, {
+    problem: badSpec,
+    scope: 'original_root',
+  });
+  check(
+    !contraBindVer.passed && contraBindVer.errorCode === 'LP-J02',
+    'R8 §3 verifySerializedLProofJson rejects contradictory expectedBinding.problem -> LP-J02',
+    `code=${contraBindVer.errorCode}`
+  );
+
+  // R8 §3: Non-boolean problemSetup.hasRegionHint ("false", 0) rejected with LP-J02
+  for (const badVal of ['false', 0, []] as unknown[]) {
+    const badTypeObj = JSON.parse(rep1.lproofJson) as Record<string, unknown>;
+    (badTypeObj.problemSetup as Record<string, unknown>).hasRegionHint = badVal;
+    const badTypeVer = checker.verifySerializedLProofJson(
+      resignLProof(badTypeObj).json
+    );
+    check(
+      !badTypeVer.passed && badTypeVer.errorCode === 'LP-J02',
+      `R8 §3 non-boolean problemSetup.hasRegionHint=${JSON.stringify(badVal)} rejected -> LP-J02`,
+      `code=${badTypeVer.errorCode}`
+    );
+  }
 });
 
 console.log(

@@ -973,6 +973,18 @@ export class ProofArtifactManager {
     const blackInitialCoords = setup.blackInitialCoords;
     const whiteInitialCoords = setup.whiteInitialCoords;
     const immortalWallCoords = setup.immortalWallCoords;
+    if (
+      setup.hasRegionHint !== undefined &&
+      typeof setup.hasRegionHint !== 'boolean'
+    ) {
+      return makeJsonError(
+        'LP-J02',
+        'lproof/1 problemSetup.hasRegionHint 类型非法（必须为布尔值）。',
+        'Invalid non-boolean problemSetup.hasRegionHint.',
+        'lproof/1',
+        fileChecksum
+      );
+    }
     const hasRegionHint =
       typeof setup.hasRegionHint === 'boolean'
         ? setup.hasRegionHint
@@ -1208,9 +1220,32 @@ export class ProofArtifactManager {
       }
     }
 
-    // Optional external original-problem identity binding (R3 F4 + R4 §3 P1-B)
+    // Optional external original-problem identity binding (R3 F4 + R4 §3 P1-B + R8 §3)
     if (expectedBinding?.problem) {
       const expProb = expectedBinding.problem;
+      if (
+        expProb.hasRegionHint !== undefined &&
+        typeof expProb.hasRegionHint !== 'boolean'
+      ) {
+        return makeJsonError(
+          'LP-J02',
+          `外部待验原题 "${expProb.id}" 的 hasRegionHint 类型非法（必须为布尔值或省略）。`,
+          'Invalid non-boolean expectedBinding.problem.hasRegionHint.',
+          'lproof/1',
+          fileChecksum,
+          scopeMeta
+        );
+      }
+      if (expProb.hasRegionHint === false && expProb.regionCoords.length > 0) {
+        return makeJsonError(
+          'LP-J02',
+          `外部待验原题 "${expProb.id}" 自相矛盾：hasRegionHint=false 时不允许携带非空 regionCoords。`,
+          'Contradictory expectedBinding.problem: hasRegionHint=false with non-empty regionCoords.',
+          'lproof/1',
+          fileChecksum,
+          scopeMeta
+        );
+      }
       const expHasRegionHint =
         expProb.hasRegionHint !== undefined
           ? expProb.hasRegionHint
@@ -2294,6 +2329,88 @@ export class ProofArtifactManager {
       (inferredRootKind === 'traced_subposition'
         ? 'traced_within_rules'
         : 'original_root');
+
+    // R8 §3: Reject non-boolean or contradictory hasRegionHint=false + non-empty regionCoords
+    // in the in-memory verification entrypoint instead of silently rewriting regionCoords.
+    if (
+      report.hasRegionHint !== undefined &&
+      typeof report.hasRegionHint !== 'boolean'
+    ) {
+      return {
+        encodingMode: effectiveEncodingMode,
+        verifiedScope: effectiveScope,
+        verifiedRootKind: inferredRootKind,
+        verifiedGoal: context.attackerGoal,
+        verifiedAttackerAllowKo: context.attackerAllowKo,
+        verifiedDefenderAllowKo: context.defenderAllowKo,
+        traceOutsideRegion: Boolean(options?.traceOutsideRegion),
+        traceHasRestrictedKoCapture: Boolean(
+          options?.traceHasRestrictedKoCapture
+        ),
+        passed: false,
+        schemaVersion: 'lproof/1',
+        jcsSha256Checksum: report.proofChecksum,
+        verifiedNodes: 0,
+        verifiedStates: 0,
+        verifiedHistories: 0,
+        replayedPrunedCertificates: 0,
+        replayedTtHits: 0,
+        failedNodeId: null,
+        errorCode: 'LP-J02',
+        message: 'SolveReport.hasRegionHint 类型非法（必须为布尔值或省略）。',
+        auditChecks: [
+          {
+            checkId: 'CHK-01',
+            requirementRef: 'FR-8.3 / R8 §3',
+            title: '区域提示契约一致性校验',
+            passed: false,
+            detail: `Invalid non-boolean hasRegionHint=${String(
+              report.hasRegionHint
+            )}.`,
+          },
+        ],
+      };
+    }
+    if (
+      report.hasRegionHint === false &&
+      (report.regionCoords?.length ?? 0) > 0
+    ) {
+      return {
+        encodingMode: effectiveEncodingMode,
+        verifiedScope: effectiveScope,
+        verifiedRootKind: inferredRootKind,
+        verifiedGoal: context.attackerGoal,
+        verifiedAttackerAllowKo: context.attackerAllowKo,
+        verifiedDefenderAllowKo: context.defenderAllowKo,
+        traceOutsideRegion: Boolean(options?.traceOutsideRegion),
+        traceHasRestrictedKoCapture: Boolean(
+          options?.traceHasRestrictedKoCapture
+        ),
+        passed: false,
+        schemaVersion: 'lproof/1',
+        jcsSha256Checksum: report.proofChecksum,
+        verifiedNodes: 0,
+        verifiedStates: 0,
+        verifiedHistories: 0,
+        replayedPrunedCertificates: 0,
+        replayedTtHits: 0,
+        failedNodeId: null,
+        errorCode: 'LP-J02',
+        message:
+          'SolveReport 自相矛盾：hasRegionHint=false 时不允许携带非空 regionCoords。',
+        auditChecks: [
+          {
+            checkId: 'CHK-01',
+            requirementRef: 'FR-8.3 / R8 §3',
+            title: '区域提示契约一致性校验',
+            passed: false,
+            detail: `Contradictory hasRegionHint=false with regionCoords.length=${
+              report.regionCoords?.length ?? 0
+            }.`,
+          },
+        ],
+      };
+    }
 
     const resolvedRegion = resolveReportRegion(report);
     const effectiveRegionCoords = resolvedRegion.regionCoords;

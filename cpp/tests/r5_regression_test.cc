@@ -524,6 +524,130 @@ void TestSection4R7ProtocolEdgeCases() {
         "high=" + lone_high_ver.error_code + ", low=" + lone_low_ver.error_code);
 }
 
+void TestSection5R8ProblemContractAndConsistency() {
+  std::cout << "\n=== 5. R8 Problem Contract, Reverse-Witness & Type Safety ===\n";
+  ProblemContractParser<19> parser;
+  ProofArtifactManager<19> checker;
+
+  static const std::string kTwoStoneAbsentJson =
+      R"json({"masked_sgf_str":"(;GM[1]FF[4]SZ[19]PL[B]AB[ab]AW[aa])","winning_color":"B","turn_color":"B","black_search_goal":"TOKILL","white_search_goal":"TOLIVE","black_crucial_stone":"aa","white_crucial_stone":"aa","black_ko_rule":"allow_ko","white_ko_rule":"allow_ko"})json";
+  static const std::string kTwoStoneEmptyJson =
+      R"json({"masked_sgf_str":"(;GM[1]FF[4]SZ[19]PL[B]AB[ab]AW[aa])","winning_color":"B","turn_color":"B","black_search_goal":"TOKILL","white_search_goal":"TOLIVE","black_crucial_stone":"aa","white_crucial_stone":"aa","black_ko_rule":"allow_ko","white_ko_rule":"allow_ko","region":""})json";
+  static const std::string kTwoStoneMaJson =
+      R"json({"masked_sgf_str":"(;GM[1]FF[4]SZ[19]PL[B]AB[ab]AW[aa]MA[aa][ab][ba])","winning_color":"B","turn_color":"B","black_search_goal":"TOKILL","white_search_goal":"TOLIVE","black_crucial_stone":"aa","white_crucial_stone":"aa","black_ko_rule":"allow_ko","white_ko_rule":"allow_ko"})json";
+  static const std::string kTwoStoneExplicitJson =
+      R"json({"masked_sgf_str":"(;GM[1]FF[4]SZ[19]PL[B]AB[ab]AW[aa])","winning_color":"B","turn_color":"B","black_search_goal":"TOKILL","white_search_goal":"TOLIVE","black_crucial_stone":"aa","white_crucial_stone":"aa","black_ko_rule":"allow_ko","white_ko_rule":"allow_ko","region":"aa,ab,ba"})json";
+  static const std::string kTwoStoneInvalidRegionJson =
+      R"json({"masked_sgf_str":"(;GM[1]FF[4]SZ[19]PL[B]AB[ab]AW[aa])","winning_color":"B","turn_color":"B","black_search_goal":"TOKILL","white_search_goal":"TOLIVE","black_crucial_stone":"aa","white_crucial_stone":"aa","black_ko_rule":"allow_ko","white_ko_rule":"allow_ko","region":"aa,zz"})json";
+
+  const ParsedProblem<19> p_absent = parser.ParseTsumegoJsonObject(
+      "r8_two_stone_absent", kTwoStoneAbsentJson,
+      TurnConflictPolicy::kRejectStrict);
+  const ParsedProblem<19> p_empty = parser.ParseTsumegoJsonObject(
+      "r8_two_stone_empty", kTwoStoneEmptyJson,
+      TurnConflictPolicy::kRejectStrict);
+  const ParsedProblem<19> p_ma = parser.ParseTsumegoJsonObject(
+      "r8_two_stone_ma", kTwoStoneMaJson, TurnConflictPolicy::kRejectStrict);
+  const ParsedProblem<19> p_explicit = parser.ParseTsumegoJsonObject(
+      "r8_two_stone_explicit", kTwoStoneExplicitJson,
+      TurnConflictPolicy::kRejectStrict);
+  const ParsedProblem<19> p_invalid = parser.ParseTsumegoJsonObject(
+      "r8_two_stone_invalid", kTwoStoneInvalidRegionJson,
+      TurnConflictPolicy::kRejectStrict);
+
+  Check(p_absent.valid && !p_absent.region_search_mask.has_value() &&
+            !p_absent.initial_position.ImmortalWall().Any(),
+        "R8 §1 absent region -> unrestricted, empty immortal wall");
+  Check(p_empty.valid && !p_empty.region_search_mask.has_value() &&
+            !p_empty.initial_position.ImmortalWall().Any(),
+        "R8 §1 empty region=\"\" -> unrestricted, empty immortal wall");
+  Check(p_ma.valid && p_ma.region_search_mask.has_value() &&
+            p_ma.region_search_mask->ToCoords() == std::vector<int>({0, 1, 19}) &&
+            !p_ma.initial_position.ImmortalWall().Any(),
+        "R8 §1 SGF MA[aa][ab][ba] -> region={0,1,19}, empty immortal wall");
+  Check(p_explicit.valid && p_explicit.region_search_mask.has_value() &&
+            p_explicit.region_search_mask->ToCoords() ==
+                std::vector<int>({0, 1, 19}) &&
+            !p_explicit.initial_position.ImmortalWall().Any(),
+        "R8 §1 explicit region=\"aa,ab,ba\" -> region={0,1,19}, empty immortal wall");
+  Check(!p_invalid.valid && p_invalid.error_code == "FR1-INVALID-REGION-COORD",
+        "R8 §1 invalid region coordinate \"zz\" rejected -> FR1-INVALID-REGION-COORD",
+        "code=" + p_invalid.error_code);
+
+  struct TwoStoneCase {
+    std::string label;
+    const ParsedProblem<19>* prob;
+  };
+  const std::vector<TwoStoneCase> variants = {
+      {"absent", &p_absent},
+      {"empty", &p_empty},
+      {"MA", &p_ma},
+      {"explicit", &p_explicit},
+  };
+  for (const auto& vc : variants) {
+    DfpnSolver<19> solver(DefaultConfig(200U));
+    const SolveReport<19> rep = solver.Solve(
+        vc.prob->initial_position, vc.prob->proof_context,
+        vc.prob->region_search_mask, vc.prob->problem_id);
+    Check(rep.root_status == ProofOutcome::kProvenWin && rep.best_move == 1 &&
+              rep.proof_dag_nodes.size() == 2U,
+          "R8 §1 native two-stone (" + vc.label +
+              ") proves PROVEN_WIN best_move=ba(1) in 2 DAG nodes",
+          "best=" + std::to_string(rep.best_move) + ", dag=" +
+              std::to_string(rep.proof_dag_nodes.size()));
+    const VerificationReport mem = checker.VerifyProofDag(
+        vc.prob->initial_position, vc.prob->proof_context, rep,
+        VerificationScope::kOriginalRoot);
+    const std::string json = checker.SerializeLProofJson(
+        vc.prob->initial_position, vc.prob->proof_context, rep);
+    const VerificationReport file = checker.VerifyLProofJsonString(
+        json, vc.prob, VerificationScope::kOriginalRoot);
+    Check(mem.passed && file.passed &&
+              mem.canonical_dag_checksum == file.canonical_dag_checksum,
+          "R8 §1 native two-stone (" + vc.label +
+              ") passes memory & external-bound file check",
+          "mem=" + mem.error_code + ", file=" + file.error_code);
+  }
+
+  // R8 §1 Cross-engine check: exact TS-generated full_state_table proof for the
+  // absent-region two-stone JSON must PASS C++ external binding on absent & empty,
+  // and FAIL with LP-P01 when bound against explicit region.
+  static const std::string kTwoStoneTsFullJson = R"json({"magic":"lproof/1","encodingMode":"full_state_table","problemId":"r8_two_stone_absent","context":{"contextId":"ctx_r8_two_stone_absent_SSK_TOKILL_ako1_dko1","rootAttacker":"B","attackerGoal":"TOKILL","crucialStoneOp":"SINGLE","koRule":"SSK","attackerAllowKo":true,"defenderAllowKo":true,"initialTokens":[{"tokenId":0,"initialCoord":0,"groupIndex":0,"stoneColor":"W"}]},"problemSetup":{"boardSize":19,"rootKind":"initial","firstToPlay":"B","koPoint":-2,"consecutivePasses":0,"survivingTokensMask":1,"zobristHex":"e322fbc46ef60882","inputHash":"e322fbc46ef60882","blackInitialCoords":[19],"whiteInitialCoords":[0],"immortalWallCoords":[],"hasRegionHint":false,"regionCoords":[],"rawRegionPointCount":0,"isFullRegionSearch":true},"rootNode":1,"rootOutcome":"PROVEN_WIN","rootPn":0,"rootDn":"SAT","bestMove":1,"bestMoveSgf":"ba","stateTable":[{"stateId":0,"parentStateId":-1,"moveFromParent":-1,"toPlay":1,"koPoint":-2,"consecutivePasses":0,"survivingTokensMask":1,"zobristHex":"e322fbc46ef60882","blackCoords":[19],"whiteCoords":[0],"historyId":0},{"stateId":1,"parentStateId":0,"moveFromParent":1,"toPlay":2,"koPoint":-2,"consecutivePasses":0,"survivingTokensMask":0,"zobristHex":"58276c71cdd50290","blackCoords":[1,19],"whiteCoords":[],"historyId":1}],"snapshotPool":[{"blackCoords":[19],"whiteCoords":[0],"toPlay":1,"zobristHex":"e322fbc46ef60882"},{"blackCoords":[1,19],"whiteCoords":[],"toPlay":2,"zobristHex":"58276c71cdd50290"}],"historySnapshotIds":[[0],[0,1]],"nodes":[{"nodeId":0,"stateId":1,"historyId":1,"parentStateId":0,"isOrNode":false,"toPlay":"W","incomingMove":1,"incomingMoveSgf":"ba","pn":0,"dn":"SAT","outcome":"PROVEN_WIN","terminalEvidence":"TOKENS_CAPTURED","isPrunedOutsideRz":false,"isTtHit":false,"isKoDependentBarrier":false,"sourceProofNodeId":null,"proofRzCoords":[0],"disproofRzCoords":[],"childNodeIds":[],"childMoves":[],"prunedCertificate":null},{"nodeId":1,"stateId":0,"historyId":0,"parentStateId":-1,"isOrNode":true,"toPlay":"B","incomingMove":-1,"incomingMoveSgf":"pass","pn":0,"dn":"SAT","outcome":"PROVEN_WIN","terminalEvidence":"INTERNAL_AGGREGATION","isPrunedOutsideRz":false,"isTtHit":false,"isKoDependentBarrier":false,"sourceProofNodeId":null,"proofRzCoords":[0,1],"disproofRzCoords":[],"childNodeIds":[0],"childMoves":[1],"prunedCertificate":null}],"checksum":"sha256-jcs:9062b66a10cf7ac2f743948aa742503b671b4a04b1033f2703cc8f0980658007"})json";
+  static const std::string kExpectedTwoStoneCanon =
+      "sha256-jcs:983f2e13180e0ffca139ab2d2b1199b8a6d91f62a9afb95e40c11ea122604f2b";
+
+  const VerificationReport ts_bind_absent = checker.VerifyLProofJsonString(
+      kTwoStoneTsFullJson, &p_absent, VerificationScope::kOriginalRoot);
+  const VerificationReport ts_bind_empty = checker.VerifyLProofJsonString(
+      kTwoStoneTsFullJson, &p_empty, VerificationScope::kOriginalRoot);
+  const VerificationReport ts_bind_explicit = checker.VerifyLProofJsonString(
+      kTwoStoneTsFullJson, &p_explicit, VerificationScope::kOriginalRoot);
+
+  Check(ts_bind_absent.passed && ts_bind_empty.passed &&
+            ts_bind_absent.canonical_dag_checksum == kExpectedTwoStoneCanon &&
+            !ts_bind_explicit.passed && ts_bind_explicit.error_code == "LP-P01",
+        "R8 §1 TS two-stone absent-region proof cross-verifies against C++ absent/empty (PASS + canonical match) and rejects explicit (LP-P01)",
+        "absent=" + ts_bind_absent.error_code +
+            ", empty=" + ts_bind_empty.error_code +
+            ", explicit=" + ts_bind_explicit.error_code);
+
+  // R8 §2: full_state_table reverse witness (p001 ba with hasRegionHint=true, regionCoords=[]) -> LP-R02
+  static const std::string kReverseEmptyRegionFullJson = R"json({"magic":"lproof/1","encodingMode":"full_state_table","problemId":"p001_straight_three_live","context":{"contextId":"ctx_p001_straight_three_live_SSK_TOLIVE_ako0_dko1","rootAttacker":"B","attackerGoal":"TOLIVE","crucialStoneOp":"SINGLE","koRule":"SSK","attackerAllowKo":false,"defenderAllowKo":true,"initialTokens":[{"tokenId":0,"initialCoord":20,"groupIndex":0,"stoneColor":"B"}]},"problemSetup":{"boardSize":19,"rootKind":"initial","firstToPlay":"B","koPoint":-2,"consecutivePasses":0,"survivingTokensMask":1,"zobristHex":"06fe8925c3232e8b","inputHash":"06fe8925c3232e8b","blackInitialCoords":[3,19,20,21,22],"whiteInitialCoords":[4,23,38,39,40,41,42],"immortalWallCoords":[4,23,38,39,40,41,42],"hasRegionHint":true,"regionCoords":[],"rawRegionPointCount":0,"isFullRegionSearch":true},"rootNode":1,"rootOutcome":"PROVEN_WIN","rootPn":0,"rootDn":"SAT","bestMove":1,"bestMoveSgf":"ba","stateTable":[{"stateId":0,"parentStateId":-1,"moveFromParent":-1,"toPlay":1,"koPoint":-2,"consecutivePasses":0,"survivingTokensMask":1,"zobristHex":"06fe8925c3232e8b","blackCoords":[3,19,20,21,22],"whiteCoords":[4,23,38,39,40,41,42],"historyId":0},{"stateId":1,"parentStateId":0,"moveFromParent":1,"toPlay":2,"koPoint":-2,"consecutivePasses":0,"survivingTokensMask":1,"zobristHex":"012424dc168fb64a","blackCoords":[1,3,19,20,21,22],"whiteCoords":[4,23,38,39,40,41,42],"historyId":1}],"snapshotPool":[{"blackCoords":[3,19,20,21,22],"whiteCoords":[4,23,38,39,40,41,42],"toPlay":1,"zobristHex":"06fe8925c3232e8b"},{"blackCoords":[1,3,19,20,21,22],"whiteCoords":[4,23,38,39,40,41,42],"toPlay":2,"zobristHex":"012424dc168fb64a"}],"historySnapshotIds":[[0],[0,1]],"nodes":[{"nodeId":0,"stateId":1,"historyId":1,"parentStateId":0,"isOrNode":false,"toPlay":"W","incomingMove":1,"incomingMoveSgf":"ba","pn":0,"dn":"SAT","outcome":"PROVEN_WIN","terminalEvidence":"BENSON_UCA","isPrunedOutsideRz":false,"isTtHit":false,"isKoDependentBarrier":false,"sourceProofNodeId":null,"proofRzCoords":[0,1,2,3,19,20,21,22],"disproofRzCoords":[],"childNodeIds":[],"childMoves":[],"prunedCertificate":null},{"nodeId":1,"stateId":0,"historyId":0,"parentStateId":-1,"isOrNode":true,"toPlay":"B","incomingMove":-1,"incomingMoveSgf":"pass","pn":0,"dn":"SAT","outcome":"PROVEN_WIN","terminalEvidence":"INTERNAL_AGGREGATION","isPrunedOutsideRz":false,"isTtHit":false,"isKoDependentBarrier":false,"sourceProofNodeId":null,"proofRzCoords":[0,1,2,3,19,20,21,22],"disproofRzCoords":[],"childNodeIds":[0],"childMoves":[1],"prunedCertificate":null}],"checksum":"sha256-jcs:5310134b5d32ec2db4edcf0d43b54016ce2d60dd3ef1a78094144b7f6deff1f4"})json";
+  const VerificationReport rev_full_ver =
+      checker.VerifyLProofJsonString(kReverseEmptyRegionFullJson);
+  Check(!rev_full_ver.passed && rev_full_ver.error_code == "LP-R02",
+        "R8 §2 full_state_table reverse witness (p001 ba with hasRegionHint=true, regionCoords=[]) -> LP-R02",
+        "code=" + rev_full_ver.error_code);
+
+  // R8 §3: Non-boolean problemSetup.hasRegionHint ("false") rejected -> LP-J02
+  static const std::string kBadTypeHasRegionHintJson = R"json({"magic":"lproof/1","encodingMode":"full_state_table","problemId":"p001_straight_three_live","context":{"contextId":"ctx_p001_straight_three_live_SSK_TOLIVE_ako0_dko1","rootAttacker":"B","attackerGoal":"TOLIVE","crucialStoneOp":"SINGLE","koRule":"SSK","attackerAllowKo":false,"defenderAllowKo":true,"initialTokens":[{"tokenId":0,"initialCoord":20,"groupIndex":0,"stoneColor":"B"}]},"problemSetup":{"boardSize":19,"rootKind":"initial","firstToPlay":"B","koPoint":-2,"consecutivePasses":0,"survivingTokensMask":1,"zobristHex":"06fe8925c3232e8b","inputHash":"06fe8925c3232e8b","blackInitialCoords":[3,19,20,21,22],"whiteInitialCoords":[4,23,38,39,40,41,42],"immortalWallCoords":[4,23,38,39,40,41,42],"hasRegionHint":"false","regionCoords":[0,1,2],"rawRegionPointCount":3,"isFullRegionSearch":true},"rootNode":1,"rootOutcome":"PROVEN_WIN","rootPn":0,"rootDn":"SAT","bestMove":1,"bestMoveSgf":"ba","stateTable":[{"stateId":0,"parentStateId":-1,"moveFromParent":-1,"toPlay":1,"koPoint":-2,"consecutivePasses":0,"survivingTokensMask":1,"zobristHex":"06fe8925c3232e8b","blackCoords":[3,19,20,21,22],"whiteCoords":[4,23,38,39,40,41,42],"historyId":0},{"stateId":1,"parentStateId":0,"moveFromParent":1,"toPlay":2,"koPoint":-2,"consecutivePasses":0,"survivingTokensMask":1,"zobristHex":"012424dc168fb64a","blackCoords":[1,3,19,20,21,22],"whiteCoords":[4,23,38,39,40,41,42],"historyId":1}],"snapshotPool":[{"blackCoords":[3,19,20,21,22],"whiteCoords":[4,23,38,39,40,41,42],"toPlay":1,"zobristHex":"06fe8925c3232e8b"},{"blackCoords":[1,3,19,20,21,22],"whiteCoords":[4,23,38,39,40,41,42],"toPlay":2,"zobristHex":"012424dc168fb64a"}],"historySnapshotIds":[[0],[0,1]],"nodes":[{"nodeId":0,"stateId":1,"historyId":1,"parentStateId":0,"isOrNode":false,"toPlay":"W","incomingMove":1,"incomingMoveSgf":"ba","pn":0,"dn":"SAT","outcome":"PROVEN_WIN","terminalEvidence":"BENSON_UCA","isPrunedOutsideRz":false,"isTtHit":false,"isKoDependentBarrier":false,"sourceProofNodeId":null,"proofRzCoords":[0,1,2,3,19,20,21,22],"disproofRzCoords":[],"childNodeIds":[],"childMoves":[],"prunedCertificate":null},{"nodeId":1,"stateId":0,"historyId":0,"parentStateId":-1,"isOrNode":true,"toPlay":"B","incomingMove":-1,"incomingMoveSgf":"pass","pn":0,"dn":"SAT","outcome":"PROVEN_WIN","terminalEvidence":"INTERNAL_AGGREGATION","isPrunedOutsideRz":false,"isTtHit":false,"isKoDependentBarrier":false,"sourceProofNodeId":null,"proofRzCoords":[0,1,2,3,19,20,21,22],"disproofRzCoords":[],"childNodeIds":[0],"childMoves":[1],"prunedCertificate":null}],"checksum":"sha256-jcs:c20fe69021ba3702513c0eeebffd5980e4617db03f56b4a62b3d9ad96cc8bdda"})json";
+  const VerificationReport bad_type_ver =
+      checker.VerifyLProofJsonString(kBadTypeHasRegionHintJson);
+  Check(!bad_type_ver.passed && bad_type_ver.error_code == "LP-J02",
+        "R8 §3 Non-boolean problemSetup.hasRegionHint=\"false\" rejected -> LP-J02",
+        "code=" + bad_type_ver.error_code);
+}
+
 }  // namespace
 
 int main() {
@@ -531,6 +655,7 @@ int main() {
   TestSection2ScopeParity();
   TestSection3FullStateBindingAndContradictoryRoot();
   TestSection4R7ProtocolEdgeCases();
+  TestSection5R8ProblemContractAndConsistency();
 
   const int failed = g_total - g_passed;
   std::cout << "\n========================================\n"

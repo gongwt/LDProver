@@ -1885,6 +1885,24 @@ VerificationReport VerifyProofDagCore(
     }
   }
 
+  // R8 §2: Validate stateTable transition moves against declared region_hint
+  // AFTER root bestMove witness binding (LP-R02) so both compact_dag and
+  // full_state_table reverse-witnesses consistently report LP-R02 across C++ & TS,
+  // while non-root out-of-region state transitions still report LP-S11.
+  if (state_rows != nullptr) {
+    for (size_t s = 1; s < state_rows->size(); ++s) {
+      if (!IsMoveInAllowedRegion<N>((*state_rows)[s].move_from_parent,
+                                    report.region_hint)) {
+        ver.passed = false;
+        ver.error_code = "LP-S11";
+        ver.message =
+            "stateTable transition moveFromParent lies outside declared "
+            "regionCoords.";
+        return ver;
+      }
+    }
+  }
+
   // Zero-trust full recursive DAG verification from `initial_pos`.
   BensonTerminalEvaluator<N> independent_terminal;
   if (!VerifySubgraphRecursive<N>(initial_pos, context, report,
@@ -2152,30 +2170,50 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
 
     // Parse regionHint BEFORE replaying traced_subposition moves so scope
     // validation (LP-S11) can inspect trace moves against declared regionCoords.
+    // R8 §3: Reject present non-boolean hasRegionHint (and non-array regionCoords)
+    // with LP-J02 rather than silently treating them as absent.
     bool has_region_hint = false;
     bool explicit_region_hint_flag = false;
     if (const auto it_hr = setup_obj.find("hasRegionHint");
-        it_hr != setup_obj.end() &&
-        it_hr->second.kind == JsonValue::Kind::kBool) {
-      has_region_hint = it_hr->second.bool_val;
-      explicit_region_hint_flag = true;
-    } else if (const auto it_rc = setup_obj.find("regionCoords");
-               it_rc != setup_obj.end() &&
-               it_rc->second.kind == JsonValue::Kind::kArray &&
-               !it_rc->second.arr_val.empty()) {
-      has_region_hint = true;
-    }
-    if (explicit_region_hint_flag && !has_region_hint) {
-      if (const auto it_rc = setup_obj.find("regionCoords");
-          it_rc != setup_obj.end() &&
-          it_rc->second.kind == JsonValue::Kind::kArray &&
-          !it_rc->second.arr_val.empty()) {
+        it_hr != setup_obj.end()) {
+      if (it_hr->second.kind != JsonValue::Kind::kBool) {
         ver.passed = false;
         ver.error_code = "LP-J02";
         ver.message =
-            "Contradictory problemSetup: hasRegionHint=false with non-empty "
-            "regionCoords.";
+            "Invalid problemSetup.hasRegionHint: expected boolean value.";
         return ver;
+      }
+      has_region_hint = it_hr->second.bool_val;
+      explicit_region_hint_flag = true;
+    } else if (const auto it_rc = setup_obj.find("regionCoords");
+               it_rc != setup_obj.end()) {
+      if (it_rc->second.kind != JsonValue::Kind::kArray) {
+        ver.passed = false;
+        ver.error_code = "LP-J02";
+        ver.message = "Invalid problemSetup.regionCoords array.";
+        return ver;
+      }
+      if (!it_rc->second.arr_val.empty()) {
+        has_region_hint = true;
+      }
+    }
+    if (explicit_region_hint_flag && !has_region_hint) {
+      if (const auto it_rc = setup_obj.find("regionCoords");
+          it_rc != setup_obj.end()) {
+        if (it_rc->second.kind != JsonValue::Kind::kArray) {
+          ver.passed = false;
+          ver.error_code = "LP-J02";
+          ver.message = "Invalid problemSetup.regionCoords array.";
+          return ver;
+        }
+        if (!it_rc->second.arr_val.empty()) {
+          ver.passed = false;
+          ver.error_code = "LP-J02";
+          ver.message =
+              "Contradictory problemSetup: hasRegionHint=false with non-empty "
+              "regionCoords.";
+          return ver;
+        }
       }
     }
     if (has_region_hint) {
@@ -2610,14 +2648,6 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
             return ver;
           }
           const int16_t mv = static_cast<int16_t>(mfp_v.int_val);
-          if (!IsMoveInAllowedRegion<N>(mv, report.region_hint)) {
-            ver.passed = false;
-            ver.error_code = "LP-S11";
-            ver.message =
-                "stateTable transition moveFromParent lies outside declared "
-                "regionCoords.";
-            return ver;
-          }
           expected_pos =
               rebuilt_state_rows[static_cast<size_t>(psid_v.int_val)].pos;
           if (!expected_pos.PlayMove(mv)) {
