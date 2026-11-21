@@ -237,7 +237,47 @@ struct JsonValue {
   }
 };
 
-// RFC 8785 JSON Canonicalization Scheme (JCS): sorted object keys, compact UTF-8.
+std::vector<uint16_t> Utf8ToUtf16CodeUnits(const std::string& s) {
+  std::vector<uint16_t> out;
+  out.reserve(s.size());
+  size_t i = 0;
+  while (i < s.size()) {
+    const unsigned char b0 = static_cast<unsigned char>(s[i]);
+    uint32_t cp = 0;
+    if (b0 < 0x80U) {
+      cp = b0;
+      i += 1U;
+    } else if ((b0 & 0xE0U) == 0xC0U && i + 1U < s.size()) {
+      cp = ((b0 & 0x1FU) << 6U) |
+           (static_cast<unsigned char>(s[i + 1U]) & 0x3FU);
+      i += 2U;
+    } else if ((b0 & 0xF0U) == 0xE0U && i + 2U < s.size()) {
+      cp = ((b0 & 0x0FU) << 12U) |
+           ((static_cast<unsigned char>(s[i + 1U]) & 0x3FU) << 6U) |
+           (static_cast<unsigned char>(s[i + 2U]) & 0x3FU);
+      i += 3U;
+    } else if ((b0 & 0xF8U) == 0xF0U && i + 3U < s.size()) {
+      cp = ((b0 & 0x07U) << 18U) |
+           ((static_cast<unsigned char>(s[i + 1U]) & 0x3FU) << 12U) |
+           ((static_cast<unsigned char>(s[i + 2U]) & 0x3FU) << 6U) |
+           (static_cast<unsigned char>(s[i + 3U]) & 0x3FU);
+      i += 4U;
+    } else {
+      cp = b0;
+      i += 1U;
+    }
+    if (cp <= 0xFFFFU) {
+      out.push_back(static_cast<uint16_t>(cp));
+    } else {
+      const uint32_t adj = cp - 0x10000U;
+      out.push_back(static_cast<uint16_t>(0xD800U + (adj >> 10U)));
+      out.push_back(static_cast<uint16_t>(0xDC00U + (adj & 0x3FFU)));
+    }
+  }
+  return out;
+}
+
+// RFC 8785 JSON Canonicalization Scheme (JCS): UTF-16 key order, compact UTF-8.
 std::string CanonicalizeJcs(const JsonValue& v) {
   switch (v.kind) {
     case JsonValue::Kind::kNull:
@@ -258,14 +298,23 @@ std::string CanonicalizeJcs(const JsonValue& v) {
       return out;
     }
     case JsonValue::Kind::kObject: {
+      std::vector<std::pair<std::vector<uint16_t>,
+                            const std::pair<const std::string, JsonValue>*>>
+          entries;
+      entries.reserve(v.obj_val.size());
+      for (const auto& kv : v.obj_val) {
+        entries.emplace_back(Utf8ToUtf16CodeUnits(kv.first), &kv);
+      }
+      std::sort(entries.begin(), entries.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
       std::string out = "{";
       bool first = true;
-      for (const auto& [k, val] : v.obj_val) {
+      for (const auto& entry : entries) {
         if (!first) out.push_back(',');
         first = false;
-        out += EscapeJsonString(k);
+        out += EscapeJsonString(entry.second->first);
         out.push_back(':');
-        out += CanonicalizeJcs(val);
+        out += CanonicalizeJcs(entry.second->second);
       }
       out.push_back('}');
       return out;
@@ -421,28 +470,37 @@ class JsonParser {
             res.push_back('\t');
             break;
           case 'u': {
-            if (pos_ + 4U > src_.size()) return false;
             uint32_t code = 0;
-            for (int k = 0; k < 4; ++k) {
-              const char hc = src_[pos_++];
-              code <<= 4U;
-              if (hc >= '0' && hc <= '9') {
-                code |= static_cast<uint32_t>(hc - '0');
-              } else if (hc >= 'a' && hc <= 'f') {
-                code |= static_cast<uint32_t>(hc - 'a' + 10);
-              } else if (hc >= 'A' && hc <= 'F') {
-                code |= static_cast<uint32_t>(hc - 'A' + 10);
-              } else {
+            if (!ParseHex4(&code)) return false;
+            // RFC 8259 §7: Reject lone low surrogates and pair high+low UTF-16
+            // surrogates into a single Unicode scalar value (U+10000..U+10FFFF).
+            if (code >= 0xDC00U && code <= 0xDFFFU) {
+              return false;
+            }
+            if (code >= 0xD800U && code <= 0xDBFFU) {
+              if (pos_ + 6U > src_.size() || src_[pos_] != '\\' ||
+                  src_[pos_ + 1U] != 'u') {
                 return false;
               }
+              pos_ += 2U;
+              uint32_t low = 0;
+              if (!ParseHex4(&low) || low < 0xDC00U || low > 0xDFFFU) {
+                return false;
+              }
+              code = 0x10000U + (((code - 0xD800U) << 10U) | (low - 0xDC00U));
             }
             if (code < 0x80U) {
               res.push_back(static_cast<char>(code));
             } else if (code < 0x800U) {
               res.push_back(static_cast<char>(0xC0U | (code >> 6U)));
               res.push_back(static_cast<char>(0x80U | (code & 0x3FU)));
-            } else {
+            } else if (code < 0x10000U) {
               res.push_back(static_cast<char>(0xE0U | (code >> 12U)));
+              res.push_back(static_cast<char>(0x80U | ((code >> 6U) & 0x3FU)));
+              res.push_back(static_cast<char>(0x80U | (code & 0x3FU)));
+            } else {
+              res.push_back(static_cast<char>(0xF0U | (code >> 18U)));
+              res.push_back(static_cast<char>(0x80U | ((code >> 12U) & 0x3FU)));
               res.push_back(static_cast<char>(0x80U | ((code >> 6U) & 0x3FU)));
               res.push_back(static_cast<char>(0x80U | (code & 0x3FU)));
             }
@@ -458,6 +516,26 @@ class JsonParser {
       }
     }
     return false;
+  }
+
+  bool ParseHex4(uint32_t* out) {
+    if (pos_ + 4U > src_.size()) return false;
+    uint32_t code = 0;
+    for (int k = 0; k < 4; ++k) {
+      const char hc = src_[pos_++];
+      code <<= 4U;
+      if (hc >= '0' && hc <= '9') {
+        code |= static_cast<uint32_t>(hc - '0');
+      } else if (hc >= 'a' && hc <= 'f') {
+        code |= static_cast<uint32_t>(hc - 'a' + 10);
+      } else if (hc >= 'A' && hc <= 'F') {
+        code |= static_cast<uint32_t>(hc - 'A' + 10);
+      } else {
+        return false;
+      }
+    }
+    *out = code;
+    return true;
   }
 
   bool ParseInt(JsonValue* out) {
@@ -1305,7 +1383,8 @@ std::string SerializeCanonicalCompactDagJson(
       MakeIntArray(initial_pos.Stones(Color::kWhite).ToCoords());
   setup.obj_val["immortalWallCoords"] =
       MakeIntArray(initial_pos.ImmortalWall().ToCoords());
-  setup.obj_val["hasRegionHint"] = JsonValue::MakeBool(!region_coords.empty());
+  setup.obj_val["hasRegionHint"] =
+      JsonValue::MakeBool(report.region_hint.has_value());
   setup.obj_val["regionCoords"] = MakeIntArray(region_coords);
   setup.obj_val["rawRegionPointCount"] =
       JsonValue::MakeInt(static_cast<int64_t>(region_coords.size()));
@@ -2074,15 +2153,30 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
     // Parse regionHint BEFORE replaying traced_subposition moves so scope
     // validation (LP-S11) can inspect trace moves against declared regionCoords.
     bool has_region_hint = false;
+    bool explicit_region_hint_flag = false;
     if (const auto it_hr = setup_obj.find("hasRegionHint");
         it_hr != setup_obj.end() &&
         it_hr->second.kind == JsonValue::Kind::kBool) {
       has_region_hint = it_hr->second.bool_val;
+      explicit_region_hint_flag = true;
     } else if (const auto it_rc = setup_obj.find("regionCoords");
                it_rc != setup_obj.end() &&
                it_rc->second.kind == JsonValue::Kind::kArray &&
                !it_rc->second.arr_val.empty()) {
       has_region_hint = true;
+    }
+    if (explicit_region_hint_flag && !has_region_hint) {
+      if (const auto it_rc = setup_obj.find("regionCoords");
+          it_rc != setup_obj.end() &&
+          it_rc->second.kind == JsonValue::Kind::kArray &&
+          !it_rc->second.arr_val.empty()) {
+        ver.passed = false;
+        ver.error_code = "LP-J02";
+        ver.message =
+            "Contradictory problemSetup: hasRegionHint=false with non-empty "
+            "regionCoords.";
+        return ver;
+      }
     }
     if (has_region_hint) {
       BitBoard<N> reg_bits;
@@ -2621,19 +2715,20 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
       }
     }
     if (const auto it_sgf = root.obj_val.find("bestMoveSgf");
-        it_sgf != root.obj_val.end() &&
-        it_sgf->second.kind == JsonValue::Kind::kString) {
-      const std::string expected_sgf = MoveToSgfLabel(report.best_move, N);
-      const bool sgf_ok =
-          (it_sgf->second.str_val == expected_sgf) ||
-          ((report.best_move == kPassMove || report.best_move == kNullMove) &&
-           (it_sgf->second.str_val == "pass" ||
-            it_sgf->second.str_val == "none"));
-      if (!sgf_ok) {
+        it_sgf != root.obj_val.end()) {
+      if (it_sgf->second.kind == JsonValue::Kind::kString) {
+        const std::string expected_sgf = MoveToSgfLabel(report.best_move, N);
+        if (it_sgf->second.str_val != expected_sgf) {
+          ver.passed = false;
+          ver.error_code = "LP-R02";
+          ver.message =
+              "Top-level bestMoveSgf disagrees with top-level bestMove.";
+          return ver;
+        }
+      } else if (it_sgf->second.kind != JsonValue::Kind::kNull) {
         ver.passed = false;
-        ver.error_code = "LP-R02";
-        ver.message =
-            "Top-level bestMoveSgf disagrees with top-level bestMove.";
+        ver.error_code = "LP-J02";
+        ver.message = "Invalid bestMoveSgf type in standalone lproof/1 file.";
         return ver;
       }
     }

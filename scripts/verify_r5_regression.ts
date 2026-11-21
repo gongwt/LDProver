@@ -652,6 +652,246 @@ runSection('4. R4 & Core Tampering Defenses', () => {
   }
 });
 
+// ============================================================================
+// Section 5: R7 Protocol Edge Cases (§2 Empty Region, §3 NULL_MOVE, §4 Unicode)
+// ============================================================================
+runSection('5. R7 Protocol Edge Cases (§2 Empty Region, §3 NULL_MOVE, §4 Unicode)', () => {
+  const p001 = getSpec('p001_straight_three_live');
+  const p007 = getSpec('p007_cramped_corner_proven_loss');
+  const cfg = defaultConfig(3500);
+
+  const toCompactDagJson = (fullObj: Record<string, unknown>): Record<string, unknown> => {
+    const compact: Record<string, unknown> = {
+      ...fullObj,
+      encodingMode: 'compact_dag',
+    };
+    delete compact.stateTable;
+    delete compact.snapshotPool;
+    delete compact.historySnapshotIds;
+    delete compact.historyTable;
+    delete compact.checksum;
+    const rawNodes = (fullObj.nodes as Array<Record<string, unknown>>) ?? [];
+    compact.nodes = rawNodes.map((n) => {
+      const c = { ...n };
+      delete c.stateId;
+      delete c.historyId;
+      delete c.parentStateId;
+      return c;
+    });
+    return compact;
+  };
+
+  // --- R7 §2 P1: Explicit empty region (PASS-only) tri-state round-trip ---
+  const p001EmptyRegion: TsumegoProblemSpec = {
+    ...p001,
+    hasRegionHint: true,
+    regionCoords: [],
+    rawRegionCoords: [],
+    attentionCoords: [],
+  };
+  const ctxEmpty = DfpnSolver.buildProofContext(p001EmptyRegion, cfg);
+  const posEmpty = DfpnSolver.buildInitialPosition(p001EmptyRegion, ctxEmpty);
+  const repEmpty = new DfpnSolver(cfg).solveFromPosition(
+    p001EmptyRegion,
+    posEmpty,
+    ctxEmpty
+  );
+  check(
+    repEmpty.rootStatus === ProofOutcome.ProvenLoss && repEmpty.numNodes <= 5,
+    'R7 §2 p001 explicit empty region (PASS-only) solves to PROVEN_LOSS in <= 5 nodes',
+    `status=${repEmpty.rootStatus}, nodes=${repEmpty.numNodes}`
+  );
+  const emptyMemVer = checker.verifyProofDag(posEmpty, ctxEmpty, repEmpty, {
+    verifiedScope: 'original_root',
+  });
+  check(
+    emptyMemVer.passed && emptyMemVer.errorCode === 'PASS',
+    'R7 §2 p001 explicit empty region passes memory verification',
+    `code=${emptyMemVer.errorCode}`
+  );
+  const emptyParsed = JSON.parse(repEmpty.lproofJson) as Record<string, unknown>;
+  const emptySetup = emptyParsed.problemSetup as Record<string, unknown>;
+  check(
+    emptySetup.hasRegionHint === true &&
+      Array.isArray(emptySetup.regionCoords) &&
+      (emptySetup.regionCoords as number[]).length === 0,
+    'R7 §2 serialized lproof/1 preserves hasRegionHint=true with empty regionCoords=[]'
+  );
+  const emptyFileVer = checker.verifySerializedLProofJson(repEmpty.lproofJson);
+  const emptyCompact = resignLProof(toCompactDagJson(emptyParsed)).json;
+  const emptyCompactVer = checker.verifySerializedLProofJson(emptyCompact);
+  check(
+    emptyFileVer.passed &&
+      emptyCompactVer.passed &&
+      emptyFileVer.canonicalDagChecksum === emptyMemVer.canonicalDagChecksum &&
+      emptyCompactVer.canonicalDagChecksum === emptyMemVer.canonicalDagChecksum,
+    'R7 §2 explicit empty region round-trips PASS in full & compact encodings with identical canonicalDagChecksum',
+    `full=${emptyFileVer.errorCode}, compact=${emptyCompactVer.errorCode}`
+  );
+
+  // Flipping hasRegionHint=false turns it into unrestricted full-board -> LP-N22!
+  const emptyAsUnrestricted = JSON.parse(repEmpty.lproofJson) as Record<
+    string,
+    unknown
+  >;
+  (emptyAsUnrestricted.problemSetup as Record<string, unknown>).hasRegionHint =
+    false;
+  const emptyAsUnrestrictedVer = checker.verifySerializedLProofJson(
+    resignLProof(emptyAsUnrestricted).json
+  );
+  check(
+    !emptyAsUnrestrictedVer.passed &&
+      emptyAsUnrestrictedVer.errorCode === 'LP-N22',
+    'R7 §2 explicit empty region re-labeled hasRegionHint=false fails unrestricted full coverage -> LP-N22',
+    `code=${emptyAsUnrestrictedVer.errorCode}`
+  );
+
+  // Reverse witness: p001 PROVEN_WIN (ba witness) with hasRegionHint=true, regionCoords=[] -> LP-R02!
+  const ctx1 = DfpnSolver.buildProofContext(p001, cfg);
+  const pos1 = DfpnSolver.buildInitialPosition(p001, ctx1);
+  const rep1 = new DfpnSolver(cfg).solveFromPosition(p001, pos1, ctx1);
+  const revFullObj = JSON.parse(rep1.lproofJson) as Record<string, unknown>;
+  (revFullObj.problemSetup as Record<string, unknown>).hasRegionHint = true;
+  (revFullObj.problemSetup as Record<string, unknown>).regionCoords = [];
+  (revFullObj.problemSetup as Record<string, unknown>).rawRegionPointCount = 0;
+  const revFullVer = checker.verifySerializedLProofJson(
+    resignLProof(revFullObj).json
+  );
+  const revCompactVer = checker.verifySerializedLProofJson(
+    resignLProof(toCompactDagJson(revFullObj)).json
+  );
+  check(
+    !revFullVer.passed &&
+      revFullVer.errorCode === 'LP-R02' &&
+      !revCompactVer.passed &&
+      revCompactVer.errorCode === 'LP-R02',
+    'R7 §2 reverse witness (p001 ba with hasRegionHint=true, regionCoords=[]) rejected in both encodings -> LP-R02',
+    `full=${revFullVer.errorCode}, compact=${revCompactVer.errorCode}`
+  );
+
+  // Contradictory hasRegionHint=false + non-empty regionCoords=[0,1,2] -> LP-J02
+  const contraRegObj = JSON.parse(rep1.lproofJson) as Record<string, unknown>;
+  (contraRegObj.problemSetup as Record<string, unknown>).hasRegionHint = false;
+  const contraRegVer = checker.verifySerializedLProofJson(
+    resignLProof(contraRegObj).json
+  );
+  check(
+    !contraRegVer.passed && contraRegVer.errorCode === 'LP-J02',
+    'R7 §2 contradictory hasRegionHint=false with non-empty regionCoords rejected -> LP-J02',
+    `code=${contraRegVer.errorCode}`
+  );
+
+  // --- R7 §3 P2: p007 PROVEN_LOSS with NULL_MOVE (-2) & bestMoveSgf="" vs null ---
+  const ctx7 = DfpnSolver.buildProofContext(p007, cfg);
+  const pos7 = DfpnSolver.buildInitialPosition(p007, ctx7);
+  const rep7 = new DfpnSolver(cfg).solveFromPosition(p007, pos7, ctx7);
+  check(
+    rep7.rootStatus === ProofOutcome.ProvenLoss,
+    'R7 §3 p007 solves to PROVEN_LOSS'
+  );
+  const makeP007WithBestMove = (
+    bestMove: number,
+    bestMoveSgf: string | null,
+    compact: boolean
+  ): string => {
+    const obj = JSON.parse(rep7.lproofJson) as Record<string, unknown>;
+    obj.bestMove = bestMove;
+    obj.bestMoveSgf = bestMoveSgf;
+    return resignLProof(compact ? toCompactDagJson(obj) : obj).json;
+  };
+  const p007EmptyFullVer = checker.verifySerializedLProofJson(
+    makeP007WithBestMove(-2, '', false),
+    { problem: p007, scope: 'original_root' }
+  );
+  const p007EmptyCompactVer = checker.verifySerializedLProofJson(
+    makeP007WithBestMove(-2, '', true),
+    { problem: p007, scope: 'original_root' }
+  );
+  const p007NullFullVer = checker.verifySerializedLProofJson(
+    makeP007WithBestMove(-2, null, false),
+    { problem: p007, scope: 'original_root' }
+  );
+  const p007NullCompactVer = checker.verifySerializedLProofJson(
+    makeP007WithBestMove(-2, null, true),
+    { problem: p007, scope: 'original_root' }
+  );
+  check(
+    p007EmptyFullVer.passed &&
+      p007EmptyCompactVer.passed &&
+      p007NullFullVer.passed &&
+      p007NullCompactVer.passed,
+    'R7 §3 p007 PROVEN_LOSS with bestMove=-2 & bestMoveSgf="" or null PASSES in both full & compact encodings',
+    `""full=${p007EmptyFullVer.errorCode}, ""compact=${p007EmptyCompactVer.errorCode}, nullFull=${p007NullFullVer.errorCode}, nullCompact=${p007NullCompactVer.errorCode}`
+  );
+  check(
+    Boolean(p007EmptyFullVer.canonicalDagChecksum) &&
+      p007EmptyFullVer.canonicalDagChecksum ===
+        p007EmptyCompactVer.canonicalDagChecksum &&
+      p007EmptyFullVer.canonicalDagChecksum ===
+        p007NullFullVer.canonicalDagChecksum &&
+      p007EmptyFullVer.canonicalDagChecksum ===
+        p007NullCompactVer.canonicalDagChecksum,
+    'R7 §3 p007 bestMove=-2 canonicalDagChecksum is identical across "" / null and full / compact encodings'
+  );
+  const p007BadSgfFull = checker.verifySerializedLProofJson(
+    makeP007WithBestMove(-2, 'pass', false),
+    { problem: p007, scope: 'original_root' }
+  );
+  const p007BadSgfCompact = checker.verifySerializedLProofJson(
+    makeP007WithBestMove(-2, 'ba', true),
+    { problem: p007, scope: 'original_root' }
+  );
+  check(
+    !p007BadSgfFull.passed &&
+      p007BadSgfFull.errorCode === 'LP-R02' &&
+      !p007BadSgfCompact.passed &&
+      p007BadSgfCompact.errorCode === 'LP-R02',
+    'R7 §3 p007 bestMove=-2 with mismatched non-empty bestMoveSgf rejected -> LP-R02',
+    `full=${p007BadSgfFull.errorCode}, compact=${p007BadSgfCompact.errorCode}`
+  );
+
+  // --- R7 §4 P2: UTF-16 Surrogate Pair Equivalence ("围棋🎯" vs "围棋\ud83c\udfaf") & Lone Surrogate Rejection ---
+  const uniObj = JSON.parse(rep1.lproofJson) as Record<string, unknown>;
+  (uniObj.context as Record<string, unknown>).contextId = '围棋🎯';
+  const { json: uniUtf8Json, checksum: uniChecksum } = resignLProof(uniObj);
+  const uniEscapedJson = uniUtf8Json.replace('围棋🎯', '围棋\\ud83c\\udfaf');
+  check(
+    uniEscapedJson.includes('围棋\\ud83c\\udfaf') &&
+      !uniEscapedJson.includes('🎯'),
+    'R7 §4 constructed surrogate-pair escaped JSON preserving identical checksum'
+  );
+  const uniUtf8Ver = checker.verifySerializedLProofJson(uniUtf8Json, {
+    problem: p001,
+    scope: 'original_root',
+  });
+  const uniEscapedVer = checker.verifySerializedLProofJson(uniEscapedJson, {
+    problem: p001,
+    scope: 'original_root',
+  });
+  check(
+    uniUtf8Ver.passed &&
+      uniEscapedVer.passed &&
+      uniUtf8Ver.jcsSha256Checksum === uniChecksum &&
+      uniEscapedVer.jcsSha256Checksum === uniChecksum &&
+      uniUtf8Ver.canonicalDagChecksum === uniEscapedVer.canonicalDagChecksum,
+    'R7 §4 literal UTF-8 "围棋🎯" and escaped "围棋\\ud83c\\udfaf" both PASS with identical file & canonical digests',
+    `utf8=${uniUtf8Ver.errorCode}, esc=${uniEscapedVer.errorCode}`
+  );
+
+  const loneHighJson = uniUtf8Json.replace('围棋🎯', '围棋\\ud83c');
+  const loneLowJson = uniUtf8Json.replace('围棋🎯', '围棋\\udfaf');
+  const loneHighVer = checker.verifySerializedLProofJson(loneHighJson);
+  const loneLowVer = checker.verifySerializedLProofJson(loneLowJson);
+  check(
+    !loneHighVer.passed &&
+      loneHighVer.errorCode === 'LP-J01' &&
+      !loneLowVer.passed &&
+      loneLowVer.errorCode === 'LP-J01',
+    'R7 §4 lone UTF-16 high/low surrogates rejected -> LP-J01',
+    `high=${loneHighVer.errorCode}, low=${loneLowVer.errorCode}`
+  );
+});
+
 console.log(
   `\n========================================\nR5 TS Regression Summary: ${passedAssertions}/${totalAssertions} passed, ${failures.length} failed.\n========================================`
 );

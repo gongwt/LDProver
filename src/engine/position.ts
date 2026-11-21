@@ -700,12 +700,12 @@ export class GoPosition {
     return scratch.playMove(move).legal;
   }
 
-  public generateLegalMoves(regionCoords?: number[]): number[] {
+  public generateLegalMoves(regionCoords?: number[] | null): number[] {
     if (this.consecutivePasses >= 2) return [];
     const nonCapSafe = this.canNonCaptureExceedAllPastStoneCounts();
     const legal: number[] = [];
 
-    if (regionCoords && regionCoords.length > 0) {
+    if (regionCoords !== undefined && regionCoords !== null) {
       for (let i = 0; i < regionCoords.length; i++) {
         const c = regionCoords[i];
         if (this.grid[c] === Color.Empty && c !== this.koPoint) {

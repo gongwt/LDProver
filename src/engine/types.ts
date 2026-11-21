@@ -175,6 +175,7 @@ export interface SolveReport {
   blackInitialCoords: number[];
   whiteInitialCoords: number[];
   immortalWallCoords: number[];
+  hasRegionHint?: boolean;
   regionCoords: number[];
   rawRegionPointCount?: number;
   isFullRegionSearch?: boolean;
@@ -291,6 +292,7 @@ export interface TsumegoProblemSpec {
   defaultAllowKo: boolean;
   attackerAllowKo?: boolean;
   defenderAllowKo?: boolean;
+  hasRegionHint?: boolean;
   regionCoords: number[];
   rawRegionCoords?: number[];
   attentionCoords?: number[];

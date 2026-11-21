@@ -149,10 +149,18 @@ export class DfpnSolver {
     const rootStateId = this.registerState(rootPos, -1, PASS_MOVE);
     const inPathHashes = new Set<string>();
 
+    const hasRegionHint =
+      problem.hasRegionHint !== undefined
+        ? problem.hasRegionHint
+        : problem.regionCoords.length > 0;
+    const effectiveRegionMask: number[] | null = hasRegionHint
+      ? problem.regionCoords
+      : null;
+
     const rootResult = this.midSearch(
       rootPos,
       context,
-      problem.regionCoords,
+      effectiveRegionMask,
       PN_DN_SATURATION,
       PN_DN_SATURATION,
       0,
@@ -194,11 +202,12 @@ export class DfpnSolver {
       immortalWallCoords: Array.from(rootPos.immortalWallSet).sort(
         (a, b) => a - b
       ),
-      regionCoords: problem.regionCoords.slice(),
-      rawRegionPointCount: rawRegionCount,
-      isFullRegionSearch: problem.regionCoords.length >= rawRegionCount,
+      hasRegionHint,
+      regionCoords: hasRegionHint ? problem.regionCoords.slice() : [],
+      rawRegionPointCount: hasRegionHint ? rawRegionCount : 0,
+      isFullRegionSearch: !hasRegionHint || problem.regionCoords.length >= rawRegionCount,
       inputHash: rootPos.computeZobristHex(),
-      configFingerprint: `${this.config.ttMode}:${this.config.koRule}:rz=${this.config.enableRzPruning}:ako=${context.attackerAllowKo}:dko=${context.defenderAllowKo}:reg=${problem.regionCoords.length}/${rawRegionCount}`,
+      configFingerprint: `${this.config.ttMode}:${this.config.koRule}:rz=${this.config.enableRzPruning}:ako=${context.attackerAllowKo}:dko=${context.defenderAllowKo}:reg=${hasRegionHint ? problem.regionCoords.length : 'all'}/${rawRegionCount}`,
       solverVersion: 'LDProver-1.8.2-cxx20',
       rootStatus: rootResult.outcome,
       unknownReason:
@@ -1053,7 +1062,7 @@ export class DfpnSolver {
   private revalidateSourceProofOnQueryState(
     queryPos: GoPosition,
     context: ProofContext,
-    regionCoords: number[],
+    regionCoords: number[] | null,
     sourceDagNodeId: number,
     expectedOutcome: ProofOutcome,
     guardDepth = 0
@@ -1123,7 +1132,7 @@ export class DfpnSolver {
       (queryPos.toPlay !== context.rootAttacker && !context.defenderAllowKo);
 
     const allowedRegion =
-      regionCoords.length > 0 ? new Set<number>(regionCoords) : null;
+      regionCoords !== null ? new Set<number>(regionCoords) : null;
 
     // Case 1: Single-witness node (OR -> ProvenWin, or AND -> ProvenLoss)
     if (
@@ -1213,7 +1222,7 @@ export class DfpnSolver {
   private midSearch(
     pos: GoPosition,
     context: ProofContext,
-    regionCoords: number[],
+    regionCoords: number[] | null,
     thPn: number,
     thDn: number,
     depth: number,

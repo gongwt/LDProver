@@ -239,6 +239,66 @@ function sortedUniqueNumbers(arr: number[]): number[] {
   return Array.from(new Set(arr)).sort((a, b) => a - b);
 }
 
+function moveToCanonicalSgf(mv: number, boardSize: number): string {
+  if (mv === PASS_MOVE) return 'pass';
+  if (mv < 0 || mv >= boardSize * boardSize) return '';
+  return coordToSgf(mv, boardSize);
+}
+
+function stringHasLoneSurrogate(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const cu = s.charCodeAt(i);
+    if (cu >= 0xd800 && cu <= 0xdbff) {
+      if (i + 1 >= s.length) return true;
+      const next = s.charCodeAt(i + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      i++;
+    } else if (cu >= 0xdc00 && cu <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function jsonHasLoneSurrogate(val: unknown): boolean {
+  if (typeof val === 'string') return stringHasLoneSurrogate(val);
+  if (Array.isArray(val)) {
+    for (let i = 0; i < val.length; i++) {
+      if (jsonHasLoneSurrogate(val[i])) return true;
+    }
+    return false;
+  }
+  if (val && typeof val === 'object') {
+    const obj = val as Record<string, unknown>;
+    for (const k of Object.keys(obj)) {
+      if (stringHasLoneSurrogate(k) || jsonHasLoneSurrogate(obj[k])) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function resolveReportRegion(report: SolveReport): {
+  hasRegionHint: boolean;
+  regionCoords: number[];
+  regionMask: number[] | null;
+  regionSet: Set<number> | null;
+} {
+  const rawCoords = sortedUniqueNumbers(report.regionCoords ?? []);
+  const hasRegionHint =
+    report.hasRegionHint !== undefined
+      ? report.hasRegionHint
+      : rawCoords.length > 0;
+  const regionCoords = hasRegionHint ? rawCoords : [];
+  return {
+    hasRegionHint,
+    regionCoords,
+    regionMask: hasRegionHint ? regionCoords : null,
+    regionSet: hasRegionHint ? new Set<number>(regionCoords) : null,
+  };
+}
+
 function isValidSnapshotShape(s: unknown): s is CanonicalSnapshot {
   if (!s || typeof s !== 'object' || Array.isArray(s)) return false;
   const obj = s as Record<string, unknown>;
@@ -396,7 +456,7 @@ export class ProofArtifactManager {
     const immortalWallCoords = Array.from(initialPos.immortalWallSet).sort(
       (a, b) => a - b
     );
-    const regionCoords = sortedUniqueNumbers(report.regionCoords ?? []);
+    const { hasRegionHint, regionCoords } = resolveReportRegion(report);
     const isTracedSubposition = initialPos.playedMoveTrace.length > 0;
 
     // Losslessly deduplicate CanonicalSnapshots across historyTable via snapshotPool
@@ -429,7 +489,7 @@ export class ProofArtifactManager {
       blackInitialCoords: initialPos.getBlackCoords(),
       whiteInitialCoords: initialPos.getWhiteCoords(),
       immortalWallCoords,
-      hasRegionHint: regionCoords.length > 0,
+      hasRegionHint,
       regionCoords,
       rawRegionPointCount: report.rawRegionPointCount ?? regionCoords.length,
       isFullRegionSearch: report.isFullRegionSearch ?? true,
@@ -645,6 +705,14 @@ export class ProofArtifactManager {
         'LP-J01',
         `JSON 解析失败: ${err instanceof Error ? err.message : String(err)}`,
         'Malformed JSON payload.'
+      );
+    }
+
+    if (jsonHasLoneSurrogate(rawParsed)) {
+      return makeJsonError(
+        'LP-J01',
+        'JSON 包含非法孤立 UTF-16 代理项 (lone surrogate)，违反 RFC 8259 / RFC 8785 Unicode 标量规范。',
+        'JSON contains unpaired UTF-16 surrogate code unit.'
       );
     }
 
@@ -909,6 +977,15 @@ export class ProofArtifactManager {
       typeof setup.hasRegionHint === 'boolean'
         ? setup.hasRegionHint
         : setup.regionCoords.length > 0;
+    if (!hasRegionHint && setup.regionCoords.length > 0) {
+      return makeJsonError(
+        'LP-J02',
+        'lproof/1 problemSetup 自相矛盾：hasRegionHint=false 时不允许携带非空 regionCoords。',
+        'Contradictory hasRegionHint=false with non-empty regionCoords.',
+        'lproof/1',
+        fileChecksum
+      );
+    }
     const regionCoords = hasRegionHint ? setup.regionCoords : [];
 
     // Reconstruct active root position (R3 F3 & R4 §3 P1-A: explicit scope + trace rule enforcement!)
@@ -964,7 +1041,7 @@ export class ProofArtifactManager {
     let traceOutsideRegion = false;
     let traceHasRestrictedKoCapture = false;
     const regionSetForTrace =
-      regionCoords.length > 0 ? new Set<number>(regionCoords) : null;
+      hasRegionHint ? new Set<number>(regionCoords) : null;
 
     if (rootKind === 'traced_subposition') {
       const originToPlay = decodeColor(setup.originFirstToPlay);
@@ -1134,8 +1211,14 @@ export class ProofArtifactManager {
     // Optional external original-problem identity binding (R3 F4 + R4 §3 P1-B)
     if (expectedBinding?.problem) {
       const expProb = expectedBinding.problem;
-      const expRegion = sortedUniqueNumbers(expProb.regionCoords);
-      const certRegion = sortedUniqueNumbers(regionCoords);
+      const expHasRegionHint =
+        expProb.hasRegionHint !== undefined
+          ? expProb.hasRegionHint
+          : expProb.regionCoords.length > 0;
+      const expRegion = expHasRegionHint
+        ? sortedUniqueNumbers(expProb.regionCoords)
+        : [];
+      const certRegion = hasRegionHint ? sortedUniqueNumbers(regionCoords) : [];
       const expWall = sortedUniqueNumbers(expProb.immortalWallCoords);
       const certWall = sortedUniqueNumbers(immortalWallCoords);
       const expBlack = sortedUniqueNumbers(expProb.blackInitialCoords);
@@ -1147,6 +1230,7 @@ export class ProofArtifactManager {
         !numberArraysEqual(sortedUniqueNumbers(originBlackForBinding), expBlack) ||
         !numberArraysEqual(sortedUniqueNumbers(originWhiteForBinding), expWhite) ||
         !numberArraysEqual(certWall, expWall) ||
+        hasRegionHint !== expHasRegionHint ||
         !numberArraysEqual(certRegion, expRegion)
       ) {
         return makeJsonError(
@@ -1429,6 +1513,21 @@ export class ProofArtifactManager {
       );
     }
 
+    if (
+      parsed.bestMoveSgf !== undefined &&
+      parsed.bestMoveSgf !== null &&
+      typeof parsed.bestMoveSgf !== 'string'
+    ) {
+      return makeJsonError(
+        'LP-J02',
+        'lproof/1 顶层 bestMoveSgf 字段必须为字符串或 null。',
+        'Invalid bestMoveSgf type.',
+        'lproof/1',
+        fileChecksum,
+        scopeMeta
+      );
+    }
+
     const reconstructedReport: SolveReport = {
       problemId: String(parsed.problemId ?? ''),
       problemTitle: String(parsed.problemId ?? ''),
@@ -1437,6 +1536,7 @@ export class ProofArtifactManager {
       blackInitialCoords,
       whiteInitialCoords,
       immortalWallCoords,
+      hasRegionHint,
       regionCoords,
       rawRegionPointCount:
         typeof setup.rawRegionPointCount === 'number'
@@ -1507,7 +1607,7 @@ export class ProofArtifactManager {
    */
   private replaySourceSubgraphOnQueryState(
     queryPos: GoPosition,
-    regionCoords: number[],
+    regionCoords: number[] | null,
     context: ProofContext,
     dagNodes: ProofDagNode[],
     sourceNodeId: number,
@@ -1576,7 +1676,7 @@ export class ProofArtifactManager {
       (queryPos.toPlay !== context.rootAttacker && !context.defenderAllowKo);
 
     const allowedRegion =
-      regionCoords.length > 0 ? new Set<number>(regionCoords) : null;
+      regionCoords !== null ? new Set<number>(regionCoords) : null;
 
     // Existential replay: OR -> ProvenWin or AND -> ProvenLoss
     if (
@@ -1660,7 +1760,7 @@ export class ProofArtifactManager {
    */
   private verifyCompactDagRecursive(
     pos: GoPosition,
-    effectiveRegionCoords: number[],
+    effectiveRegionMask: number[] | null,
     allowedRegionSet: Set<number> | null,
     context: ProofContext,
     report: SolveReport,
@@ -1706,7 +1806,7 @@ export class ProofArtifactManager {
       }
       const ok = this.replaySourceSubgraphOnQueryState(
         pos,
-        effectiveRegionCoords,
+        effectiveRegionMask,
         context,
         report.proofDagNodes,
         node.sourceProofNodeId,
@@ -1799,7 +1899,7 @@ export class ProofArtifactManager {
         if (edge.isKoCapture && restrictedSide) continue;
         const sub = this.verifyCompactDagRecursive(
           edge.nextPos,
-          effectiveRegionCoords,
+          effectiveRegionMask,
           allowedRegionSet,
           context,
           report,
@@ -1820,7 +1920,7 @@ export class ProofArtifactManager {
     }
 
     stats.verifiedUniversals++;
-    const expectedLegalMoves = pos.generateLegalMoves(effectiveRegionCoords);
+    const expectedLegalMoves = pos.generateLegalMoves(effectiveRegionMask);
     for (const lm of expectedLegalMoves) {
       const edge = moveToEdge.get(lm);
       if (!edge) {
@@ -1843,7 +1943,7 @@ export class ProofArtifactManager {
       }
       const sub = this.verifyCompactDagRecursive(
         edge.nextPos,
-        effectiveRegionCoords,
+        effectiveRegionMask,
         allowedRegionSet,
         context,
         report,
@@ -1867,7 +1967,7 @@ export class ProofArtifactManager {
   private validateRootProvenanceAndTrace(
     initialPos: GoPosition,
     context: ProofContext,
-    regionCoords: number[],
+    regionMask: number[] | null,
     effectiveScope: VerificationScope
   ): {
     ok: boolean;
@@ -1916,7 +2016,7 @@ export class ProofArtifactManager {
     }
 
     const regionSet =
-      regionCoords.length > 0 ? new Set<number>(regionCoords) : null;
+      regionMask !== null ? new Set<number>(regionMask) : null;
     const replayPos = new GoPosition(
       context,
       initialPos.boardSize,
@@ -2048,12 +2148,6 @@ export class ProofArtifactManager {
       return Array.from(set).sort((a, b) => a - b);
     };
 
-    const moveToCanonicalSgf = (mv: number): string => {
-      if (mv === PASS_MOVE) return 'pass';
-      if (mv < 0 || mv >= initialPos.boardSize * initialPos.boardSize) return '';
-      return coordToSgf(mv, initialPos.boardSize);
-    };
-
     const normalizeEvidence = (n: ProofDagNode): string => {
       if (
         n.terminalEvidence === 'BENSON_UCA' ||
@@ -2069,7 +2163,9 @@ export class ProofArtifactManager {
       return 'NONE';
     };
 
-    const regionCoords = sortUniqueBoardCoords(report.regionCoords ?? []);
+    const resolvedRegion = resolveReportRegion(report);
+    const hasRegionHint = resolvedRegion.hasRegionHint;
+    const regionCoords = sortUniqueBoardCoords(resolvedRegion.regionCoords);
     const immortalWallCoords = sortUniqueBoardCoords(
       Array.from(initialPos.immortalWallSet)
     );
@@ -2086,7 +2182,7 @@ export class ProofArtifactManager {
       blackInitialCoords: initialPos.getBlackCoords(),
       whiteInitialCoords: initialPos.getWhiteCoords(),
       immortalWallCoords,
-      hasRegionHint: regionCoords.length > 0,
+      hasRegionHint,
       regionCoords,
       rawRegionPointCount: regionCoords.length,
       isFullRegionSearch: true,
@@ -2127,13 +2223,16 @@ export class ProofArtifactManager {
       rootPn: report.rootPn >= PN_DN_SATURATION ? 'SAT' : report.rootPn,
       rootDn: report.rootDn >= PN_DN_SATURATION ? 'SAT' : report.rootDn,
       bestMove: report.bestMove,
-      bestMoveSgf: moveToCanonicalSgf(report.bestMove),
+      bestMoveSgf: moveToCanonicalSgf(report.bestMove, initialPos.boardSize),
       nodes: report.proofDagNodes.map((n) => ({
         nodeId: n.nodeId,
         isOrNode: n.isOrNode,
         toPlay: encodeColorStr(n.toPlay),
         incomingMove: n.incomingMove,
-        incomingMoveSgf: moveToCanonicalSgf(n.incomingMove),
+        incomingMoveSgf: moveToCanonicalSgf(
+          n.incomingMove,
+          initialPos.boardSize
+        ),
         pn: n.pn >= PN_DN_SATURATION ? 'SAT' : n.pn,
         dn: n.dn >= PN_DN_SATURATION ? 'SAT' : n.dn,
         outcome: n.outcome,
@@ -2196,11 +2295,10 @@ export class ProofArtifactManager {
         ? 'traced_within_rules'
         : 'original_root');
 
-    const effectiveRegionCoords = report.regionCoords ?? [];
-    const allowedRegionSet =
-      effectiveRegionCoords.length > 0
-        ? new Set<number>(effectiveRegionCoords)
-        : null;
+    const resolvedRegion = resolveReportRegion(report);
+    const effectiveRegionCoords = resolvedRegion.regionCoords;
+    const effectiveRegionMask = resolvedRegion.regionMask;
+    const allowedRegionSet = resolvedRegion.regionSet;
 
     let traceOutsideRegion = Boolean(options?.traceOutsideRegion);
     let traceHasRestrictedKoCapture = Boolean(
@@ -2212,7 +2310,7 @@ export class ProofArtifactManager {
       const traceCheck = this.validateRootProvenanceAndTrace(
         initialPos,
         context,
-        effectiveRegionCoords,
+        effectiveRegionMask,
         effectiveScope
       );
       traceOutsideRegion = traceCheck.traceOutsideRegion;
@@ -2312,14 +2410,10 @@ export class ProofArtifactManager {
         rootBindingValid = false;
         rootBindingDetail = `报告根部 (rootPn=${report.rootPn}, rootDn=${report.rootDn}) 与 ${report.rootStatus} 不一致`;
       } else {
-        // R4 §4 P1-C: Validate top-level `bestMove` & `bestMoveSgf` against the verified root DAG node
+        // R4 §4 P1-C & R7 §3: Validate top-level `bestMove` & `bestMoveSgf` using shared canonical move label.
+        // For NULL_MOVE (-2), both canonical `""` and JSON `null` are accepted; any mismatched string fails LP-R02.
         const bm = report.bestMove;
-        const expectedBmSgf =
-          bm >= 0
-            ? coordToSgf(bm, initialPos.boardSize)
-            : bm === PASS_MOVE
-            ? 'pass'
-            : null;
+        const expectedBmSgf = moveToCanonicalSgf(bm, initialPos.boardSize);
         if (
           report.bestMoveSgf !== null &&
           report.bestMoveSgf !== undefined &&
@@ -2327,9 +2421,7 @@ export class ProofArtifactManager {
         ) {
           rootBindingValid = false;
           rootBindingFailureCode = 'LP-R02';
-          rootBindingDetail = `顶层 bestMove=${bm} 与 bestMoveSgf="${report.bestMoveSgf}" 不一致（期望 "${String(
-            expectedBmSgf
-          )}"）`;
+          rootBindingDetail = `顶层 bestMove=${bm} 与 bestMoveSgf="${report.bestMoveSgf}" 不一致（期望 "${expectedBmSgf}"）`;
         } else {
           // Resolve redirected source root if root is TT/RZ reuse
           let effRoot: ProofDagNode | null = rootNode;
@@ -2712,7 +2804,7 @@ export class ProofArtifactManager {
       } else {
         const res = this.verifyCompactDagRecursive(
           initialPos.clone(),
-          effectiveRegionCoords,
+          effectiveRegionMask,
           allowedRegionSet,
           context,
           report,
@@ -2889,7 +2981,7 @@ export class ProofArtifactManager {
           } else {
             verifiedUniversalCount++;
             const expectedLegalMoves = pos.generateLegalMoves(
-              effectiveRegionCoords
+              effectiveRegionMask
             );
             for (const lm of expectedLegalMoves) {
               const edge = moveToEdge.get(lm);
@@ -2964,7 +3056,7 @@ export class ProofArtifactManager {
         const queryPos = rebuiltPositions[node.stateId];
         const ok = this.replaySourceSubgraphOnQueryState(
           queryPos,
-          effectiveRegionCoords,
+          effectiveRegionMask,
           context,
           report.proofDagNodes,
           node.sourceProofNodeId!,
