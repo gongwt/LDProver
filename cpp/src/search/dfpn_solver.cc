@@ -216,9 +216,13 @@ int32_t DfpnSolver<N>::ScoreMoveFastCapture(const Position<N>& pos,
                                             int16_t move,
                                             bool is_or_node) const {
   if (move == kPassMove) {
-    // At AND nodes (defender to play) with 0 consecutive passes, rank PASS high
-    // to seed a compact null-move certificate RZ immediately.
-    return (!is_or_node && pos.ConsecutivePasses() == 0) ? 1850 : -2000;
+    // At AND nodes (defender to play) with 0 consecutive passes, rank PASS
+    // below immediate tactical captures/refutations so bad attacker moves are
+    // refuted first, while still keeping PASS near the top for null-move RZ.
+    if (!is_or_node && pos.ConsecutivePasses() == 0) {
+      return config_.enable_rz_pruning ? 1050 : 360;
+    }
+    return -2000;
   }
   int32_t score = tctx.crucial_lib_bonus[static_cast<size_t>(move)];
 
@@ -631,12 +635,12 @@ void DfpnSolver<N>::MidSearch(
             (idx == 0) ? 1U : (idx <= 2 ? 2U : static_cast<uint32_t>(idx + 1));
         if (is_or_node) {
           fresh.children[idx].pn =
-              (fresh.children[idx].move == kPassMove) ? 120U : rank_metric;
+              (fresh.children[idx].move == kPassMove) ? 220U : rank_metric;
           fresh.children[idx].dn = 1U;
         } else {
           fresh.children[idx].pn = 1U;
           fresh.children[idx].dn =
-              (fresh.children[idx].move == kPassMove) ? 1U : rank_metric;
+              (fresh.children[idx].move == kPassMove) ? 4U : rank_metric;
         }
       }
     }
@@ -650,25 +654,23 @@ void DfpnSolver<N>::MidSearch(
     auto& children = frontier.children;
     const size_t total_legal = children.size();
 
-    // When a sibling null-move certificate RZ is already known, open the full
-    // widening window immediately so OutsideRZRevalidated can bulk-prune moves.
-    if (frontier.has_null_move_rz && frontier.widening_level < 6U) {
-      frontier.widening_level = 6U;
-    }
-
     size_t window_size = total_legal;
-    if (config_.enable_progressive_widening && frontier.widening_level < 5U) {
-      const size_t cap =
-          static_cast<size_t>(config_.widening_base_k)
-          << frontier.widening_level;
+    if (config_.enable_progressive_widening && frontier.widening_level < 6U) {
+      const size_t base_k =
+          is_or_node
+              ? static_cast<size_t>(config_.widening_base_k)
+              : std::max<size_t>(4U,
+                                 static_cast<size_t>(config_.widening_base_k) /
+                                     2U);
+      const size_t cap = base_k << frontier.widening_level;
       if (cap < total_legal) window_size = cap;
     }
 
-    // FR-5.5: Try Outside-RZ null-move certificate pruning on unexpanded moves
-    // whenever a new/smaller sibling certificate RZ becomes available.
+    // FR-5.5: Try Outside-RZ null-move certificate pruning on undecided moves
+    // inside the active window (per-child stamp so newly widened moves are
+    // checked immediately without repeating failed revalidations).
     if (config_.enable_rz_pruning && frontier.has_null_move_rz &&
-        frontier.checked_null_move_dag_id != frontier.representative_dag_id) {
-      frontier.checked_null_move_dag_id = frontier.representative_dag_id;
+        frontier.representative_dag_id != kInvalidDagNodeId) {
       const bool restricted_side =
           (pos.ToPlay() == context.root_attacker &&
            !context.attacker_allow_ko) ||
@@ -682,7 +684,11 @@ void DfpnSolver<N>::MidSearch(
 
       for (size_t i = 0; i < window_size; ++i) {
         auto& ch = children[i];
-        if (ch.expanded || ch.outcome != ProofOutcome::kUnknown) continue;
+        if (ch.has_decisive_dag || ch.outcome != ProofOutcome::kUnknown ||
+            ch.checked_null_move_dag_id == frontier.representative_dag_id) {
+          continue;
+        }
+        ch.checked_null_move_dag_id = frontier.representative_dag_id;
         if (rz_engine_.IsOutsideRZCandidate(ch.move,
                                             frontier.active_null_move_rz)) {
           Position<N> next_pos = pos;
@@ -718,7 +724,8 @@ void DfpnSolver<N>::MidSearch(
             report_.proof_dag_nodes.push_back(pruned_node);
             dag_has_capture_.push_back(rep_has_cap);
 
-            ch.expanded = true;
+            ch.probed = true;
+            ch.has_decisive_dag = true;
             ch.pruned_outside_rz = true;
             ch.move_captured = did_cap;
             ch.subtree_has_capture = rep_has_cap;
@@ -741,10 +748,12 @@ void DfpnSolver<N>::MidSearch(
         (unexpanded_u > 0)
             ? std::max(is_or_node ? children[window_size].pn
                                   : children[window_size].dn,
-                       8U * (frontier.widening_level + 1U))
+                       (is_or_node ? 14U : 10U) *
+                           (frontier.widening_level + 1U))
             : kPnDnSaturation;
     uint32_t cur_pn = 1;
     uint32_t cur_dn = 1;
+    int force_expand_pass_idx = -1;
 
     if (is_or_node) {
       uint32_t min_pn = kPnDnSaturation;
@@ -757,7 +766,8 @@ void DfpnSolver<N>::MidSearch(
         min_pn = std::min(min_pn, widen_trigger);
       }
       if (sum_dn == 0 && window_size < total_legal) {
-        ++frontier.widening_level;
+        frontier.widening_level =
+            frontier.has_null_move_rz ? 6U : (frontier.widening_level + 1U);
         ++report_.widening_upgrades;
         continue;
       }
@@ -770,16 +780,47 @@ void DfpnSolver<N>::MidSearch(
         sum_pn += children[i].pn;
         min_dn = std::min(min_dn, children[i].dn);
       }
+      // Also honor any already-probed PASS outside the current window that
+      // produced a decisive refutation (dn == 0).
+      for (size_t i = window_size; i < total_legal; ++i) {
+        if (children[i].has_decisive_dag && !children[i].ko_dependent &&
+            children[i].dn == 0) {
+          min_dn = 0;
+          break;
+        }
+      }
       if (unexpanded_u > 0) {
         min_dn = std::min(min_dn, widen_trigger);
       }
-      if (sum_pn == 0 && window_size < total_legal) {
-        ++frontier.widening_level;
-        ++report_.widening_upgrades;
-        continue;
+      if (min_dn > 0 && sum_pn == 0 && window_size < total_legal) {
+        // Before widening across the full region, probe PASS once if unprobed
+        // so active_null_move_rz carries a stone-free tenuki certificate.
+        int pass_idx = -1;
+        if (config_.enable_rz_pruning && pos.ConsecutivePasses() == 0 &&
+            !frontier.pass_probed) {
+          for (size_t i = 0; i < total_legal; ++i) {
+            if (children[i].move == kPassMove && !children[i].probed &&
+                !children[i].ko_dependent &&
+                children[i].outcome == ProofOutcome::kUnknown) {
+              pass_idx = static_cast<int>(i);
+              break;
+            }
+          }
+        }
+        if (pass_idx >= 0) {
+          force_expand_pass_idx = pass_idx;
+          cur_pn = 1U;
+          cur_dn = std::max(1U, children[static_cast<size_t>(pass_idx)].dn);
+        } else {
+          frontier.widening_level =
+              frontier.has_null_move_rz ? 6U : (frontier.widening_level + 1U);
+          ++report_.widening_upgrades;
+          continue;
+        }
+      } else {
+        cur_pn = ClampSat(sum_pn + (unexpanded_u > 0 ? 1ULL : 0ULL));
+        cur_dn = min_dn;
       }
-      cur_pn = ClampSat(sum_pn + (unexpanded_u > 0 ? 1ULL : 0ULL));
-      cur_dn = min_dn;
     }
 
     // Check asymmetric decisive completion conditions (FR-4.2).
@@ -937,14 +978,16 @@ void DfpnSolver<N>::MidSearch(
       break;
     }
 
-    // At AND nodes (defender to play) with 0 consecutive passes and no sibling
-    // RZ yet, probe PASS first to seed OutsideRZRevalidated null-move pruning.
-    int force_expand_pass_idx = -1;
-    if (config_.enable_rz_pruning && !is_or_node &&
-        pos.ConsecutivePasses() == 0 && !frontier.has_null_move_rz &&
+    // At compact AND nodes (where all legal moves already fit in window_size)
+    // with 0 consecutive passes and no sibling RZ yet, probe PASS at most ONCE
+    // (`!frontier.pass_probed`) to seed OutsideRZRevalidated pruning, then
+    // immediately resume normal df-pn scheduling if inconclusive.
+    if (force_expand_pass_idx < 0 && config_.enable_rz_pruning && !is_or_node &&
+        window_size == total_legal && pos.ConsecutivePasses() == 0 &&
+        !frontier.has_null_move_rz && !frontier.pass_probed &&
         children.size() > 1U) {
       for (size_t i = 0; i < window_size; ++i) {
-        if (children[i].move == kPassMove && !children[i].expanded &&
+        if (children[i].move == kPassMove && !children[i].probed &&
             !children[i].ko_dependent &&
             children[i].outcome == ProofOutcome::kUnknown) {
           force_expand_pass_idx = static_cast<int>(i);
@@ -958,31 +1001,32 @@ void DfpnSolver<N>::MidSearch(
     uint32_t best_metric = kPnDnSaturation;
     uint32_t second_best_metric = kPnDnSaturation;
 
-    for (size_t i = 0; i < window_size; ++i) {
-      if (children[i].ko_dependent) continue;
-      const uint32_t m = is_or_node ? children[i].pn : children[i].dn;
-      if (m < best_metric) {
-        second_best_metric = best_metric;
-        best_metric = m;
-        best_idx = static_cast<int>(i);
-      } else if (m < second_best_metric) {
-        second_best_metric = m;
-      }
-    }
-
     if (force_expand_pass_idx >= 0) {
       best_idx = force_expand_pass_idx;
       best_metric = children[static_cast<size_t>(best_idx)].dn;
-    }
-
-    // Progressive Widening upgrade condition (FR-4.4).
-    if (unexpanded_u > 0 && force_expand_pass_idx < 0) {
-      if (best_idx < 0 || best_metric >= widen_trigger) {
-        ++frontier.widening_level;
-        ++report_.widening_upgrades;
-        continue;
+      second_best_metric = kPnDnSaturation;
+    } else {
+      for (size_t i = 0; i < window_size; ++i) {
+        if (children[i].ko_dependent) continue;
+        const uint32_t m = is_or_node ? children[i].pn : children[i].dn;
+        if (m < best_metric) {
+          second_best_metric = best_metric;
+          best_metric = m;
+          best_idx = static_cast<int>(i);
+        } else if (m < second_best_metric) {
+          second_best_metric = m;
+        }
       }
-      second_best_metric = std::min(second_best_metric, widen_trigger);
+
+      // Progressive Widening upgrade condition (FR-4.4).
+      if (unexpanded_u > 0) {
+        if (best_idx < 0 || best_metric >= widen_trigger) {
+          ++frontier.widening_level;
+          ++report_.widening_upgrades;
+          continue;
+        }
+        second_best_metric = std::min(second_best_metric, widen_trigger);
+      }
     }
 
     if (best_idx < 0 || best_metric >= kPnDnSaturation) {
@@ -990,6 +1034,10 @@ void DfpnSolver<N>::MidSearch(
       *out_dn = cur_dn;
       *out_outcome = ProofOutcome::kUnknown;
       break;
+    }
+
+    if (children[static_cast<size_t>(best_idx)].move == kPassMove) {
+      frontier.pass_probed = true;
     }
 
     const int16_t chosen_move = children[static_cast<size_t>(best_idx)].move;
@@ -1006,7 +1054,9 @@ void DfpnSolver<N>::MidSearch(
     uint32_t child_th_dn = th_dn;
     if (is_or_node) {
       child_th_pn = std::min(th_pn, eps_bound);
-      const uint64_t other_dn = cur_dn - chosen_dn;
+      const uint64_t other_dn =
+          (cur_dn > chosen_dn) ? static_cast<uint64_t>(cur_dn - chosen_dn)
+                               : 0ULL;
       child_th_dn =
           (th_dn >= kPnDnSaturation)
               ? kPnDnSaturation
@@ -1014,7 +1064,9 @@ void DfpnSolver<N>::MidSearch(
                      ? std::max(2U, static_cast<uint32_t>(th_dn - other_dn))
                      : 1U);
     } else {
-      const uint64_t other_pn = cur_pn - chosen_pn;
+      const uint64_t other_pn =
+          (cur_pn > chosen_pn) ? static_cast<uint64_t>(cur_pn - chosen_pn)
+                               : 0ULL;
       child_th_pn =
           (th_pn >= kPnDnSaturation)
               ? kPnDnSaturation
@@ -1064,6 +1116,11 @@ void DfpnSolver<N>::MidSearch(
     mpc.disproof_rz = c_disproof_rz;
     mpc.dag_node_id = c_dag_id;
 
+    mpc.probed = true;
+    if (mpc.move == kPassMove) {
+      post_frontier.pass_probed = true;
+    }
+
     // FR-5.7: KoDependent witness barrier check (propagates child_ko_dep too!).
     const bool restricted_side =
         (pos.ToPlay() == context.root_attacker && !context.attacker_allow_ko) ||
@@ -1075,35 +1132,40 @@ void DfpnSolver<N>::MidSearch(
       mpc.pn = kPnDnSaturation / 2;
       mpc.dn = kPnDnSaturation / 2;
       mpc.dag_node_id = kInvalidDagNodeId;
-      mpc.expanded = false;
+      mpc.has_decisive_dag = false;
       *out_ko_dependent = true;
     } else {
-      mpc.expanded = (mpc.outcome != ProofOutcome::kUnknown &&
-                      mpc.dag_node_id != kInvalidDagNodeId);
+      mpc.has_decisive_dag = (mpc.outcome != ProofOutcome::kUnknown &&
+                              mpc.dag_node_id != kInvalidDagNodeId);
     }
 
     // Record compact sibling certificate RZ for OutsideRZRevalidated pruning (FR-5.5).
+    // Prefer PASS_MOVE (Null-Move) representative at AND nodes because no stone
+    // is added on sourcePos, guaranteeing queryLegalMoves <= sourceLegalMoves.
     // Never seed OR-node active_null_move_rz from PASS_MOVE (DOUBLE_PASS_RESOLUTION)!
-    if (!is_or_node && mpc.pn == 0 && mpc.dag_node_id != kInvalidDagNodeId &&
+    if (!is_or_node && mpc.pn == 0 && mpc.has_decisive_dag &&
         mpc.proof_rz.Size() > 0 &&
         (!post_frontier.has_null_move_rz ||
-         mpc.proof_rz.Size() < post_frontier.active_null_move_rz.Size())) {
+         (mpc.move == kPassMove &&
+          post_frontier.representative_move != kPassMove) ||
+         ((mpc.move == kPassMove) ==
+              (post_frontier.representative_move == kPassMove) &&
+          mpc.proof_rz.Size() < post_frontier.active_null_move_rz.Size()))) {
       post_frontier.active_null_move_rz = mpc.proof_rz;
       post_frontier.has_null_move_rz = true;
+      post_frontier.representative_move = mpc.move;
       post_frontier.representative_dag_id = mpc.dag_node_id;
       post_frontier.representative_outcome = ProofOutcome::kProvenWin;
-      post_frontier.checked_null_move_dag_id = kInvalidDagNodeId;
     } else if (is_or_node && mpc.move != kPassMove && mpc.dn == 0 &&
-               mpc.dag_node_id != kInvalidDagNodeId &&
-               mpc.disproof_rz.Size() > 0 &&
+               mpc.has_decisive_dag && mpc.disproof_rz.Size() > 0 &&
                (!post_frontier.has_null_move_rz ||
                 mpc.disproof_rz.Size() <
                     post_frontier.active_null_move_rz.Size())) {
       post_frontier.active_null_move_rz = mpc.disproof_rz;
       post_frontier.has_null_move_rz = true;
+      post_frontier.representative_move = mpc.move;
       post_frontier.representative_dag_id = mpc.dag_node_id;
       post_frontier.representative_outcome = ProofOutcome::kProvenLoss;
-      post_frontier.checked_null_move_dag_id = kInvalidDagNodeId;
     }
   }
 

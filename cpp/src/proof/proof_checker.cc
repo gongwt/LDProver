@@ -902,11 +902,57 @@ bool ReplaySourceSubgraphOnQueryState(
 }
 
 template <int N>
-bool VerifySubgraphRecursive(const Position<N>& pos,
-                             const ProofContext& context,
-                             const SolveReport<N>& report, uint32_t node_id,
-                             const BensonTerminalEvaluator<N>& terminal_eval,
-                             uint32_t depth, VerificationReport* ver) {
+bool HistorySnapshotListsEqual(
+    const std::vector<CanonicalSnapshot<N>>& a,
+    const std::vector<CanonicalSnapshot<N>>& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i].black_stones != b[i].black_stones ||
+        a[i].white_stones != b[i].white_stones ||
+        a[i].to_play != b[i].to_play ||
+        a[i].zobrist_hash != b[i].zobrist_hash) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <int N>
+struct VerifiedStateRow {
+  Position<N> pos;
+  int64_t parent_state_id = -1;
+  int16_t move_from_parent = kPassMove;
+  uint32_t history_id = 0;
+};
+
+struct FullStateNodeMeta {
+  int64_t parent_state_id = -1;
+  bool has_pruned_cert = false;
+  int64_t pruned_cert_query_state_id = -1;
+  int64_t pruned_cert_source_node_id = -1;
+  std::string pruned_cert_reason;
+};
+
+template <int N>
+bool PositionsExactlyEqual(const Position<N>& a, const Position<N>& b) {
+  return a.ZobristHash() == b.ZobristHash() && a.ToPlay() == b.ToPlay() &&
+         a.KoPoint() == b.KoPoint() &&
+         a.ConsecutivePasses() == b.ConsecutivePasses() &&
+         a.SurvivingTargetTokensMask() == b.SurvivingTargetTokensMask() &&
+         a.Stones(Color::kBlack) == b.Stones(Color::kBlack) &&
+         a.Stones(Color::kWhite) == b.Stones(Color::kWhite) &&
+         HistorySnapshotListsEqual<N>(a.HistorySnapshots(),
+                                      b.HistorySnapshots());
+}
+
+template <int N>
+bool VerifySubgraphRecursive(
+    const Position<N>& pos, const ProofContext& context,
+    const SolveReport<N>& report, uint32_t node_id,
+    const BensonTerminalEvaluator<N>& terminal_eval, uint32_t depth,
+    const std::vector<VerifiedStateRow<N>>* state_rows,
+    const std::vector<FullStateNodeMeta>* node_metas,
+    VerificationReport* ver) {
   if (depth > 256U || node_id >= report.proof_dag_nodes.size()) {
     ver->failed_node_id = static_cast<int32_t>(node_id);
     ver->error_code = "LP-S01";
@@ -925,6 +971,38 @@ bool VerifySubgraphRecursive(const Position<N>& pos,
     ver->message =
         "Node to_play / is_or_node disagrees with reachable board turn.";
     return false;
+  }
+
+  // R5 §3: In full_state_table mode, verify that the node's stateId, historyId,
+  // and parentStateId bind EXACTLY to the replayed reachable Position<N>.
+  if (state_rows != nullptr) {
+    if (node.state_id >= state_rows->size()) {
+      ver->failed_node_id = static_cast<int32_t>(node_id);
+      ver->error_code = "LP-S02";
+      ver->message = "Reachable ProofDagNode stateId out of stateTable bounds.";
+      return false;
+    }
+    const auto& row = (*state_rows)[node.state_id];
+    const bool row_is_or = (row.pos.ToPlay() == context.root_attacker);
+    if (node.to_play != row.pos.ToPlay() || node.is_or_node != row_is_or) {
+      ver->failed_node_id = static_cast<int32_t>(node_id);
+      ver->error_code = "LP-N10";
+      ver->message =
+          "Reachable ProofDagNode toPlay/isOrNode disagrees with referenced "
+          "stateTable row.";
+      return false;
+    }
+    if (!PositionsExactlyEqual<N>(row.pos, pos) ||
+        node.history_id != row.history_id ||
+        (node_metas != nullptr && node_id < node_metas->size() &&
+         (*node_metas)[node_id].parent_state_id != row.parent_state_id)) {
+      ver->failed_node_id = static_cast<int32_t>(node_id);
+      ver->error_code = "LP-S10";
+      ver->message =
+          "Reachable ProofDagNode stateId/historyId/parentStateId disagrees "
+          "with replayed board state, history, or tokens.";
+      return false;
+    }
   }
 
   if (node.is_pruned_outside_rz || node.is_tt_hit) {
@@ -961,9 +1039,51 @@ bool VerifySubgraphRecursive(const Position<N>& pos,
     return true;
   }
 
-  // Every recorded child edge must be legal AND inside declared `region_hint`.
+  auto check_child_state_edge = [&](uint32_t cid, int16_t mv) -> bool {
+    if (state_rows == nullptr) return true;
+    const auto& child_node = report.proof_dag_nodes[cid];
+    if (child_node.state_id >= state_rows->size()) {
+      ver->failed_node_id = static_cast<int32_t>(cid);
+      ver->error_code = "LP-S02";
+      ver->message = "Child ProofDagNode stateId out of stateTable bounds.";
+      return false;
+    }
+    const auto& child_row = (*state_rows)[child_node.state_id];
+    const bool child_row_is_or =
+        (child_row.pos.ToPlay() == context.root_attacker);
+    if (child_node.to_play != child_row.pos.ToPlay() ||
+        child_node.is_or_node != child_row_is_or) {
+      ver->failed_node_id = static_cast<int32_t>(cid);
+      ver->error_code = "LP-N10";
+      ver->message =
+          "Child ProofDagNode toPlay/isOrNode disagrees with referenced "
+          "stateTable row.";
+      return false;
+    }
+    if (child_row.parent_state_id != static_cast<int64_t>(node.state_id) ||
+        child_row.move_from_parent != mv || child_node.incoming_move != mv) {
+      ver->failed_node_id = static_cast<int32_t>(node_id);
+      ver->error_code = "LP-S10";
+      ver->message =
+          "Parent->child DAG edge disagrees with stateTable parentStateId, "
+          "moveFromParent, or incomingMove.";
+      return false;
+    }
+    return true;
+  };
+
+  // Every recorded child edge must be legal, inside declared `region_hint`,
+  // non-duplicate, and (in full_state_table mode) state-transition consistent.
+  std::unordered_set<int16_t> seen_child_moves;
+  seen_child_moves.reserve(node.child_moves.size());
   for (size_t i = 0; i < node.child_moves.size(); ++i) {
     const int16_t mv = node.child_moves[i];
+    if (!seen_child_moves.insert(mv).second) {
+      ver->failed_node_id = static_cast<int32_t>(node_id);
+      ver->error_code = "LP-N11";
+      ver->message = "Duplicate child move edge recorded in ProofDagNode.";
+      return false;
+    }
     if (!IsMoveInAllowedRegion<N>(mv, report.region_hint)) {
       ver->failed_node_id = static_cast<int32_t>(node_id);
       ver->error_code = "LP-S11";
@@ -975,6 +1095,9 @@ bool VerifySubgraphRecursive(const Position<N>& pos,
       ver->failed_node_id = static_cast<int32_t>(node_id);
       ver->error_code = "LP-S09";
       ver->message = "Illegal child move recorded in reachable ProofDagNode.";
+      return false;
+    }
+    if (!check_child_state_edge(node.child_node_ids[i], mv)) {
       return false;
     }
   }
@@ -1009,7 +1132,8 @@ bool VerifySubgraphRecursive(const Position<N>& pos,
       }
       if (is_ko_cap && restricted_side) continue;
       if (VerifySubgraphRecursive<N>(next_pos, context, report, cid,
-                                     terminal_eval, depth + 1U, ver)) {
+                                     terminal_eval, depth + 1U, state_rows,
+                                     node_metas, ver)) {
         return true;
       }
       return false;
@@ -1056,7 +1180,8 @@ bool VerifySubgraphRecursive(const Position<N>& pos,
       return false;
     }
     if (!VerifySubgraphRecursive<N>(next_pos, context, report, cid,
-                                    terminal_eval, depth + 1U, ver)) {
+                                    terminal_eval, depth + 1U, state_rows,
+                                    node_metas, ver)) {
       return false;
     }
   }
@@ -1114,21 +1239,7 @@ bool ParseCanonicalSnapshotObj(const JsonValue& v, CanonicalSnapshot<N>* out) {
   return true;
 }
 
-template <int N>
-bool HistorySnapshotListsEqual(
-    const std::vector<CanonicalSnapshot<N>>& a,
-    const std::vector<CanonicalSnapshot<N>>& b) {
-  if (a.size() != b.size()) return false;
-  for (size_t i = 0; i < a.size(); ++i) {
-    if (a[i].black_stones != b[i].black_stones ||
-        a[i].white_stones != b[i].white_stones ||
-        a[i].to_play != b[i].to_play ||
-        a[i].zobrist_hash != b[i].zobrist_hash) {
-      return false;
-    }
-  }
-  return true;
-}
+// HistorySnapshotListsEqual moved above VerifySubgraphRecursive.
 
 }  // namespace
 
@@ -1313,19 +1424,100 @@ std::string ProofArtifactManager<N>::ExportSolutionTreeSgf(
   return sgf.str();
 }
 
+namespace {
+
 template <int N>
-VerificationReport ProofArtifactManager<N>::VerifyProofDag(
-    const Position<N>& initial_pos, const ProofContext& context,
-    const SolveReport<N>& report) const {
+VerificationReport VerifyProofDagCore(
+    const ProofArtifactManager<N>& mgr, const Position<N>& initial_pos,
+    const ProofContext& context, const SolveReport<N>& report,
+    std::optional<VerificationScope> scope_override,
+    const std::vector<VerifiedStateRow<N>>* state_rows,
+    const std::vector<FullStateNodeMeta>* node_metas,
+    bool replay_root_trace) {
   VerificationReport ver;
-  SerializeLProofJson(initial_pos, context, report, &ver.jcs_sha256_checksum);
+  mgr.SerializeLProofJson(initial_pos, context, report,
+                          &ver.jcs_sha256_checksum);
   ver.canonical_dag_checksum = ver.jcs_sha256_checksum;
-  ver.encoding_mode = "compact_dag";
-  ver.verified_root_kind =
-      initial_pos.PlayedMoveTrace().empty() ? "initial" : "traced_subposition";
-  ver.verified_scope = initial_pos.PlayedMoveTrace().empty()
-                           ? "original_root"
-                           : "free_exploration";
+  ver.encoding_mode =
+      (state_rows != nullptr) ? "full_state_table" : "compact_dag";
+
+  const bool is_traced = !initial_pos.PlayedMoveTrace().empty();
+  const VerificationScope effective_scope =
+      scope_override.has_value()
+          ? *scope_override
+          : (is_traced ? VerificationScope::kTracedWithinRules
+                       : VerificationScope::kOriginalRoot);
+  ver.verified_root_kind = is_traced ? "traced_subposition" : "initial";
+  ver.verified_scope = VerificationScopeToStr(effective_scope);
+
+  if (effective_scope == VerificationScope::kOriginalRoot && is_traced) {
+    ver.passed = false;
+    ver.error_code = "LP-P02";
+    ver.message =
+        "Rejected traced_subposition under original_root verification scope.";
+    return ver;
+  }
+
+  if (replay_root_trace && is_traced) {
+    Position<N> replay_pos;
+    replay_pos.Clear(context);
+    for (int c : initial_pos.OriginBlack().ToCoords()) {
+      replay_pos.SetupInitialStone(c, Color::kBlack);
+    }
+    for (int c : initial_pos.OriginWhite().ToCoords()) {
+      replay_pos.SetupInitialStone(c, Color::kWhite);
+    }
+    replay_pos.SetImmortalWall(initial_pos.ImmortalWall());
+    replay_pos.FinalizeInitialPosition(initial_pos.OriginToPlay());
+
+    for (int16_t mv : initial_pos.PlayedMoveTrace()) {
+      const bool outside_reg =
+          !IsMoveInAllowedRegion<N>(mv, report.region_hint);
+      if (outside_reg) ver.trace_outside_region = true;
+
+      const bool restricted_side =
+          (replay_pos.ToPlay() == context.root_attacker &&
+           !context.attacker_allow_ko) ||
+          (replay_pos.ToPlay() != context.root_attacker &&
+           !context.defender_allow_ko);
+      bool is_ko_cap = false;
+      if (!replay_pos.PlayMove(mv, &is_ko_cap)) {
+        ver.passed = false;
+        ver.error_code = "LP-S09";
+        ver.message =
+            "Illegal move in traced_subposition PlayedMoveTrace replay.";
+        return ver;
+      }
+      if (is_ko_cap && restricted_side) {
+        ver.trace_has_restricted_ko_capture = true;
+      }
+      if (effective_scope == VerificationScope::kTracedWithinRules) {
+        if (outside_reg) {
+          ver.passed = false;
+          ver.error_code = "LP-S11";
+          ver.message =
+              "traced_subposition move plays outside declared regionCoords "
+              "(rejected under traced_within_rules scope).";
+          return ver;
+        }
+        if (is_ko_cap && restricted_side) {
+          ver.passed = false;
+          ver.error_code = "LP-S12";
+          ver.message =
+              "traced_subposition move performs a restricted-side ko capture "
+              "(rejected under traced_within_rules scope).";
+          return ver;
+        }
+      }
+    }
+    if (!PositionsExactlyEqual<N>(replay_pos, initial_pos)) {
+      ver.passed = false;
+      ver.error_code = "LP-S02";
+      ver.message =
+          "Replayed PlayedMoveTrace disagrees with provided initial_pos.";
+      return ver;
+    }
+  }
 
   if (report.root_status == ProofOutcome::kUnknown) {
     ver.passed = false;
@@ -1420,8 +1612,6 @@ VerificationReport ProofArtifactManager<N>::VerifyProofDag(
     }
 
     if (node.is_pruned_outside_rz || node.is_tt_hit) {
-      // Strict acyclicity: source_proof_node_id MUST strictly precede node_id!
-      // Rejects self-referencing prunes (e.g. node_id=0, source_proof_node_id=0).
       if (node.source_proof_node_id >= node.node_id ||
           node.source_proof_node_id >= report.proof_dag_nodes.size() ||
           report.proof_dag_nodes[node.source_proof_node_id].outcome !=
@@ -1432,6 +1622,80 @@ VerificationReport ProofArtifactManager<N>::VerifyProofDag(
         ver.message =
             "Pruned/TT node has cyclic, out-of-order, or mismatched "
             "source_proof_node_id.";
+        return ver;
+      }
+    }
+    if (state_rows != nullptr && node.is_pruned_outside_rz &&
+        node_metas != nullptr && i < node_metas->size()) {
+      const auto& nm = (*node_metas)[i];
+      if (!nm.has_pruned_cert ||
+          nm.pruned_cert_reason != "OutsideRZRevalidated" ||
+          nm.pruned_cert_query_state_id != static_cast<int64_t>(node.state_id) ||
+          nm.pruned_cert_source_node_id !=
+              static_cast<int64_t>(node.source_proof_node_id)) {
+        ver.passed = false;
+        ver.failed_node_id = static_cast<int32_t>(node.node_id);
+        ver.error_code = "LP-R02";
+        ver.message =
+            "OutsideRZRevalidated node in full_state_table proof lacks valid "
+            "prunedCertificate binding.";
+        return ver;
+      }
+    }
+  }
+
+  // R5 §3: In full_state_table mode, verify reachable node closure binds cleanly
+  // to stateTable turn/role, historyId, and parentStateId (matching TS CHK-03).
+  if (state_rows != nullptr) {
+    std::unordered_set<uint32_t> reachable;
+    std::vector<uint32_t> stack;
+    reachable.insert(report.root_dag_node_id);
+    stack.push_back(report.root_dag_node_id);
+    while (!stack.empty()) {
+      const uint32_t nid = stack.back();
+      stack.pop_back();
+      const auto& n = report.proof_dag_nodes[nid];
+      for (uint32_t cid : n.child_node_ids) {
+        if (reachable.insert(cid).second) stack.push_back(cid);
+      }
+      if ((n.is_pruned_outside_rz || n.is_tt_hit) &&
+          n.source_proof_node_id < report.proof_dag_nodes.size()) {
+        if (reachable.insert(n.source_proof_node_id).second) {
+          stack.push_back(n.source_proof_node_id);
+        }
+      }
+    }
+    for (size_t i = 0; i < report.proof_dag_nodes.size(); ++i) {
+      if (reachable.count(static_cast<uint32_t>(i)) == 0) continue;
+      const auto& node = report.proof_dag_nodes[i];
+      if (node.state_id >= state_rows->size()) {
+        ver.passed = false;
+        ver.failed_node_id = static_cast<int32_t>(node.node_id);
+        ver.error_code = "LP-S02";
+        ver.message = "Reachable ProofDagNode stateId out of bounds.";
+        return ver;
+      }
+      const auto& row = (*state_rows)[node.state_id];
+      const bool expected_row_or = (row.pos.ToPlay() == context.root_attacker);
+      if (node.to_play != row.pos.ToPlay() ||
+          node.is_or_node != expected_row_or) {
+        ver.passed = false;
+        ver.failed_node_id = static_cast<int32_t>(node.node_id);
+        ver.error_code = "LP-N10";
+        ver.message =
+            "Reachable ProofDagNode toPlay/isOrNode disagrees with referenced "
+            "stateTable row.";
+        return ver;
+      }
+      if (node.history_id != row.history_id ||
+          (node_metas != nullptr && i < node_metas->size() &&
+           (*node_metas)[i].parent_state_id != row.parent_state_id)) {
+        ver.passed = false;
+        ver.failed_node_id = static_cast<int32_t>(node.node_id);
+        ver.error_code = "LP-S10";
+        ver.message =
+            "Reachable ProofDagNode historyId/parentStateId disagrees with "
+            "referenced stateTable row.";
         return ver;
       }
     }
@@ -1534,7 +1798,7 @@ VerificationReport ProofArtifactManager<N>::VerifyProofDag(
   BensonTerminalEvaluator<N> independent_terminal;
   if (!VerifySubgraphRecursive<N>(initial_pos, context, report,
                                   report.root_dag_node_id, independent_terminal,
-                                  0U, &ver)) {
+                                  0U, state_rows, node_metas, &ver)) {
     ver.passed = false;
     return ver;
   }
@@ -1548,17 +1812,27 @@ VerificationReport ProofArtifactManager<N>::VerifyProofDag(
   return ver;
 }
 
+}  // namespace
+
+template <int N>
+VerificationReport ProofArtifactManager<N>::VerifyProofDag(
+    const Position<N>& initial_pos, const ProofContext& context,
+    const SolveReport<N>& report,
+    std::optional<VerificationScope> scope_override) const {
+  return VerifyProofDagCore<N>(*this, initial_pos, context, report,
+                               scope_override, nullptr, nullptr, true);
+}
+
 template <int N>
 VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
     const std::string& json_text,
     const ParsedProblem<N>* expected_problem,
     std::optional<VerificationScope> scope_override) const {
   VerificationReport ver;
-  const VerificationScope effective_scope =
+  VerificationScope effective_scope =
       scope_override.has_value()
           ? *scope_override
-          : (expected_problem != nullptr ? VerificationScope::kOriginalRoot
-                                         : VerificationScope::kFreeExploration);
+          : VerificationScope::kOriginalRoot;
   ver.verified_scope = VerificationScopeToStr(effective_scope);
 
   JsonValue root;
@@ -1664,7 +1938,8 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
   bool trace_outside_region = false;
   bool trace_has_restricted_ko_capture = false;
   uint32_t state_table_verified_count = 0;
-  std::vector<Position<N>> rebuilt_state_positions;
+  std::vector<VerifiedStateRow<N>> rebuilt_state_rows;
+  std::vector<FullStateNodeMeta> node_metas;
 
   try {
     if (const auto it_pid = root.obj_val.find("problemId");
@@ -1826,6 +2101,15 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
       root_kind = it_rk->second.str_val;
     }
     ver.verified_root_kind = root_kind;
+    if (!scope_override.has_value()) {
+      effective_scope =
+          (expected_problem != nullptr)
+              ? VerificationScope::kOriginalRoot
+              : (root_kind == "traced_subposition"
+                     ? VerificationScope::kTracedWithinRules
+                     : VerificationScope::kOriginalRoot);
+      ver.verified_scope = VerificationScopeToStr(effective_scope);
+    }
 
     // R4 §3 P1-A: Default external problem binding enforces original_root!
     if (root_kind == "traced_subposition" &&
@@ -1929,6 +2213,26 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
         return ver;
       }
     } else {
+      // R5 §2: Contradictory `rootKind="initial"` with non-empty
+      // `initialTraceMoves` must be rejected explicitly (LP-P02 / LP-J02).
+      if (const auto it_trace = setup_obj.find("initialTraceMoves");
+          it_trace != setup_obj.end()) {
+        if (it_trace->second.kind != JsonValue::Kind::kArray) {
+          ver.passed = false;
+          ver.error_code = "LP-J02";
+          ver.message =
+              "Malformed non-array initialTraceMoves on initial root.";
+          return ver;
+        }
+        if (!it_trace->second.arr_val.empty()) {
+          ver.passed = false;
+          ver.error_code = "LP-P02";
+          ver.message =
+              "Contradictory lproof/1 root: rootKind='initial' must not carry "
+              "non-empty initialTraceMoves.";
+          return ver;
+        }
+      }
       origin_b_bits = claimed_b_bits;
       origin_w_bits = claimed_w_bits;
       origin_turn = first_to_play;
@@ -2136,7 +2440,7 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
       }
 
       // Replay and verify EVERY entry in stateTable[0..M-1] from initial_pos.
-      rebuilt_state_positions.resize(st_val.arr_val.size());
+      rebuilt_state_rows.resize(st_val.arr_val.size());
       for (size_t s = 0; s < st_val.arr_val.size(); ++s) {
         const auto& st_item = st_val.arr_val[s];
         if (st_item.kind != JsonValue::Kind::kObject) {
@@ -2205,7 +2509,7 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
             return ver;
           }
           expected_pos =
-              rebuilt_state_positions[static_cast<size_t>(psid_v.int_val)];
+              rebuilt_state_rows[static_cast<size_t>(psid_v.int_val)].pos;
           if (!expected_pos.PlayMove(mv)) {
             ver.passed = false;
             ver.error_code = "LP-S09";
@@ -2254,10 +2558,15 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
               "historyTable mismatch).";
           return ver;
         }
-        rebuilt_state_positions[s] = expected_pos;
+        rebuilt_state_rows[s].pos = expected_pos;
+        rebuilt_state_rows[s].parent_state_id = psid_v.int_val;
+        rebuilt_state_rows[s].move_from_parent =
+            static_cast<int16_t>(mfp_v.int_val);
+        rebuilt_state_rows[s].history_id =
+            static_cast<uint32_t>(hid_v.int_val);
       }
       state_table_verified_count =
-          static_cast<uint32_t>(rebuilt_state_positions.size());
+          static_cast<uint32_t>(rebuilt_state_rows.size());
     }
 
     if (const auto it = root.obj_val.find("rootOutcome");
@@ -2347,20 +2656,59 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
       }
 
       ProofDagNode<N> node;
+      FullStateNodeMeta nmeta;
       node.node_id = static_cast<uint32_t>(nid_v.int_val);
-      if (const auto it_sid = nj.obj_val.find("stateId");
-          it_sid != nj.obj_val.end() &&
-          it_sid->second.kind == JsonValue::Kind::kInt) {
+      if (has_state_table) {
+        const auto it_sid = nj.obj_val.find("stateId");
+        const auto it_hid = nj.obj_val.find("historyId");
+        const auto it_psid = nj.obj_val.find("parentStateId");
+        if (it_sid == nj.obj_val.end() ||
+            it_sid->second.kind != JsonValue::Kind::kInt ||
+            it_hid == nj.obj_val.end() ||
+            it_hid->second.kind != JsonValue::Kind::kInt ||
+            it_psid == nj.obj_val.end() ||
+            it_psid->second.kind != JsonValue::Kind::kInt) {
+          ver.passed = false;
+          ver.failed_node_id = static_cast<int32_t>(node.node_id);
+          ver.error_code = "LP-J02";
+          ver.message =
+              "full_state_table ProofDagNode must declare integer stateId, "
+              "historyId, and parentStateId.";
+          return ver;
+        }
         if (it_sid->second.int_val < 0 ||
-            (has_state_table &&
-             static_cast<size_t>(it_sid->second.int_val) >=
-                 rebuilt_state_positions.size())) {
+            static_cast<size_t>(it_sid->second.int_val) >=
+                rebuilt_state_rows.size() ||
+            it_hid->second.int_val < 0) {
           ver.passed = false;
           ver.failed_node_id = static_cast<int32_t>(node.node_id);
           ver.error_code = "LP-S02";
-          ver.message = "ProofDagNode stateId out of stateTable bounds.";
+          ver.message = "ProofDagNode stateId or historyId out of bounds.";
           return ver;
         }
+        node.state_id = static_cast<uint32_t>(it_sid->second.int_val);
+        node.history_id = static_cast<uint32_t>(it_hid->second.int_val);
+        nmeta.parent_state_id = it_psid->second.int_val;
+        if (const auto it_pc = nj.obj_val.find("prunedCertificate");
+            it_pc != nj.obj_val.end() &&
+            it_pc->second.kind == JsonValue::Kind::kObject) {
+          const auto& pc = it_pc->second.obj_val;
+          const auto it_r = pc.find("reason");
+          const auto it_qs = pc.find("queryStateId");
+          const auto it_sn = pc.find("sourceProofNodeId");
+          if (it_r != pc.end() && it_r->second.kind == JsonValue::Kind::kString &&
+              it_qs != pc.end() && it_qs->second.kind == JsonValue::Kind::kInt &&
+              it_sn != pc.end() && it_sn->second.kind == JsonValue::Kind::kInt) {
+            nmeta.has_pruned_cert = true;
+            nmeta.pruned_cert_reason = it_r->second.str_val;
+            nmeta.pruned_cert_query_state_id = it_qs->second.int_val;
+            nmeta.pruned_cert_source_node_id = it_sn->second.int_val;
+          }
+        }
+      } else if (const auto it_sid = nj.obj_val.find("stateId");
+                 it_sid != nj.obj_val.end() &&
+                 it_sid->second.kind == JsonValue::Kind::kInt &&
+                 it_sid->second.int_val >= 0) {
         node.state_id = static_cast<uint32_t>(it_sid->second.int_val);
       }
       node.is_or_node = or_v.bool_val;
@@ -2450,6 +2798,9 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
         node.child_node_ids.push_back(static_cast<uint32_t>(el.int_val));
       }
       report.proof_dag_nodes.push_back(std::move(node));
+      if (has_state_table) {
+        node_metas.push_back(std::move(nmeta));
+      }
     }
 
     if (has_state_table &&
@@ -2469,7 +2820,10 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
     return ver;
   }
 
-  VerificationReport dag_ver = VerifyProofDag(initial_pos, context, report);
+  VerificationReport dag_ver = VerifyProofDagCore<N>(
+      *this, initial_pos, context, report, effective_scope,
+      has_state_table ? &rebuilt_state_rows : nullptr,
+      has_state_table ? &node_metas : nullptr, false);
   // R4 §4 P1-C: Preserve the verified input file's RFC 8785 JCS SHA-256
   // checksum rather than overwriting it with re-serialized compact DAG digest!
   dag_ver.canonical_dag_checksum = dag_ver.jcs_sha256_checksum;

@@ -69,9 +69,10 @@ class ProofArtifactManager {
   // complete legal-move coverage at universal nodes, declared region membership
   // on every proof edge, top-level bestMove binding, and full recursive semantic
   // replay of OutsideRZRevalidated / TT certificates.
-  VerificationReport VerifyProofDag(const Position<N>& initial_pos,
-                                    const ProofContext& context,
-                                    const SolveReport<N>& report) const;
+  VerificationReport VerifyProofDag(
+      const Position<N>& initial_pos, const ProofContext& context,
+      const SolveReport<N>& report,
+      std::optional<VerificationScope> scope_override = std::nullopt) const;
 
   // Standalone process-independent verifier reconstructing initial Position<N>
   // (including traced sub-positions via zero-trust move replay), ProofContext,

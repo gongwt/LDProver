@@ -105,11 +105,13 @@ class DfpnSolver {
     uint32_t pn = 1;
     uint32_t dn = 1;
     ProofOutcome outcome = ProofOutcome::kUnknown;
-    bool expanded = false;
+    bool probed = false;
+    bool has_decisive_dag = false;
     bool pruned_outside_rz = false;
     bool ko_dependent = false;
     bool move_captured = false;
     bool subtree_has_capture = false;
+    uint32_t checked_null_move_dag_id = kInvalidDagNodeId;
     uint32_t dag_node_id = kInvalidDagNodeId;
     uint64_t child_path_id = 0;
     ProofCertificateRZ<N> proof_rz{};
@@ -121,9 +123,10 @@ class DfpnSolver {
     uint32_t widening_level = 0;
     ProofCertificateRZ<N> active_null_move_rz{};
     bool has_null_move_rz = false;
+    bool pass_probed = false;
+    int16_t representative_move = kPassMove;
     uint32_t representative_dag_id = kInvalidDagNodeId;
     ProofOutcome representative_outcome = ProofOutcome::kUnknown;
-    uint32_t checked_null_move_dag_id = kInvalidDagNodeId;
   };
 
   struct NodeTacticalContext {

@@ -58,3 +58,15 @@ target_link_libraries(tprover PRIVATE
   ldprover_dfpn
   ldprover_proof
 )
+
+# Versioned R5 Native Regression Suite (ctest / ./ldprover_r5_tests)
+enable_testing()
+add_executable(ldprover_r5_tests
+  tests/r5_regression_test.cc
+)
+target_link_libraries(ldprover_r5_tests PRIVATE
+  ldprover_dfpn
+  ldprover_proof
+)
+add_test(NAME ldprover_r5_tests COMMAND ldprover_r5_tests)
+

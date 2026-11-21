@@ -1084,6 +1084,29 @@ export class ProofArtifactManager {
         );
       }
     } else {
+      // R5 §2: Contradictory `rootKind="initial"` with non-empty `initialTraceMoves` must be rejected!
+      if (setup.initialTraceMoves !== undefined) {
+        if (!isIntegerArray(setup.initialTraceMoves)) {
+          return makeJsonError(
+            'LP-J02',
+            'initial 根证书包含非法非整数数组 initialTraceMoves。',
+            'Malformed initialTraceMoves on initial root.',
+            'lproof/1',
+            fileChecksum,
+            scopeMeta
+          );
+        }
+        if (setup.initialTraceMoves.length > 0) {
+          return makeJsonError(
+            'LP-P02',
+            '自相矛盾的根声明：rootKind="initial" 不允许携带非空 initialTraceMoves 前置轨迹。',
+            'Contradictory initial root declares non-empty initialTraceMoves.',
+            'lproof/1',
+            fileChecksum,
+            scopeMeta
+          );
+        }
+      }
       initialPos.setupInitialStones(
         blackInitialCoords,
         whiteInitialCoords,
@@ -1444,6 +1467,7 @@ export class ProofArtifactManager {
 
     const ver = this.verifyProofDag(initialPos, context, reconstructedReport, {
       skipChecksumRecompute: true,
+      skipTraceReplay: true,
       isCompactDag: !hasStateTable,
       verifiedScope: effectiveScope,
       verifiedRootKind: rootKind,
@@ -1815,6 +1839,250 @@ export class ProofArtifactManager {
     return { ok: true, detail: '' };
   }
 
+  /**
+   * Shared provenance & arrival-trace validation used by the memory entrypoint
+   * (`verifyProofDag`) so memory and file verification produce identical scope,
+   * LP-P02, LP-S11, LP-S12, and trace-violation flags.
+   */
+  private validateRootProvenanceAndTrace(
+    initialPos: GoPosition,
+    context: ProofContext,
+    regionCoords: number[],
+    effectiveScope: VerificationScope
+  ): {
+    ok: boolean;
+    errorCode: string;
+    message: string;
+    detail: string;
+    traceOutsideRegion: boolean;
+    traceHasRestrictedKoCapture: boolean;
+  } {
+    const isTraced = initialPos.playedMoveTrace.length > 0;
+    if (effectiveScope === 'original_root' && isTraced) {
+      return {
+        ok: false,
+        errorCode: 'LP-P02',
+        message:
+          '原题命题校验模式 (original_root) 拒绝 traced_subposition 子局面证书；该证书仅证明给定到达轨迹后的子局面，不等价于原题初始命题。',
+        detail:
+          'Rejected traced_subposition under original_root verification scope.',
+        traceOutsideRegion: false,
+        traceHasRestrictedKoCapture: false,
+      };
+    }
+
+    if (!isTraced) {
+      return {
+        ok: true,
+        errorCode: 'PASS',
+        message: '',
+        detail: '',
+        traceOutsideRegion: false,
+        traceHasRestrictedKoCapture: false,
+      };
+    }
+
+    const regionSet =
+      regionCoords.length > 0 ? new Set<number>(regionCoords) : null;
+    const replayPos = new GoPosition(
+      context,
+      initialPos.boardSize,
+      Array.from(initialPos.immortalWallSet)
+    );
+    replayPos.setupInitialStones(
+      initialPos.originBlackCoords,
+      initialPos.originWhiteCoords,
+      initialPos.originToPlay
+    );
+
+    let traceOutsideRegion = false;
+    let traceHasRestrictedKoCapture = false;
+
+    for (let i = 0; i < initialPos.playedMoveTrace.length; i++) {
+      const tmv = initialPos.playedMoveTrace[i];
+      const outsideRegion =
+        tmv !== PASS_MOVE && regionSet !== null && !regionSet.has(tmv);
+      if (outsideRegion) {
+        traceOutsideRegion = true;
+        if (effectiveScope === 'traced_within_rules') {
+          return {
+            ok: false,
+            errorCode: 'LP-S11',
+            message: `traced_subposition 到达轨迹第 ${i + 1} 手 ${coordToSgf(
+              tmv,
+              initialPos.boardSize
+            )} (move=${tmv}) 超出题目声明的合法 region 集合。`,
+            detail: `Trace move ${tmv} at index ${i} lies outside declared region.`,
+            traceOutsideRegion: true,
+            traceHasRestrictedKoCapture,
+          };
+        }
+      }
+
+      const sideToPlay = replayPos.toPlay;
+      const restrictedSide =
+        (sideToPlay === context.rootAttacker && !context.attackerAllowKo) ||
+        (sideToPlay !== context.rootAttacker && !context.defenderAllowKo);
+      const playRes = replayPos.playMove(tmv);
+      if (!playRes.legal) {
+        return {
+          ok: false,
+          errorCode: 'LP-S09',
+          message: `traced_subposition 到达轨迹第 ${i + 1} 手 move=${tmv} 在规则下非法。`,
+          detail: `Illegal move ${tmv} at trace index ${i}.`,
+          traceOutsideRegion,
+          traceHasRestrictedKoCapture,
+        };
+      }
+      if (playRes.isKoCapture && restrictedSide) {
+        traceHasRestrictedKoCapture = true;
+        if (effectiveScope === 'traced_within_rules') {
+          return {
+            ok: false,
+            errorCode: 'LP-S12',
+            message: `traced_subposition 到达轨迹第 ${i + 1} 手 ${coordToSgf(
+              tmv,
+              initialPos.boardSize
+            )} 属于受限方禁劫提劫，在 traced_within_rules 范围内被拒绝。`,
+            detail: `Restricted-side ko capture at trace index ${i} rejected under traced_within_rules.`,
+            traceOutsideRegion,
+            traceHasRestrictedKoCapture: true,
+          };
+        }
+      }
+    }
+
+    if (
+      replayPos.toPlay !== initialPos.toPlay ||
+      replayPos.koPoint !== initialPos.koPoint ||
+      replayPos.consecutivePasses !== initialPos.consecutivePasses ||
+      replayPos.survivingTargetTokensMask !==
+        initialPos.survivingTargetTokensMask ||
+      replayPos.computeZobristHex() !== initialPos.computeZobristHex() ||
+      !numberArraysEqual(
+        replayPos.getBlackCoords(),
+        initialPos.getBlackCoords()
+      ) ||
+      !numberArraysEqual(
+        replayPos.getWhiteCoords(),
+        initialPos.getWhiteCoords()
+      )
+    ) {
+      return {
+        ok: false,
+        errorCode: 'LP-S02',
+        message: 'traced_subposition 到达轨迹重放结果与当前内存初始局面不一致。',
+        detail: 'Replayed trace position diverges from provided initialPos.',
+        traceOutsideRegion,
+        traceHasRestrictedKoCapture,
+      };
+    }
+
+    return {
+      ok: true,
+      errorCode: 'PASS',
+      message: '',
+      detail: '',
+      traceOutsideRegion,
+      traceHasRestrictedKoCapture,
+    };
+  }
+
+  /**
+   * Computes the RFC 8785 JCS SHA-256 digest of ONLY the canonical lproof/1
+   * schema fields (stripping any non-semantic extra JSON properties).
+   */
+  private computeCanonicalSchemaChecksum(
+    initialPos: GoPosition,
+    context: ProofContext,
+    report: SolveReport,
+    isCompactDag: boolean
+  ): string {
+    if (!isCompactDag) {
+      return this.serializeLProofJson(initialPos, context, report).checksum;
+    }
+
+    const regionCoords = report.regionCoords ?? [];
+    const immortalWallCoords = Array.from(initialPos.immortalWallSet).sort(
+      (a, b) => a - b
+    );
+    const isTraced = initialPos.playedMoveTrace.length > 0;
+    const problemSetup: Record<string, unknown> = {
+      boardSize: initialPos.boardSize,
+      rootKind: isTraced ? 'traced_subposition' : 'initial',
+      firstToPlay: encodeColorStr(initialPos.toPlay),
+      koPoint: initialPos.koPoint,
+      consecutivePasses: initialPos.consecutivePasses,
+      survivingTokensMask: initialPos.survivingTargetTokensMask,
+      zobristHex: initialPos.computeZobristHex(),
+      inputHash: report.inputHash,
+      blackInitialCoords: initialPos.getBlackCoords(),
+      whiteInitialCoords: initialPos.getWhiteCoords(),
+      immortalWallCoords,
+      hasRegionHint: regionCoords.length > 0,
+      regionCoords,
+      rawRegionPointCount: report.rawRegionPointCount ?? regionCoords.length,
+      isFullRegionSearch: report.isFullRegionSearch ?? true,
+    };
+    if (isTraced) {
+      problemSetup.originFirstToPlay = encodeColorStr(initialPos.originToPlay);
+      problemSetup.originBlackCoords = initialPos.originBlackCoords.slice();
+      problemSetup.originWhiteCoords = initialPos.originWhiteCoords.slice();
+      problemSetup.initialTraceMoves = initialPos.playedMoveTrace.slice();
+    }
+
+    const compactPayload = {
+      magic: 'lproof/1',
+      encodingMode: 'compact_dag' as LProofEncodingMode,
+      problemId: report.problemId,
+      context: {
+        contextId: context.contextId,
+        rootAttacker: encodeColorStr(context.rootAttacker),
+        attackerGoal: context.attackerGoal,
+        crucialStoneOp: context.crucialStoneOp,
+        koRule: context.koRule,
+        attackerAllowKo: context.attackerAllowKo,
+        defenderAllowKo: context.defenderAllowKo,
+        initialTokens: context.initialTokens.map((t) => ({
+          tokenId: t.tokenId,
+          initialCoord: t.initialCoord,
+          groupIndex: t.groupIndex,
+          stoneColor: encodeColorStr(t.stoneColor),
+        })),
+      },
+      problemSetup,
+      rootNode: report.rootDagNodeId,
+      rootOutcome: report.rootStatus,
+      rootPn: report.rootPn >= PN_DN_SATURATION ? 'SAT' : report.rootPn,
+      rootDn: report.rootDn >= PN_DN_SATURATION ? 'SAT' : report.rootDn,
+      bestMove: report.bestMove,
+      bestMoveSgf:
+        report.bestMoveSgf ?? coordToSgf(report.bestMove, initialPos.boardSize),
+      nodes: report.proofDagNodes.map((n) => ({
+        nodeId: n.nodeId,
+        isOrNode: n.isOrNode,
+        toPlay: encodeColorStr(n.toPlay),
+        incomingMove: n.incomingMove,
+        incomingMoveSgf: n.incomingMoveSgf,
+        pn: n.pn >= PN_DN_SATURATION ? 'SAT' : n.pn,
+        dn: n.dn >= PN_DN_SATURATION ? 'SAT' : n.dn,
+        outcome: n.outcome,
+        terminalEvidence: n.terminalEvidence,
+        isPrunedOutsideRz: n.isPrunedOutsideRz,
+        isTtHit: n.isTtHit,
+        isKoDependentBarrier: n.isKoDependentBarrier,
+        sourceProofNodeId: n.sourceProofNodeId,
+        proofRzCoords: n.proofRzCoords,
+        disproofRzCoords: n.disproofRzCoords,
+        childNodeIds: n.childNodeIds,
+        childMoves: n.childMoves,
+        prunedCertificate: null,
+      })),
+    };
+
+    return `sha256-jcs:${sha256Hex(canonicalizeJsonJcs(compactPayload))}`;
+  }
+
   // FR-9.1, FR-9.2, FR-9.3: Zero-trust Independent Proof Checker (`tprover check`)
   public verifyProofDag(
     initialPos: GoPosition,
@@ -1822,6 +2090,7 @@ export class ProofArtifactManager {
     report: SolveReport,
     options?: {
       skipChecksumRecompute?: boolean;
+      skipTraceReplay?: boolean;
       isCompactDag?: boolean;
       verifiedScope?: VerificationScope;
       verifiedRootKind?: 'initial' | 'traced_subposition';
@@ -1853,18 +2122,6 @@ export class ProofArtifactManager {
       (inferredRootKind === 'traced_subposition'
         ? 'traced_within_rules'
         : 'original_root');
-    const commonMeta: Partial<VerificationReport> = {
-      encodingMode: effectiveEncodingMode,
-      verifiedScope: effectiveScope,
-      verifiedRootKind: inferredRootKind,
-      verifiedGoal: context.attackerGoal,
-      verifiedAttackerAllowKo: context.attackerAllowKo,
-      verifiedDefenderAllowKo: context.defenderAllowKo,
-      traceOutsideRegion: Boolean(options?.traceOutsideRegion),
-      traceHasRestrictedKoCapture: Boolean(
-        options?.traceHasRestrictedKoCapture
-      ),
-    };
 
     const effectiveRegionCoords = report.regionCoords ?? [];
     const allowedRegionSet =
@@ -1872,13 +2129,82 @@ export class ProofArtifactManager {
         ? new Set<number>(effectiveRegionCoords)
         : null;
 
+    let traceOutsideRegion = Boolean(options?.traceOutsideRegion);
+    let traceHasRestrictedKoCapture = Boolean(
+      options?.traceHasRestrictedKoCapture
+    );
+
+    // R5 §2: Enforce identical root provenance & arrival-trace rules in memory entrypoint!
+    if (!options?.skipTraceReplay) {
+      const traceCheck = this.validateRootProvenanceAndTrace(
+        initialPos,
+        context,
+        effectiveRegionCoords,
+        effectiveScope
+      );
+      traceOutsideRegion = traceCheck.traceOutsideRegion;
+      traceHasRestrictedKoCapture = traceCheck.traceHasRestrictedKoCapture;
+      if (!traceCheck.ok) {
+        return {
+          encodingMode: effectiveEncodingMode,
+          verifiedScope: effectiveScope,
+          verifiedRootKind: inferredRootKind,
+          verifiedGoal: context.attackerGoal,
+          verifiedAttackerAllowKo: context.attackerAllowKo,
+          verifiedDefenderAllowKo: context.defenderAllowKo,
+          traceOutsideRegion,
+          traceHasRestrictedKoCapture,
+          passed: false,
+          schemaVersion: 'lproof/1',
+          jcsSha256Checksum: report.proofChecksum,
+          verifiedNodes: 0,
+          verifiedStates: 0,
+          verifiedHistories: 0,
+          replayedPrunedCertificates: 0,
+          replayedTtHits: 0,
+          failedNodeId: null,
+          errorCode: traceCheck.errorCode,
+          message: traceCheck.message,
+          auditChecks: [
+            {
+              checkId: 'CHK-01',
+              requirementRef: 'FR-8.3 / FR-9.1 / R5 §2',
+              title: '根命题作用域与到达轨迹规则一致性校验',
+              passed: false,
+              detail: traceCheck.detail,
+            },
+          ],
+        };
+      }
+    }
+
+    const commonMeta: Partial<VerificationReport> = {
+      encodingMode: effectiveEncodingMode,
+      verifiedScope: effectiveScope,
+      verifiedRootKind: inferredRootKind,
+      verifiedGoal: context.attackerGoal,
+      verifiedAttackerAllowKo: context.attackerAllowKo,
+      verifiedDefenderAllowKo: context.defenderAllowKo,
+      traceOutsideRegion,
+      traceHasRestrictedKoCapture,
+    };
+
     // Check 1: RFC 8785 JCS SHA-256 Checksum, InputHash, Root Proposition & bestMove Binding (FR-8.3, FR-9.1, R4 §4)
     let checksumValid = true;
     let displayChecksum = report.proofChecksum;
+    let canonicalSchemaChecksum: string | undefined = undefined;
     if (!options?.skipChecksumRecompute) {
       const recomputed = this.serializeLProofJson(initialPos, context, report);
       checksumValid = recomputed.checksum === report.proofChecksum;
       displayChecksum = recomputed.checksum;
+      canonicalSchemaChecksum = recomputed.checksum;
+    } else if (report.rootStatus !== ProofOutcome.Unknown) {
+      canonicalSchemaChecksum = this.computeCanonicalSchemaChecksum(
+        initialPos,
+        context,
+        report,
+        isCompactDag
+      );
     }
     const expectedInputHash = initialPos.computeZobristHex();
     const inputHashValid = report.inputHash === expectedInputHash;
@@ -2335,7 +2661,7 @@ export class ProofArtifactManager {
         passed: allPassed,
         schemaVersion: 'lproof/1',
         jcsSha256Checksum: report.proofChecksum,
-        canonicalDagChecksum: report.proofChecksum,
+        canonicalDagChecksum: canonicalSchemaChecksum,
         verifiedNodes: reachableNodeIds.size,
         verifiedStates: stats.verifiedStates,
         verifiedHistories: stats.verifiedStates,
@@ -2590,7 +2916,7 @@ export class ProofArtifactManager {
       passed: allPassed,
       schemaVersion: 'lproof/1',
       jcsSha256Checksum: report.proofChecksum,
-      canonicalDagChecksum: displayChecksum,
+      canonicalDagChecksum: canonicalSchemaChecksum,
       verifiedNodes: reachableNodeIds.size,
       verifiedStates: stateReplayOk ? rebuiltPositions.length : 0,
       verifiedHistories: stateReplayOk ? rebuiltPositions.length : 0,

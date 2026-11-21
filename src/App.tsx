@@ -47,6 +47,7 @@ import {
   SolverConfig,
   TsumegoProblemSpec,
   VerificationReport,
+  VerificationScope,
 } from './engine/types';
 
 type ActiveWorkspaceTab =
@@ -122,8 +123,11 @@ export default function App() {
   );
   const [copiedFeedback, setCopiedFeedback] = useState<string | null>(null);
 
-  // Proof Checker Fault Injection State
+  // Proof Checker Fault Injection & Sub-position Verification Scope State
   const [faultMode, setFaultMode] = useState<FaultInjectionMode>('none');
+  const [subpositionVerifyScope, setSubpositionVerifyScope] = useState<
+    'traced_within_rules' | 'free_exploration'
+  >('traced_within_rules');
 
   // Contract Parser Test State (FR-1.1..1.3)
   const [contractPreset, setContractPreset] = useState<
@@ -250,14 +254,22 @@ export default function App() {
     return evaluator.evaluateTerminal(displayedPosition, proofContext);
   }, [displayedPosition, proofContext]);
 
-  // Independent lproof/1 Proof Checker execution (with semantic re-signing in Fault Injection Sandbox)
+  const isManualSubRoot = solveManualSubposition && manualMoves.length > 0;
+  const activeVerificationScope: VerificationScope = isManualSubRoot
+    ? subpositionVerifyScope
+    : 'original_root';
+
+  // Independent lproof/1 Proof Checker execution (shares exact scope & trace rules with file verifier)
   const verificationReport = useMemo((): VerificationReport => {
     const checker = new ProofArtifactManager();
     if (faultMode === 'none') {
       return checker.verifyProofDag(
         activeSolvePosition,
         proofContext,
-        solveReport
+        solveReport,
+        {
+          verifiedScope: activeVerificationScope,
+        }
       );
     }
 
@@ -319,19 +331,27 @@ export default function App() {
     return checker.verifyProofDag(
       activeSolvePosition,
       proofContext,
-      clonedReport
+      clonedReport,
+      {
+        verifiedScope: activeVerificationScope,
+      }
     );
-  }, [activeSolvePosition, proofContext, solveReport, faultMode]);
+  }, [
+    activeSolvePosition,
+    proofContext,
+    solveReport,
+    faultMode,
+    activeVerificationScope,
+  ]);
 
   // Process-independent standalone JSON text verifier (runs when viewing Tab 3 Checker)
   const standaloneJsonVerification = useMemo((): VerificationReport | null => {
     if (activeTab !== 'checker' || faultMode !== 'none') return null;
     const checker = new ProofArtifactManager();
-    const isManualSub = solveManualSubposition && manualMoves.length > 0;
     return checker.verifySerializedLProofJson(solveReport.lproofJson, {
       problem: currentProblem,
       context: proofContext,
-      scope: isManualSub ? 'free_exploration' : 'original_root',
+      scope: activeVerificationScope,
     });
   }, [
     activeTab,
@@ -339,8 +359,7 @@ export default function App() {
     solveReport.lproofJson,
     currentProblem,
     proofContext,
-    solveManualSubposition,
-    manualMoves.length,
+    activeVerificationScope,
   ]);
 
   const handleSelectProblem = (
@@ -1002,9 +1021,25 @@ export default function App() {
                       <div>
                         {manualMoves.length > 0 ? (
                           solveManualSubposition ? (
-                            <span className="font-sans font-semibold text-indigo-700">
-                              试下子局面 ({manualMoves.length} 手) 独立证明 · Checker:{' '}
+                            <span
+                              className={`font-sans font-semibold ${
+                                !verificationReport.passed
+                                  ? 'text-red-700'
+                                  : verificationReport.traceOutsideRegion ||
+                                    verificationReport.traceHasRestrictedKoCapture
+                                  ? 'text-amber-800'
+                                  : 'text-indigo-700'
+                              }`}
+                            >
+                              试下子局面 ({manualMoves.length} 手 · scope=
+                              {verificationReport.verifiedScope}) · Checker:{' '}
                               {verificationReport.errorCode}
+                              {verificationReport.traceOutsideRegion
+                                ? ' · 越区轨迹'
+                                : ''}
+                              {verificationReport.traceHasRestrictedKoCapture
+                                ? ' · 受限提劫'
+                                : ''}
                             </span>
                           ) : (
                             <span className="font-sans font-semibold text-amber-800">
@@ -1475,6 +1510,75 @@ export default function App() {
                     >
                       {verificationReport.errorCode} ({verificationReport.verifiedNodes} 节点)
                     </dd>
+                  </div>
+
+                  <div className="col-span-2 rounded border border-slate-200 bg-slate-50 px-2.5 py-2 font-mono text-[11px] text-slate-700 space-y-1">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span>
+                        Scope:{' '}
+                        <strong className="text-slate-900">
+                          {verificationReport.verifiedScope ?? 'original_root'}
+                        </strong>{' '}
+                        · Root:{' '}
+                        <strong className="text-slate-900">
+                          {verificationReport.verifiedRootKind ?? 'initial'}
+                        </strong>
+                      </span>
+                      {isManualSubRoot && (
+                        <div className="flex items-center gap-1 font-sans">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setSubpositionVerifyScope('traced_within_rules')
+                            }
+                            className={`px-1.5 py-0.5 rounded text-[10px] cursor-pointer ${
+                              subpositionVerifyScope === 'traced_within_rules'
+                                ? 'bg-slate-900 text-white'
+                                : 'bg-white border border-slate-300 text-slate-700'
+                            }`}
+                          >
+                            题内严格
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setSubpositionVerifyScope('free_exploration')
+                            }
+                            className={`px-1.5 py-0.5 rounded text-[10px] cursor-pointer ${
+                              subpositionVerifyScope === 'free_exploration'
+                                ? 'bg-slate-900 text-white'
+                                : 'bg-white border border-slate-300 text-slate-700'
+                            }`}
+                          >
+                            自由探索
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <span
+                        className={
+                          verificationReport.traceOutsideRegion
+                            ? 'font-semibold text-amber-800'
+                            : 'text-slate-500'
+                        }
+                      >
+                        越区轨迹 (traceOutsideRegion):{' '}
+                        {verificationReport.traceOutsideRegion ? '是' : '否'}
+                      </span>
+                      <span
+                        className={
+                          verificationReport.traceHasRestrictedKoCapture
+                            ? 'font-semibold text-amber-800'
+                            : 'text-slate-500'
+                        }
+                      >
+                        受限提劫 (traceHasRestrictedKoCapture):{' '}
+                        {verificationReport.traceHasRestrictedKoCapture
+                          ? '是'
+                          : '否'}
+                      </span>
+                    </div>
                   </div>
                 </dl>
 
@@ -1979,9 +2083,26 @@ export default function App() {
 
               <div className="mt-4 pt-4 border-t border-slate-200 text-xs font-mono text-slate-700 space-y-1">
                 <div>Checker Message: {verificationReport.message}</div>
+                <div className="text-slate-600">
+                  Scope: {verificationReport.verifiedScope ?? 'original_root'} |
+                  RootKind: {verificationReport.verifiedRootKind ?? 'initial'} |
+                  Encoding: {verificationReport.encodingMode ?? 'full_state_table'}{' '}
+                  | traceOutsideRegion:{' '}
+                  {verificationReport.traceOutsideRegion ? 'true' : 'false'} |
+                  traceHasRestrictedKoCapture:{' '}
+                  {verificationReport.traceHasRestrictedKoCapture
+                    ? 'true'
+                    : 'false'}
+                </div>
                 <div className="text-slate-500">
                   RFC 8785 JCS SHA-256: {verificationReport.jcsSha256Checksum}
                 </div>
+                {verificationReport.canonicalDagChecksum && (
+                  <div className="text-slate-500">
+                    Canonical Schema Digest:{' '}
+                    {verificationReport.canonicalDagChecksum}
+                  </div>
+                )}
                 {standaloneJsonVerification && (
                   <div
                     className={
@@ -1992,7 +2113,17 @@ export default function App() {
                   >
                     Standalone JSON File Verifier (verifySerializedLProofJson):{' '}
                     {standaloneJsonVerification.passed ? 'PASS' : 'FAIL'} (
-                    {standaloneJsonVerification.errorCode})
+                    {standaloneJsonVerification.errorCode}) | scope=
+                    {standaloneJsonVerification.verifiedScope} | rootKind=
+                    {standaloneJsonVerification.verifiedRootKind} |
+                    traceOutsideRegion=
+                    {standaloneJsonVerification.traceOutsideRegion
+                      ? 'true'
+                      : 'false'}{' '}
+                    | traceHasRestrictedKoCapture=
+                    {standaloneJsonVerification.traceHasRestrictedKoCapture
+                      ? 'true'
+                      : 'false'}
                   </div>
                 )}
               </div>

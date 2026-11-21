@@ -1199,12 +1199,13 @@ export class DfpnSolver {
       return false;
     }
     const budgetBytes = this.config.memoryBudgetMb * 1024 * 1024;
-    // Conservative byte estimate across stateTable, historyTable, DAG nodes, frontier cache, and TT
+    // Conservative byte estimate across stateTable, historyTable, DAG nodes, frontier cache, revalCache, and TT
     const estimatedBytes =
       this.stateTable.length * 1024 +
       this.historyTable.length * 2048 +
       this.proofDagNodes.length * 768 +
       this.nodeFrontierCache.size * 4096 +
+      this.revalCache.size * 128 +
       this.ttStore.size * 1024;
     return estimatedBytes > budgetBytes;
   }
