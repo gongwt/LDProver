@@ -355,55 +355,197 @@ runSection('2. R5 §2 Verification Scope & Memory/File Parity', () => {
     'Contradictory initial + non-empty initialTraceMoves rejected (free_exploration) -> LP-P02',
     `got=${contradictFree.errorCode}`
   );
+
+  // R6 §2 P1: Pre-root history snapshot integrity in memory & file entrypoints
+  // covering BOTH SituationalSuperko (SSK) and PositionalSuperko (PSK).
+  for (const koRule of [KoRule.SituationalSuperko, KoRule.PositionalSuperko]) {
+    const koLabel = koRule === KoRule.SituationalSuperko ? 'SSK' : 'PSK';
+    const r6Cfg: SolverConfig = { ...defaultConfig(3500), koRule };
+    const r6Ctx = DfpnSolver.buildProofContext(p001, r6Cfg);
+    const fullHistPos = DfpnSolver.buildInitialPosition(p001, r6Ctx);
+    const baPlay = fullHistPos.playMove(coordFromRowCol(0, 1, 19)); // B[ba]
+    check(baPlay.legal, `R6 §2 [${koLabel}] p001 B[ba] legal`);
+    check(
+      fullHistPos.historySnapshots.length === 2,
+      `R6 §2 [${koLabel}] full history has 2 snapshots`
+    );
+
+    const fullRep = new DfpnSolver(r6Cfg).solveFromPosition(
+      p001,
+      fullHistPos,
+      r6Ctx
+    );
+    const fullMem = checker.verifyProofDag(fullHistPos, r6Ctx, fullRep, {
+      verifiedScope: 'traced_within_rules',
+    });
+    const fullFile = checker.verifySerializedLProofJson(fullRep.lproofJson, {
+      problem: p001,
+      context: r6Ctx,
+      scope: 'traced_within_rules',
+    });
+    check(
+      fullMem.passed && fullFile.passed,
+      `R6 §2 [${koLabel}] p001 B[ba] full history (2 snapshots) mem & file PASS`,
+      `mem=${fullMem.errorCode}, file=${fullFile.errorCode}`
+    );
+
+    // Strip the origin-root snapshot while keeping board, turn, tokens, ko, origin & playedMoveTrace=[ba]
+    const strippedPos = fullHistPos.clone();
+    strippedPos.historySnapshots = fullHistPos.historySnapshots.slice(1);
+    check(
+      strippedPos.historySnapshots.length === 1,
+      `R6 §2 [${koLabel}] stripped history has 1 snapshot`
+    );
+    const strippedRep = new DfpnSolver(r6Cfg).solveFromPosition(
+      p001,
+      strippedPos,
+      r6Ctx
+    );
+    const strippedMem = checker.verifyProofDag(strippedPos, r6Ctx, strippedRep, {
+      verifiedScope: 'traced_within_rules',
+    });
+    const strippedFile = checker.verifySerializedLProofJson(
+      strippedRep.lproofJson,
+      {
+        problem: p001,
+        context: r6Ctx,
+        scope: 'traced_within_rules',
+      }
+    );
+    check(
+      !strippedMem.passed && strippedMem.errorCode === 'LP-S02',
+      `R6 §2 [${koLabel}] stripped pre-root history rejected by memory checker -> LP-S02`,
+      `mem=${strippedMem.errorCode}`
+    );
+    check(
+      !strippedFile.passed && strippedFile.errorCode === 'LP-S02',
+      `R6 §2 [${koLabel}] stripped pre-root history rejected by file checker -> LP-S02`,
+      `file=${strippedFile.errorCode}`
+    );
+
+    // Also reject un-traced initial root whose historySnapshots was emptied in memory
+    const emptyRootHistPos = DfpnSolver.buildInitialPosition(p001, r6Ctx);
+    const rootRep = new DfpnSolver(r6Cfg).solveFromPosition(
+      p001,
+      emptyRootHistPos,
+      r6Ctx
+    );
+    emptyRootHistPos.historySnapshots = [];
+    const emptyRootMem = checker.verifyProofDag(
+      emptyRootHistPos,
+      r6Ctx,
+      rootRep,
+      { verifiedScope: 'original_root' }
+    );
+    check(
+      !emptyRootMem.passed && emptyRootMem.errorCode === 'LP-S02',
+      `R6 §2 [${koLabel}] un-traced root with emptied historySnapshots rejected -> LP-S02`,
+      `mem=${emptyRootMem.errorCode}`
+    );
+  }
 });
 
 // ============================================================================
-// Section 3: R5 §3 Full-State DAG-to-State Binding & canonicalDagChecksum
+// Section 3: R5/R6 §3 Full-State Node Binding & §4 Cross-Engine canonicalDagChecksum
 // ============================================================================
-runSection('3. R5 §3 Full-State StateId Binding & canonicalDagChecksum', () => {
+runSection('3. R5/R6 §3 Full-State Node Binding & §4 canonicalDagChecksum', () => {
   const p001 = getSpec('p001_straight_three_live');
   const cfg = defaultConfig(3500);
   const ctx = DfpnSolver.buildProofContext(p001, cfg);
   const pos = DfpnSolver.buildInitialPosition(p001, ctx);
   const rep = new DfpnSolver(cfg).solveFromPosition(p001, pos, ctx);
 
+  // Cross-engine canonical compact_dag digest shared verbatim with C++ r5_regression_test.cc
+  const expectedCrossEngineCanonicalDigest =
+    'sha256-jcs:a002fe4896c1c728d06c9700518bf86bdb9e5a0b8c8dc58a8e3ecf7ef9d669d6';
+
+  const baselineMem = checker.verifyProofDag(pos, ctx, rep, {
+    verifiedScope: 'original_root',
+  });
   const baselineVer = checker.verifySerializedLProofJson(rep.lproofJson, {
     problem: p001,
     scope: 'original_root',
   });
   check(
-    baselineVer.passed && Boolean(baselineVer.canonicalDagChecksum),
-    'p001 baseline full_state_table passes with canonicalDagChecksum',
-    `code=${baselineVer.errorCode}`
+    baselineVer.passed &&
+      baselineVer.canonicalDagChecksum === expectedCrossEngineCanonicalDigest &&
+      baselineMem.canonicalDagChecksum === expectedCrossEngineCanonicalDigest,
+    'R6 §4 p001 baseline memory & file canonicalDagChecksum match cross-engine canonical compact_dag digest',
+    `file=${baselineVer.canonicalDagChecksum}, mem=${baselineMem.canonicalDagChecksum}`
   );
 
-  // R5 §3 critical mutation: point `ba` leaf node's stateId to 0 (root state), re-sign
-  const parsedMut = JSON.parse(rep.lproofJson) as Record<string, unknown>;
-  const nodes = parsedMut.nodes as Array<Record<string, unknown>>;
-  const baLeaf = nodes.find(
-    (n) =>
-      n.incomingMove === coordFromRowCol(0, 1, 19) &&
-      (n.childNodeIds as number[]).length === 0
-  );
-  check(Boolean(baLeaf), 'Located ba leaf node in p001 full_state_table');
-  if (baLeaf) {
-    baLeaf.stateId = 0;
-    const { json: badStateJson } = resignLProof(parsedMut);
-    const badStateVer = checker.verifySerializedLProofJson(badStateJson, {
-      problem: p001,
-      scope: 'original_root',
-    });
-    check(
-      !badStateVer.passed && badStateVer.errorCode === 'LP-N10',
-      'p001 ba leaf stateId=0 rejected with LP-N10',
-      `passed=${badStateVer.passed}, code=${badStateVer.errorCode}`
+  // R5 §3 / R6 §3 Table: 4 independent single-field mutations on ba leaf (re-signed)
+  const mutateBaLeaf = (
+    mutator: (leaf: Record<string, unknown>) => void
+  ): string => {
+    const parsed = JSON.parse(rep.lproofJson) as Record<string, unknown>;
+    const nodes = parsed.nodes as Array<Record<string, unknown>>;
+    const leaf = nodes.find(
+      (n) =>
+        n.incomingMove === coordFromRowCol(0, 1, 19) &&
+        (n.childNodeIds as number[]).length === 0
     );
-  }
+    check(Boolean(leaf), 'Located ba leaf node in p001 full_state_table');
+    if (leaf) mutator(leaf);
+    return resignLProof(parsed).json;
+  };
 
-  // R5 §3 P2: Extra non-semantic top-level JSON field -> re-signed -> PASS,
-  // jcsSha256Checksum reflects file bytes while canonicalDagChecksum strips extra fields!
+  // 1) stateId: 1 -> 0 => LP-N10
+  const verBadState = checker.verifySerializedLProofJson(
+    mutateBaLeaf((leaf) => {
+      leaf.stateId = 0;
+    }),
+    { problem: p001, scope: 'original_root' }
+  );
+  check(
+    !verBadState.passed && verBadState.errorCode === 'LP-N10',
+    'R5/R6 §3 ba leaf stateId=0 rejected with LP-N10',
+    `passed=${verBadState.passed}, code=${verBadState.errorCode}`
+  );
+
+  // 2) historyId: 1 -> 0 => LP-S10
+  const verBadHistory = checker.verifySerializedLProofJson(
+    mutateBaLeaf((leaf) => {
+      leaf.historyId = 0;
+    }),
+    { problem: p001, scope: 'original_root' }
+  );
+  check(
+    !verBadHistory.passed && verBadHistory.errorCode === 'LP-S10',
+    'R6 §3 ba leaf historyId=0 rejected with LP-S10',
+    `passed=${verBadHistory.passed}, code=${verBadHistory.errorCode}`
+  );
+
+  // 3) parentStateId: 0 -> -1 => LP-S10
+  const verBadParent = checker.verifySerializedLProofJson(
+    mutateBaLeaf((leaf) => {
+      leaf.parentStateId = -1;
+    }),
+    { problem: p001, scope: 'original_root' }
+  );
+  check(
+    !verBadParent.passed && verBadParent.errorCode === 'LP-S10',
+    'R6 §3 ba leaf parentStateId=-1 rejected with LP-S10',
+    `passed=${verBadParent.passed}, code=${verBadParent.errorCode}`
+  );
+
+  // 4) deleted historyId => LP-J02
+  const verMissingHistory = checker.verifySerializedLProofJson(
+    mutateBaLeaf((leaf) => {
+      delete leaf.historyId;
+    }),
+    { problem: p001, scope: 'original_root' }
+  );
+  check(
+    !verMissingHistory.passed && verMissingHistory.errorCode === 'LP-J02',
+    'R6 §3 ba leaf missing historyId rejected with LP-J02',
+    `passed=${verMissingHistory.passed}, code=${verMissingHistory.errorCode}`
+  );
+
+  // R5 §3 P2 / R6 §4 P2: Extra non-semantic top-level JSON field -> re-signed -> PASS,
+  // jcsSha256Checksum reflects file bytes while canonicalDagChecksum stays identical across engines!
   const parsedExtra = JSON.parse(rep.lproofJson) as Record<string, unknown>;
-  parsedExtra.extraNonSemanticTag = 'r5-audit-metadata';
+  parsedExtra.extraNonSemanticTag = 'r6-audit-metadata';
   const { json: extraJson, checksum: extraFileChecksum } = resignLProof(parsedExtra);
   const extraVer = checker.verifySerializedLProofJson(extraJson, {
     problem: p001,
@@ -425,9 +567,9 @@ runSection('3. R5 §3 Full-State StateId Binding & canonicalDagChecksum', () => 
     `canonical=${extraVer.canonicalDagChecksum}, file=${extraVer.jcsSha256Checksum}`
   );
   check(
-    extraVer.canonicalDagChecksum === baselineVer.canonicalDagChecksum,
-    'canonicalDagChecksum equals baseline canonical schema digest',
-    `extra=${extraVer.canonicalDagChecksum}, base=${baselineVer.canonicalDagChecksum}`
+    extraVer.canonicalDagChecksum === expectedCrossEngineCanonicalDigest,
+    'canonicalDagChecksum equals cross-engine canonical compact_dag digest',
+    `extra=${extraVer.canonicalDagChecksum}, expected=${expectedCrossEngineCanonicalDigest}`
   );
 });
 

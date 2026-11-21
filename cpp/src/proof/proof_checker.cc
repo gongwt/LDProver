@@ -1241,12 +1241,11 @@ bool ParseCanonicalSnapshotObj(const JsonValue& v, CanonicalSnapshot<N>* out) {
 
 // HistorySnapshotListsEqual moved above VerifySubgraphRecursive.
 
-}  // namespace
-
 template <int N>
-std::string ProofArtifactManager<N>::SerializeLProofJson(
+std::string SerializeCanonicalCompactDagJson(
     const Position<N>& initial_pos, const ProofContext& context,
-    const SolveReport<N>& report, std::string* out_checksum) const {
+    const SolveReport<N>& report, const std::string* context_id_override,
+    std::string* out_checksum) {
   JsonValue root = JsonValue::MakeObj();
   root.obj_val["magic"] = JsonValue::MakeStr("lproof/1");
   root.obj_val["encodingMode"] = JsonValue::MakeStr("compact_dag");
@@ -1257,7 +1256,9 @@ std::string ProofArtifactManager<N>::SerializeLProofJson(
       JsonValue::MakeBool(context.attacker_allow_ko);
   ctx_obj.obj_val["attackerGoal"] = JsonValue::MakeStr(
       context.attacker_goal == SearchGoal::kToKill ? "TOKILL" : "TOLIVE");
-  ctx_obj.obj_val["contextId"] = JsonValue::MakeStr(HexU64(context.context_id));
+  ctx_obj.obj_val["contextId"] = JsonValue::MakeStr(
+      context_id_override != nullptr ? *context_id_override
+                                     : HexU64(context.context_id));
   ctx_obj.obj_val["crucialStoneOp"] =
       JsonValue::MakeStr(LogicalOpToStr(context.crucial_stone_op));
   ctx_obj.obj_val["defenderAllowKo"] =
@@ -1304,8 +1305,7 @@ std::string ProofArtifactManager<N>::SerializeLProofJson(
       MakeIntArray(initial_pos.Stones(Color::kWhite).ToCoords());
   setup.obj_val["immortalWallCoords"] =
       MakeIntArray(initial_pos.ImmortalWall().ToCoords());
-  setup.obj_val["hasRegionHint"] =
-      JsonValue::MakeBool(report.region_hint.has_value());
+  setup.obj_val["hasRegionHint"] = JsonValue::MakeBool(!region_coords.empty());
   setup.obj_val["regionCoords"] = MakeIntArray(region_coords);
   setup.obj_val["rawRegionPointCount"] =
       JsonValue::MakeInt(static_cast<int64_t>(region_coords.size()));
@@ -1386,6 +1386,16 @@ std::string ProofArtifactManager<N>::SerializeLProofJson(
   return PrettyPrintJson(root, 0) + "\n";
 }
 
+}  // namespace
+
+template <int N>
+std::string ProofArtifactManager<N>::SerializeLProofJson(
+    const Position<N>& initial_pos, const ProofContext& context,
+    const SolveReport<N>& report, std::string* out_checksum) const {
+  return SerializeCanonicalCompactDagJson<N>(initial_pos, context, report,
+                                             nullptr, out_checksum);
+}
+
 template <int N>
 std::string ProofArtifactManager<N>::ExportSolutionTreeSgf(
     const Position<N>& initial_pos, const ProofContext& context,
@@ -1428,15 +1438,17 @@ namespace {
 
 template <int N>
 VerificationReport VerifyProofDagCore(
-    const ProofArtifactManager<N>& mgr, const Position<N>& initial_pos,
-    const ProofContext& context, const SolveReport<N>& report,
+    const Position<N>& initial_pos, const ProofContext& context,
+    const SolveReport<N>& report,
     std::optional<VerificationScope> scope_override,
     const std::vector<VerifiedStateRow<N>>* state_rows,
     const std::vector<FullStateNodeMeta>* node_metas,
-    bool replay_root_trace) {
+    bool replay_root_trace,
+    const std::string* canonical_context_id = nullptr) {
   VerificationReport ver;
-  mgr.SerializeLProofJson(initial_pos, context, report,
-                          &ver.jcs_sha256_checksum);
+  SerializeCanonicalCompactDagJson<N>(initial_pos, context, report,
+                                      canonical_context_id,
+                                      &ver.jcs_sha256_checksum);
   ver.canonical_dag_checksum = ver.jcs_sha256_checksum;
   ver.encoding_mode =
       (state_rows != nullptr) ? "full_state_table" : "compact_dag";
@@ -1819,8 +1831,8 @@ VerificationReport ProofArtifactManager<N>::VerifyProofDag(
     const Position<N>& initial_pos, const ProofContext& context,
     const SolveReport<N>& report,
     std::optional<VerificationScope> scope_override) const {
-  return VerifyProofDagCore<N>(*this, initial_pos, context, report,
-                               scope_override, nullptr, nullptr, true);
+  return VerifyProofDagCore<N>(initial_pos, context, report, scope_override,
+                               nullptr, nullptr, true, nullptr);
 }
 
 template <int N>
@@ -1940,6 +1952,8 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
   uint32_t state_table_verified_count = 0;
   std::vector<VerifiedStateRow<N>> rebuilt_state_rows;
   std::vector<FullStateNodeMeta> node_metas;
+  std::string raw_context_id;
+  bool has_raw_context_id = false;
 
   try {
     if (const auto it_pid = root.obj_val.find("problemId");
@@ -1951,6 +1965,8 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
     const auto& ctx_obj = it_ctx->second.obj_val;
     if (const auto it = ctx_obj.find("contextId");
         it != ctx_obj.end() && it->second.kind == JsonValue::Kind::kString) {
+      raw_context_id = it->second.str_val;
+      has_raw_context_id = true;
       ParseHexU64(it->second.str_val, &context.context_id);
     }
     if (const auto it = ctx_obj.find("rootAttacker"); it == ctx_obj.end() ||
@@ -2821,9 +2837,10 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
   }
 
   VerificationReport dag_ver = VerifyProofDagCore<N>(
-      *this, initial_pos, context, report, effective_scope,
+      initial_pos, context, report, effective_scope,
       has_state_table ? &rebuilt_state_rows : nullptr,
-      has_state_table ? &node_metas : nullptr, false);
+      has_state_table ? &node_metas : nullptr, false,
+      has_raw_context_id ? &raw_context_id : nullptr);
   // R4 §4 P1-C: Preserve the verified input file's RFC 8785 JCS SHA-256
   // checksum rather than overwriting it with re-serialized compact DAG digest!
   dag_ver.canonical_dag_checksum = dag_ver.jcs_sha256_checksum;

@@ -1216,9 +1216,11 @@ export class ProofArtifactManager {
       const nodeToPlay = decodeColor(n.toPlay);
       if (
         typeof n.nodeId !== 'number' ||
+        !Number.isInteger(n.nodeId) ||
         typeof n.isOrNode !== 'boolean' ||
         nodeToPlay === null ||
         typeof n.incomingMove !== 'number' ||
+        !Number.isInteger(n.incomingMove) ||
         typeof n.outcome !== 'string' ||
         !isIntegerArray(n.childNodeIds) ||
         !isIntegerArray(n.childMoves)
@@ -1230,6 +1232,24 @@ export class ProofArtifactManager {
           'lproof/1',
           fileChecksum
         );
+      }
+      if (hasStateTable) {
+        if (
+          typeof n.stateId !== 'number' ||
+          !Number.isInteger(n.stateId) ||
+          typeof n.historyId !== 'number' ||
+          !Number.isInteger(n.historyId) ||
+          typeof n.parentStateId !== 'number' ||
+          !Number.isInteger(n.parentStateId)
+        ) {
+          return makeJsonError(
+            'LP-J02',
+            `full_state_table 模式下节点 #${n.nodeId} 必须声明合法整数 stateId、historyId 与 parentStateId。`,
+            'full_state_table ProofDagNode must declare integer stateId, historyId, and parentStateId.',
+            'lproof/1',
+            fileChecksum
+          );
+        }
       }
       nodes.push({
         nodeId: n.nodeId,
@@ -1872,6 +1892,19 @@ export class ProofArtifactManager {
     }
 
     if (!isTraced) {
+      const expectedRootSnap = initialPos.currentCanonicalSnapshot();
+      if (!historyTablesMatch(initialPos.historySnapshots, [expectedRootSnap])) {
+        return {
+          ok: false,
+          errorCode: 'LP-S02',
+          message:
+            '初始根局面的超劫历史快照列表 (historySnapshots) 缺失或与当前棋面不一致。',
+          detail:
+            'Initial root historySnapshots disagrees with canonical root snapshot.',
+          traceOutsideRegion: false,
+          traceHasRestrictedKoCapture: false,
+        };
+      }
       return {
         ok: true,
         errorCode: 'PASS',
@@ -1966,13 +1999,19 @@ export class ProofArtifactManager {
       !numberArraysEqual(
         replayPos.getWhiteCoords(),
         initialPos.getWhiteCoords()
+      ) ||
+      !historyTablesMatch(
+        initialPos.historySnapshots,
+        replayPos.historySnapshots
       )
     ) {
       return {
         ok: false,
         errorCode: 'LP-S02',
-        message: 'traced_subposition 到达轨迹重放结果与当前内存初始局面不一致。',
-        detail: 'Replayed trace position diverges from provided initialPos.',
+        message:
+          'traced_subposition 到达轨迹重放结果（含完整超劫历史快照）与当前内存初始局面不一致。',
+        detail:
+          'Replayed trace position or historySnapshots diverges from provided initialPos.',
         traceOutsideRegion,
         traceHasRestrictedKoCapture,
       };
@@ -1989,22 +2028,50 @@ export class ProofArtifactManager {
   }
 
   /**
-   * Computes the RFC 8785 JCS SHA-256 digest of ONLY the canonical lproof/1
-   * schema fields (stripping any non-semantic extra JSON properties).
+   * Computes the encoding-independent canonical `compact_dag` RFC 8785 JCS
+   * SHA-256 digest of ONLY the semantic lproof/1 proof DAG schema fields
+   * (stripping StateTable/HistoryTable/prunedCertificate and any non-semantic
+   * extra JSON properties) so TS and C++ produce identical canonical digests
+   * for both `full_state_table` and `compact_dag` certificates.
    */
   private computeCanonicalSchemaChecksum(
     initialPos: GoPosition,
     context: ProofContext,
-    report: SolveReport,
-    isCompactDag: boolean
+    report: SolveReport
   ): string {
-    if (!isCompactDag) {
-      return this.serializeLProofJson(initialPos, context, report).checksum;
-    }
+    const sortUniqueBoardCoords = (coords: number[]): number[] => {
+      const maxPts = initialPos.boardSize * initialPos.boardSize;
+      const set = new Set<number>();
+      for (const c of coords) {
+        if (Number.isInteger(c) && c >= 0 && c < maxPts) set.add(c);
+      }
+      return Array.from(set).sort((a, b) => a - b);
+    };
 
-    const regionCoords = report.regionCoords ?? [];
-    const immortalWallCoords = Array.from(initialPos.immortalWallSet).sort(
-      (a, b) => a - b
+    const moveToCanonicalSgf = (mv: number): string => {
+      if (mv === PASS_MOVE) return 'pass';
+      if (mv < 0 || mv >= initialPos.boardSize * initialPos.boardSize) return '';
+      return coordToSgf(mv, initialPos.boardSize);
+    };
+
+    const normalizeEvidence = (n: ProofDagNode): string => {
+      if (
+        n.terminalEvidence === 'BENSON_UCA' ||
+        n.terminalEvidence === 'TOKENS_CAPTURED' ||
+        n.terminalEvidence === 'DOUBLE_PASS_RESOLUTION' ||
+        n.terminalEvidence === 'EMPTY_TARGET_CONSTANT_FALSE'
+      ) {
+        return n.terminalEvidence;
+      }
+      if (n.isPrunedOutsideRz) return 'OUTSIDE_RZ_REVALIDATED';
+      if (n.isTtHit) return 'TT_REVALIDATED_REUSE';
+      if (n.childNodeIds.length > 0) return 'INTERNAL_AGGREGATION';
+      return 'NONE';
+    };
+
+    const regionCoords = sortUniqueBoardCoords(report.regionCoords ?? []);
+    const immortalWallCoords = sortUniqueBoardCoords(
+      Array.from(initialPos.immortalWallSet)
     );
     const isTraced = initialPos.playedMoveTrace.length > 0;
     const problemSetup: Record<string, unknown> = {
@@ -2021,13 +2088,17 @@ export class ProofArtifactManager {
       immortalWallCoords,
       hasRegionHint: regionCoords.length > 0,
       regionCoords,
-      rawRegionPointCount: report.rawRegionPointCount ?? regionCoords.length,
-      isFullRegionSearch: report.isFullRegionSearch ?? true,
+      rawRegionPointCount: regionCoords.length,
+      isFullRegionSearch: true,
     };
     if (isTraced) {
       problemSetup.originFirstToPlay = encodeColorStr(initialPos.originToPlay);
-      problemSetup.originBlackCoords = initialPos.originBlackCoords.slice();
-      problemSetup.originWhiteCoords = initialPos.originWhiteCoords.slice();
+      problemSetup.originBlackCoords = sortUniqueBoardCoords(
+        initialPos.originBlackCoords
+      );
+      problemSetup.originWhiteCoords = sortUniqueBoardCoords(
+        initialPos.originWhiteCoords
+      );
       problemSetup.initialTraceMoves = initialPos.playedMoveTrace.slice();
     }
 
@@ -2056,24 +2127,26 @@ export class ProofArtifactManager {
       rootPn: report.rootPn >= PN_DN_SATURATION ? 'SAT' : report.rootPn,
       rootDn: report.rootDn >= PN_DN_SATURATION ? 'SAT' : report.rootDn,
       bestMove: report.bestMove,
-      bestMoveSgf:
-        report.bestMoveSgf ?? coordToSgf(report.bestMove, initialPos.boardSize),
+      bestMoveSgf: moveToCanonicalSgf(report.bestMove),
       nodes: report.proofDagNodes.map((n) => ({
         nodeId: n.nodeId,
         isOrNode: n.isOrNode,
         toPlay: encodeColorStr(n.toPlay),
         incomingMove: n.incomingMove,
-        incomingMoveSgf: n.incomingMoveSgf,
+        incomingMoveSgf: moveToCanonicalSgf(n.incomingMove),
         pn: n.pn >= PN_DN_SATURATION ? 'SAT' : n.pn,
         dn: n.dn >= PN_DN_SATURATION ? 'SAT' : n.dn,
         outcome: n.outcome,
-        terminalEvidence: n.terminalEvidence,
+        terminalEvidence: normalizeEvidence(n),
         isPrunedOutsideRz: n.isPrunedOutsideRz,
         isTtHit: n.isTtHit,
-        isKoDependentBarrier: n.isKoDependentBarrier,
-        sourceProofNodeId: n.sourceProofNodeId,
-        proofRzCoords: n.proofRzCoords,
-        disproofRzCoords: n.disproofRzCoords,
+        isKoDependentBarrier: false,
+        sourceProofNodeId:
+          (n.isPrunedOutsideRz || n.isTtHit) && n.sourceProofNodeId !== null
+            ? n.sourceProofNodeId
+            : null,
+        proofRzCoords: sortUniqueBoardCoords(n.proofRzCoords),
+        disproofRzCoords: sortUniqueBoardCoords(n.disproofRzCoords),
         childNodeIds: n.childNodeIds,
         childMoves: n.childMoves,
         prunedCertificate: null,
@@ -2197,13 +2270,16 @@ export class ProofArtifactManager {
       const recomputed = this.serializeLProofJson(initialPos, context, report);
       checksumValid = recomputed.checksum === report.proofChecksum;
       displayChecksum = recomputed.checksum;
-      canonicalSchemaChecksum = recomputed.checksum;
+      canonicalSchemaChecksum = this.computeCanonicalSchemaChecksum(
+        initialPos,
+        context,
+        report
+      );
     } else if (report.rootStatus !== ProofOutcome.Unknown) {
       canonicalSchemaChecksum = this.computeCanonicalSchemaChecksum(
         initialPos,
         context,
-        report,
-        isCompactDag
+        report
       );
     }
     const expectedInputHash = initialPos.computeZobristHex();
@@ -2576,9 +2652,15 @@ export class ProofArtifactManager {
 
         if (!isCompactDag && stateReplayOk && reachableNodeIds.has(node.nodeId)) {
           const pos = rebuiltPositions[node.stateId];
-          if (!pos) {
+          const stateRow = report.stateTable[node.stateId];
+          if (
+            !pos ||
+            !stateRow ||
+            node.historyId < 0 ||
+            node.historyId >= report.historyTable.length
+          ) {
             lpN15AndRoleOk = false;
-            topologyDetail = `节点 #${node.nodeId} 指向不存在的 stateId=${node.stateId}`;
+            topologyDetail = `节点 #${node.nodeId} 指向越界的 stateId=${node.stateId} 或 historyId=${node.historyId}`;
             recordFailure('LP-S02', node.nodeId);
             break;
           }
@@ -2587,6 +2669,15 @@ export class ProofArtifactManager {
             lpN15AndRoleOk = false;
             topologyDetail = `节点 #${node.nodeId} 的轮次/AND-OR 角色与真实可达局面冲突`;
             recordFailure('LP-N10', node.nodeId);
+            break;
+          }
+          if (
+            node.historyId !== stateRow.historyId ||
+            node.parentStateId !== stateRow.parentStateId
+          ) {
+            lpN15AndRoleOk = false;
+            topologyDetail = `节点 #${node.nodeId} 的 historyId=${node.historyId} / parentStateId=${node.parentStateId} 与 stateTable[${node.stateId}] (historyId=${stateRow.historyId}, parentStateId=${stateRow.parentStateId}) 冲突`;
+            recordFailure('LP-S10', node.nodeId);
             break;
           }
         }
