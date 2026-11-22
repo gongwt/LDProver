@@ -27,6 +27,7 @@ import {
 } from '../src/engine/studyLdRzCatalog';
 import {
   KoRule,
+  ProofContext,
   ProofOutcome,
   SearchGoal,
   SolverConfig,
@@ -1876,6 +1877,335 @@ runSection('Section 10: R12 Fragment Contract Binding, Full-Table Integrity, Run
       `src=${frag42Tail.sourceReceipt.status}/${frag42Tail.sourceReceipt.verificationMode}, q=${frag42Tail.queryReplayReceipt.status}`
     );
   }
+});
+
+runSection('Section 11: R13 Original-Root Binding, Entry-Point-Invariant Full-Table Audit & Unified Run-Contract Verification', () => {
+  const cfgRz: SolverConfig = {
+    ...defaultConfig(3500),
+    maxDepth: 48,
+    memoryBudgetMb: 512,
+    enableRzPruning: true,
+    useProblemDefaultKo: true,
+  };
+  const cloneReport = <T,>(r: T): T => JSON.parse(JSON.stringify(r));
+
+  // 11.1 R13 §1: Authentic originalRootOutcome binding & rejection of cross-contract / unverified originalRootReport
+  const p162 = getSpec('chao_vol2_p162');
+  const ctx162 = DfpnSolver.buildProofContext(p162, cfgRz);
+  const rep162Orig = new DfpnSolver(cfgRz).solveProblem(p162);
+  const srMove = sgfToCoord('sr', 19);
+  const subPos162 = DfpnSolver.buildInitialPosition(p162, ctx162);
+  subPos162.playMove(srMove);
+  subPos162.playMove(PASS_MOVE);
+  const rep162Sub = new DfpnSolver(cfgRz).solveFromPosition(
+    p162,
+    subPos162,
+    ctx162
+  );
+
+  // Empty-region same-board p162 variant produces PROVEN_LOSS in ~3 nodes
+  const p162EmptyRegion: TsumegoProblemSpec = {
+    ...p162,
+    hasRegionHint: true,
+    regionCoords: [],
+  };
+  const rep162Empty = new DfpnSolver(cfgRz).solveProblem(p162EmptyRegion);
+  const vr162EmptyFile = checker.verifySerializedLProofJson(
+    rep162Empty.lproofJson,
+    { problem: p162, context: ctx162, scope: 'original_root' }
+  );
+  check(
+    rep162Empty.rootStatus === ProofOutcome.ProvenLoss &&
+      !vr162EmptyFile.passed &&
+      vr162EmptyFile.errorCode === 'LP-P01',
+    'R13 §1 setup: empty-region p162 variant yields PROVEN_LOSS and fails whole-file original_root check with LP-P01',
+    `variantStatus=${rep162Empty.rootStatus}, fileErr=${vr162EmptyFile.errorCode}`
+  );
+
+  // Positive control: official UNKNOWN originalRootReport binds cleanly as UNKNOWN (3500 nodes)
+  const frag162OfficialOrig = checker.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162Orig,
+  });
+  check(
+    frag162OfficialOrig.originalRootOutcome === ProofOutcome.Unknown &&
+      frag162OfficialOrig.originalRootNodes === 3500 &&
+      frag162OfficialOrig.originalRootBindingNote === undefined &&
+      frag162OfficialOrig.runRootOutcome === ProofOutcome.ProvenWin &&
+      frag162OfficialOrig.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+      frag162OfficialOrig.sourceReceipt.passed,
+    'R13 §1 positive control: official p162 UNKNOWN originalRootReport binds originalRootOutcome=UNKNOWN (3500 nodes) alongside standalone PROVEN_WIN',
+    `orig=${String(frag162OfficialOrig.originalRootOutcome)}, nodes=${String(frag162OfficialOrig.originalRootNodes)}, note=${String(frag162OfficialOrig.originalRootBindingNote)}`
+  );
+
+  // Counterexample: attaching empty-region PROVEN_LOSS variant as originalRootReport MUST NOT taint originalRootOutcome!
+  const frag162VariantOrig = checker.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162Empty,
+  });
+  check(
+    frag162VariantOrig.originalRootOutcome === null &&
+      Boolean(frag162VariantOrig.originalRootBindingNote?.includes('LP-P01')) &&
+      frag162VariantOrig.runRootOutcome === ProofOutcome.ProvenWin &&
+      frag162VariantOrig.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+      frag162VariantOrig.sourceReceipt.passed,
+    'R13 §1 rejects empty-region p162 PROVEN_LOSS variant attached as originalRootReport (originalRootOutcome=null with LP-P01 note) while preserving standalone sourceReceipt',
+    `orig=${String(frag162VariantOrig.originalRootOutcome)}, note=${frag162VariantOrig.originalRootBindingNote}, src=${frag162VariantOrig.sourceReceipt.status}`
+  );
+
+  // Counterexample: attaching standalone subposition report as originalRootReport MUST NOT upgrade originalRootOutcome!
+  const frag162SubAsOrig = checker.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162Sub,
+  });
+  check(
+    frag162SubAsOrig.originalRootOutcome === null &&
+      Boolean(frag162SubAsOrig.originalRootBindingNote?.includes('LP-P02')) &&
+      frag162SubAsOrig.sourceReceipt.passed,
+    'R13 §1 rejects standalone subposition report attached as originalRootReport (LP-P02)',
+    `orig=${String(frag162SubAsOrig.originalRootOutcome)}, note=${frag162SubAsOrig.originalRootBindingNote}`
+  );
+
+  // 11.2 R13 §2 Case A: p042 RZ-referenced source descendant stateId corruption must fail identically from BOTH direct and RZ entry points
+  const p042 = getSpec('chao_vol1_p042');
+  const ctx42 = DfpnSolver.buildProofContext(p042, cfgRz);
+  const rep42 = new DfpnSolver(cfgRz).solveProblem(p042);
+  const rsMove = sgfToCoord('rs', 19);
+  const rsSnap42 = rep42.branchCoverageSnapshots?.find((s) => s.path === 'rs');
+  const passEntry42 = rsSnap42?.moves.find((m) => m.move === PASS_MOVE);
+  const rzEntry42 = rsSnap42?.moves.find(
+    (m) =>
+      m.status === 'RZ_REVALIDATED' &&
+      m.sourceProofNodeId === passEntry42?.dagNodeId
+  );
+
+  check(
+    Boolean(passEntry42 && rzEntry42),
+    'R13 §2A setup: located p042 rs/pass source node and an RZ_REVALIDATED sibling referencing it',
+    `pass=#${passEntry42?.dagNodeId}, rz=${rzEntry42?.moveSgf}/#${rzEntry42?.dagNodeId}`
+  );
+
+  if (passEntry42 && rzEntry42) {
+    // Positive control: intact p042 passes from both direct source and RZ sibling entry
+    const okDirect42 = checker.verifySubproofFragment({
+      problem: p042,
+      context: ctx42,
+      report: rep42,
+      targetPathMoves: [rsMove, PASS_MOVE],
+      targetDagNodeId: passEntry42.dagNodeId,
+    });
+    const okViaRz42 = checker.verifySubproofFragment({
+      problem: p042,
+      context: ctx42,
+      report: rep42,
+      targetPathMoves: [rsMove, rzEntry42.move],
+      targetDagNodeId: rzEntry42.dagNodeId,
+    });
+    check(
+      okDirect42.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+        okDirect42.sourceReceipt.verificationMode === 'full_state_table' &&
+        okViaRz42.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+        okViaRz42.sourceReceipt.verificationMode === 'full_state_table',
+      'R13 §2A positive control: intact p042 verifies both direct rs/pass source and RZ sibling in full_state_table mode',
+      `direct=${okDirect42.sourceReceipt.status}, viaRz=${okViaRz42.sourceReceipt.status}`
+    );
+
+    // Mutate ordinary child of rs/pass source node to out-of-bounds stateId
+    const srcDagNode = rep42.proofDagNodes[passEntry42.dagNodeId];
+    const childToCorrupt = srcDagNode.childNodeIds[0];
+    const rep42MutDesc = cloneReport(rep42);
+    rep42MutDesc.proofDagNodes[childToCorrupt].stateId =
+      rep42MutDesc.stateTable.length;
+
+    const failDirect42 = checker.verifySubproofFragment({
+      problem: p042,
+      context: ctx42,
+      report: rep42MutDesc,
+      targetPathMoves: [rsMove, PASS_MOVE],
+      targetDagNodeId: passEntry42.dagNodeId,
+    });
+    const failViaRz42 = checker.verifySubproofFragment({
+      problem: p042,
+      context: ctx42,
+      report: rep42MutDesc,
+      targetPathMoves: [rsMove, rzEntry42.move],
+      targetDagNodeId: rzEntry42.dagNodeId,
+    });
+    check(
+      failDirect42.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+        failDirect42.sourceReceipt.errorCode === 'LP-S10' &&
+        failViaRz42.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+        failViaRz42.sourceReceipt.errorCode === 'LP-S10' &&
+        failViaRz42.originalRootOutcome === null,
+      `R13 §2A entry-point invariance: corrupting source child #${childToCorrupt}.stateId fails BOTH direct (#${passEntry42.dagNodeId}) and RZ ref (${rzEntry42.moveSgf}/#${rzEntry42.dagNodeId}) with LP-S10`,
+      `direct=${failDirect42.sourceReceipt.status}/${failDirect42.sourceReceipt.errorCode}, viaRz=${failViaRz42.sourceReceipt.status}/${failViaRz42.sourceReceipt.errorCode}, origRoot=${String(failViaRz42.originalRootOutcome)}`
+    );
+  }
+
+  // 11.3 R13 §2 Case B: p001 ba leaf self-loop parentStateId must fail identically from BOTH root and direct ba entry
+  const p001 = getSpec('p001');
+  const ctx001 = DfpnSolver.buildProofContext(p001, cfgRz);
+  const rep001 = new DfpnSolver(cfgRz).solveProblem(p001);
+  const baMove = sgfToCoord('ba', 19);
+
+  const rep001SelfLoop = cloneReport(rep001);
+  const baStateId = rep001SelfLoop.proofDagNodes[0].stateId;
+  rep001SelfLoop.proofDagNodes[0].parentStateId = baStateId;
+  rep001SelfLoop.stateTable[baStateId].parentStateId = baStateId;
+
+  const failLoopFromRoot = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001SelfLoop,
+    targetPathMoves: [],
+    targetDagNodeId: rep001SelfLoop.rootDagNodeId,
+  });
+  const failLoopDirectBa = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001SelfLoop,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    failLoopFromRoot.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      failLoopFromRoot.sourceReceipt.errorCode === 'LP-S10' &&
+      failLoopDirectBa.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      failLoopDirectBa.sourceReceipt.errorCode === 'LP-S10' &&
+      failLoopDirectBa.originalRootOutcome === null,
+    'R13 §2B entry-point invariance: p001 ba leaf self-loop parentStateId fails BOTH root and direct ba entry with LP-S10',
+    `root=${failLoopFromRoot.sourceReceipt.status}/${failLoopFromRoot.sourceReceipt.errorCode}, directBa=${failLoopDirectBa.sourceReceipt.status}/${failLoopDirectBa.sourceReceipt.errorCode}`
+  );
+
+  // 11.4 R13 §3: Cross-binding between in-memory SolveReport and embedded lproofJson + mandatory context/runContract checks
+  const p001EmptyRegion: TsumegoProblemSpec = {
+    ...p001,
+    hasRegionHint: true,
+    regionCoords: [],
+  };
+  const rep001Empty = new DfpnSolver(cfgRz).solveProblem(p001EmptyRegion);
+
+  // Case A: swap official p001 report.lproofJson with real empty-region p001 PROVEN_LOSS lproofJson
+  const rep001SwappedLproof = cloneReport(rep001);
+  rep001SwappedLproof.lproofJson = rep001Empty.lproofJson;
+  const failSwappedLproof = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001SwappedLproof,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    failSwappedLproof.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      failSwappedLproof.sourceReceipt.errorCode === 'LP-P01',
+    'R13 §3A rejects official p001 in-memory report paired with swapped empty-region lproofJson (LP-P01)',
+    `status=${failSwappedLproof.sourceReceipt.status}, code=${failSwappedLproof.sourceReceipt.errorCode}`
+  );
+
+  // Case B: delete context from report.lproofJson (must reject with LP-J02, NEVER silently skip!)
+  const rep001NoLpCtx = cloneReport(rep001);
+  const lpObjNoCtx = JSON.parse(rep001NoLpCtx.lproofJson);
+  delete lpObjNoCtx.context;
+  rep001NoLpCtx.lproofJson = JSON.stringify(lpObjNoCtx);
+
+  const ctx001OppositeKo: ProofContext = {
+    ...ctx001,
+    attackerAllowKo: !ctx001.attackerAllowKo,
+  };
+  const failNoCtxOppositeKo = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001OppositeKo,
+    report: rep001NoLpCtx,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  const failNoCtxSameKo = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001NoLpCtx,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    failNoCtxOppositeKo.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      (failNoCtxOppositeKo.sourceReceipt.errorCode === 'LP-P01' ||
+        failNoCtxOppositeKo.sourceReceipt.errorCode === 'LP-J02') &&
+      failNoCtxSameKo.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      failNoCtxSameKo.sourceReceipt.errorCode === 'LP-J02',
+    'R13 §3B rejects stripped lproofJson.context (LP-J02 / LP-P01) instead of silently skipping context binding',
+    `oppKo=${failNoCtxOppositeKo.sourceReceipt.status}/${failNoCtxOppositeKo.sourceReceipt.errorCode}, sameKo=${failNoCtxSameKo.sourceReceipt.status}/${failNoCtxSameKo.sourceReceipt.errorCode}`
+  );
+
+  // Case C: omitted lproofJson with opposite attackerAllowKo still rejected via runContract AND configFingerprint fallback
+  const rep001EmptyLpStr = cloneReport(rep001);
+  rep001EmptyLpStr.lproofJson = '';
+  const failEmptyLpOppositeKo = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001OppositeKo,
+    report: rep001EmptyLpStr,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  const rep001NoLpNoRc = cloneReport(rep001EmptyLpStr);
+  delete rep001NoLpNoRc.runContract;
+  const failFpFallbackOppositeKo = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001OppositeKo,
+    report: rep001NoLpNoRc,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    failEmptyLpOppositeKo.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      failEmptyLpOppositeKo.sourceReceipt.errorCode === 'LP-P01' &&
+      failFpFallbackOppositeKo.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      failFpFallbackOppositeKo.sourceReceipt.errorCode === 'LP-P01',
+    'R13 §3C rejects mismatched attackerAllowKo even when lproofJson is omitted (via runContract and configFingerprint fallback, LP-P01)',
+    `rc=${failEmptyLpOppositeKo.sourceReceipt.errorCode}, fp=${failFpFallbackOppositeKo.sourceReceipt.errorCode}`
+  );
+
+  // 11.5 Baseline & canonical digest invariance guard (p031 & p042 byte-exact R12 canonical checksums)
+  const p031 = getSpec('chao_vol1_p031');
+  const ctx031 = DfpnSolver.buildProofContext(p031, cfgRz);
+  const rep031 = new DfpnSolver(cfgRz).solveProblem(p031);
+  const vr031 = checker.verifySerializedLProofJson(rep031.lproofJson, {
+    problem: p031,
+    context: ctx031,
+    scope: 'original_root',
+  });
+  const vr042 = checker.verifySerializedLProofJson(rep42.lproofJson, {
+    problem: p042,
+    context: ctx42,
+    scope: 'original_root',
+  });
+  check(
+    rep031.rootStatus === ProofOutcome.ProvenWin &&
+      rep031.bestMoveSgf === 'sr' &&
+      rep031.numNodes === 1892 &&
+      vr031.passed &&
+      vr031.canonicalDagChecksum ===
+        'sha256-jcs:134cdbdb6f5909f57979f89ecdd8760466c327b4b2ccbd4e48d9d8f9da3a74a7' &&
+      rep42.rootStatus === ProofOutcome.ProvenWin &&
+      rep42.bestMoveSgf === 'rs' &&
+      rep42.numNodes === 331 &&
+      vr042.passed &&
+      vr042.canonicalDagChecksum ===
+        'sha256-jcs:879d82fa63abb4f6fc76cb8e16adc14e4f6f671d89af630f18b62bd91fa29c16',
+    'R13 baseline guard: p031 (1892 nodes) and p042 (331 nodes) preserve exact R12 canonical DAG digests',
+    `p031=${rep031.numNodes}/${vr031.canonicalDagChecksum}, p042=${rep42.numNodes}/${vr042.canonicalDagChecksum}`
+  );
 });
 
 console.log(

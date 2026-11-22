@@ -549,10 +549,20 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
             <span className="font-mono text-slate-600">
               运行来源: {fragmentReceipt.result.runSource} · 本次运行根:{' '}
               {fragmentReceipt.result.runRootOutcome} · 原题根:{' '}
-              {fragmentReceipt.result.originalRootOutcome ?? '未提供(仅子局面)'} ·
-              模式: {fragmentReceipt.result.sourceReceipt.verificationMode}
+              {fragmentReceipt.result.originalRootOutcome ?? '未绑定(仅子局面)'}
+              {fragmentReceipt.result.originalRootOutcome !== null &&
+              fragmentReceipt.result.originalRootNodes !== null &&
+              fragmentReceipt.result.originalRootNodes !== undefined
+                ? ` (${fragmentReceipt.result.originalRootNodes} 节点)`
+                : ''}{' '}
+              · 模式: {fragmentReceipt.result.sourceReceipt.verificationMode}
             </span>
           </div>
+          {fragmentReceipt.result.originalRootBindingNote && (
+            <div className="rounded border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-amber-900">
+              原根结论未采信：{fragmentReceipt.result.originalRootBindingNote}
+            </div>
+          )}
 
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
             {/* Source Receipt */}

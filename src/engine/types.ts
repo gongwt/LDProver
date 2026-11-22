@@ -252,6 +252,8 @@ export interface SubproofFragmentVerificationResult {
   runStartPathSgf: string[];
   runRootOutcome: ProofOutcome;
   originalRootOutcome: ProofOutcome | null;
+  originalRootNodes?: number | null;
+  originalRootBindingNote?: string;
   sourceReceipt: SubproofSourceReceipt;
   queryReplayReceipt: SubproofQueryReplayReceipt;
 }
@@ -329,6 +331,22 @@ export interface StateTableEntry {
   historyId: number;
 }
 
+export interface RunContractSnapshot {
+  boardSize: number;
+  immortalWallCoords: number[];
+  hasRegionHint: boolean;
+  regionCoords: number[];
+  rootAttacker: Color;
+  attackerGoal: SearchGoal;
+  crucialStoneOp: LogicalOp;
+  initialTokens: TargetToken[];
+  koRule: KoRule;
+  attackerAllowKo: boolean;
+  defenderAllowKo: boolean;
+  rootKind: 'initial' | 'traced_subposition';
+  initialTraceMoves: number[];
+}
+
 export interface SolveReport {
   problemId: string;
   problemTitle: string;
@@ -341,6 +359,7 @@ export interface SolveReport {
   regionCoords: number[];
   rawRegionPointCount?: number;
   isFullRegionSearch?: boolean;
+  runContract?: RunContractSnapshot;
   inputHash: string;
   configFingerprint: string;
   solverVersion: string;

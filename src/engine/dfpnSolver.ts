@@ -302,6 +302,26 @@ export class DfpnSolver {
       regionCoords: hasRegionHint ? problem.regionCoords.slice() : [],
       rawRegionPointCount: hasRegionHint ? rawRegionCount : 0,
       isFullRegionSearch: !hasRegionHint || problem.regionCoords.length >= rawRegionCount,
+      runContract: {
+        boardSize: rootPos.boardSize,
+        immortalWallCoords: Array.from(rootPos.immortalWallSet).sort(
+          (a, b) => a - b
+        ),
+        hasRegionHint,
+        regionCoords: hasRegionHint
+          ? Array.from(new Set(problem.regionCoords)).sort((a, b) => a - b)
+          : [],
+        rootAttacker: context.rootAttacker,
+        attackerGoal: context.attackerGoal,
+        crucialStoneOp: context.crucialStoneOp,
+        initialTokens: context.initialTokens.map((t) => ({ ...t })),
+        koRule: context.koRule,
+        attackerAllowKo: context.attackerAllowKo,
+        defenderAllowKo: context.defenderAllowKo,
+        rootKind:
+          rootPos.playedMoveTrace.length > 0 ? 'traced_subposition' : 'initial',
+        initialTraceMoves: rootPos.playedMoveTrace.slice(),
+      },
       inputHash: rootPos.computeZobristHex(),
       configFingerprint: `${this.config.ttMode}:${this.config.koRule}:rz=${this.config.enableRzPruning}:ako=${context.attackerAllowKo}:dko=${context.defenderAllowKo}:reg=${hasRegionHint ? problem.regionCoords.length : 'all'}/${rawRegionCount}`,
       solverVersion: 'LDProver-1.8.2-cxx20',
