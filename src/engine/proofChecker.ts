@@ -511,13 +511,15 @@ function isValidNonNegativeNodeCount(n: unknown): n is number {
 }
 
 /**
- * R15 P2: Zero-throw structural validator for in-memory SolveReport DAG/state/history arrays.
- * Runs BEFORE any `.map` / `.length` / `.nodeId` dereference in verifyProofDag,
- * verifyOriginalRootReceipt, and verifySubproofFragment so missing or null-element arrays
- * return structured LP-J02 failures instead of throwing TypeError.
+ * R15 P2 + R16 P2: Encoding-mode-aware, zero-throw structural validator for in-memory SolveReport
+ * DAG/state/history tables. Runs BEFORE any `.map` / `.length` / `.nodeId` / `.clone` dereference
+ * in verifyProofDag, verifyOriginalRootReceipt, and verifySubproofFragment so missing tables,
+ * null rows, or missing/non-integer index fields return structured LP-J02 failures instead of
+ * throwing TypeError.
  */
 function validateReportMemoryStructure(
-  report: unknown
+  report: unknown,
+  mode: LProofEncodingMode | 'auto' = 'auto'
 ):
   | { ok: true }
   | { ok: false; code: 'LP-J02'; detail: string; failedNodeId: number | null } {
@@ -538,6 +540,44 @@ function validateReportMemoryStructure(
       failedNodeId: null,
     };
   }
+
+  const effectiveMode: LProofEncodingMode =
+    mode === 'auto'
+      ? Array.isArray(r.stateTable) && r.stateTable.length > 0
+        ? 'full_state_table'
+        : 'compact_dag'
+      : mode;
+
+  if (effectiveMode === 'full_state_table') {
+    if (!Array.isArray(r.stateTable)) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: 'full_state_table 模式下缺失必需的 stateTable 数组。',
+        failedNodeId: null,
+      };
+    }
+    if (!Array.isArray(r.historyTable)) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: 'full_state_table 模式下缺失必需的 historyTable 数组。',
+        failedNodeId: null,
+      };
+    }
+    if (r.stateTable.length > 0 && r.historyTable.length === 0) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: 'full_state_table 模式下存在非空 stateTable，但 historyTable 为空。',
+        failedNodeId: null,
+      };
+    }
+  }
+
+  const hasNonEmptyStateTable =
+    Array.isArray(r.stateTable) && r.stateTable.length > 0;
+
   const nodes = r.proofDagNodes as unknown[];
   for (let i = 0; i < nodes.length; i++) {
     const raw = nodes[i];
@@ -573,6 +613,23 @@ function validateReportMemoryStructure(
         ok: false,
         code: 'LP-J02',
         detail: `proofDagNodes[${i}] 缺少必需字段或字段类型非法。`,
+        failedNodeId: i,
+      };
+    }
+    if (
+      effectiveMode === 'full_state_table' &&
+      hasNonEmptyStateTable &&
+      (typeof n.stateId !== 'number' ||
+        !Number.isInteger(n.stateId) ||
+        typeof n.historyId !== 'number' ||
+        !Number.isInteger(n.historyId) ||
+        typeof n.parentStateId !== 'number' ||
+        !Number.isInteger(n.parentStateId))
+    ) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: `full_state_table 模式下 proofDagNodes[${i}] 缺少必需的整数 stateId/historyId/parentStateId。`,
         failedNodeId: i,
       };
     }
@@ -622,6 +679,21 @@ function validateReportMemoryStructure(
       }
       const sto = st as Record<string, unknown>;
       if (
+        typeof sto.stateId !== 'number' ||
+        !Number.isInteger(sto.stateId) ||
+        typeof sto.parentStateId !== 'number' ||
+        !Number.isInteger(sto.parentStateId) ||
+        typeof sto.moveFromParent !== 'number' ||
+        !Number.isInteger(sto.moveFromParent) ||
+        decodeColor(sto.toPlay) === null ||
+        typeof sto.koPoint !== 'number' ||
+        !Number.isInteger(sto.koPoint) ||
+        typeof sto.consecutivePasses !== 'number' ||
+        !Number.isInteger(sto.consecutivePasses) ||
+        typeof sto.survivingTokensMask !== 'number' ||
+        !Number.isInteger(sto.survivingTokensMask) ||
+        typeof sto.historyId !== 'number' ||
+        !Number.isInteger(sto.historyId) ||
         typeof sto.zobristHex !== 'string' ||
         !Array.isArray(sto.blackCoords) ||
         !Array.isArray(sto.whiteCoords)
@@ -629,7 +701,7 @@ function validateReportMemoryStructure(
         return {
           ok: false,
           code: 'LP-J02',
-          detail: `stateTable[${i}] 缺少必需字段或坐标数组非法。`,
+          detail: `stateTable[${i}] 缺少必需的索引/状态字段（如 parentStateId/historyId/stateId/moveFromParent）或类型非法。`,
           failedNodeId: null,
         };
       }
@@ -668,6 +740,7 @@ function validateReportMemoryStructure(
         }
         const so = snap as Record<string, unknown>;
         if (
+          decodeColor(so.toPlay) === null ||
           typeof so.zobristHex !== 'string' ||
           !Array.isArray(so.blackCoords) ||
           !Array.isArray(so.whiteCoords)
@@ -1134,7 +1207,10 @@ export class ProofArtifactManager {
     // Losslessly deduplicate CanonicalSnapshots across historyTable via snapshotPool
     const snapshotPool: CanonicalSnapshot[] = [];
     const snapshotIndexByKey = new Map<string, number>();
-    const historySnapshotIds: number[][] = report.historyTable.map((snaps) =>
+    const rawHistoryTable = Array.isArray(report.historyTable)
+      ? report.historyTable
+      : [];
+    const historySnapshotIds: number[][] = rawHistoryTable.map((snaps) =>
       snaps.map((s) => {
         const key = `${s.toPlay}:${s.zobristHex}:${s.blackCoords.join(
           ','
@@ -3048,9 +3124,13 @@ export class ProofArtifactManager {
         ? 'traced_within_rules'
         : 'original_root');
 
-    // R15 P2: Zero-throw structural validation of report / proofDagNodes / stateTable / historyTable
-    // BEFORE any canonical projection (.map/.nodeId) or checksum recomputation!
-    const memStructureCheck = validateReportMemoryStructure(report);
+    // R15 P2 + R16 P2: Encoding-mode-aware zero-throw structural validation of
+    // report / proofDagNodes / stateTable / historyTable BEFORE any canonical
+    // projection (.map/.nodeId), serialization, or state replay!
+    const memStructureCheck = validateReportMemoryStructure(
+      report,
+      effectiveEncodingMode
+    );
     if (!memStructureCheck.ok) {
       return {
         encodingMode: effectiveEncodingMode,
@@ -3471,9 +3551,16 @@ export class ProofArtifactManager {
           }
           expectedPos = initialPos.clone();
         } else {
-          if (st.parentStateId < 0 || st.parentStateId >= s) {
+          if (
+            !Number.isInteger(st.parentStateId) ||
+            st.parentStateId < 0 ||
+            st.parentStateId >= s ||
+            !rebuiltPositions[st.parentStateId]
+          ) {
             stateReplayOk = false;
-            stateReplayDetail = `State #${s} 的 parentStateId=${st.parentStateId} 越界或非拓扑前驱`;
+            stateReplayDetail = `State #${s} 的 parentStateId=${String(
+              st.parentStateId
+            )} 越界、缺失或非拓扑前驱`;
             recordFailure('LP-S02');
             break;
           }
@@ -3500,7 +3587,13 @@ export class ProofArtifactManager {
         const expectedZobrist = expectedPos.computeZobristHex();
         const expectedBlack = expectedPos.getBlackCoords();
         const expectedWhite = expectedPos.getWhiteCoords();
-        const claimedHistory = report.historyTable[st.historyId];
+        const claimedHistory =
+          Array.isArray(report.historyTable) &&
+          Number.isInteger(st.historyId) &&
+          st.historyId >= 0 &&
+          st.historyId < report.historyTable.length
+            ? report.historyTable[st.historyId]
+            : undefined;
 
         if (
           st.zobristHex !== expectedZobrist ||
@@ -3624,7 +3717,9 @@ export class ProofArtifactManager {
           if (
             !pos ||
             !stateRow ||
+            !Number.isInteger(node.historyId) ||
             node.historyId < 0 ||
+            !Array.isArray(report.historyTable) ||
             node.historyId >= report.historyTable.length
           ) {
             lpN15AndRoleOk = false;
@@ -3930,6 +4025,14 @@ export class ProofArtifactManager {
         const node = report.proofDagNodes[nid];
         if (!node.isPrunedOutsideRz && !node.isTtHit) continue;
         const queryPos = rebuiltPositions[node.stateId];
+        if (!queryPos) {
+          reuseReplayOk = false;
+          reuseReplayDetail = `复用节点 #${node.nodeId} 指向不存在的 stateId=${String(
+            node.stateId
+          )}`;
+          recordFailure('LP-S02', node.nodeId);
+          break;
+        }
         const ok = this.replaySourceSubgraphOnQueryState(
           queryPos,
           effectiveRegionMask,

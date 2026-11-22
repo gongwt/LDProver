@@ -2991,9 +2991,85 @@ runSection('Section 13: R15 Receipt Cache Consistency & Zero-Throw Damaged-DAG I
   const rep001NullDagRow = cloneReport(rep001);
   (rep001NullDagRow.proofDagNodes as unknown[])[0] = null;
 
+  // R16 §1 (P2): Full-state-table structural dependencies
+  const rep001MissingHistory = cloneReport(rep001);
+  delete (rep001MissingHistory as unknown as Record<string, unknown>).historyTable;
+
+  const rep001MissingParentStateId = cloneReport(rep001);
+  delete (
+    rep001MissingParentStateId.stateTable[1] as unknown as Record<string, unknown>
+  ).parentStateId;
+
+  const rep001MissingHistoryId = cloneReport(rep001);
+  delete (
+    rep001MissingHistoryId.stateTable[0] as unknown as Record<string, unknown>
+  ).historyId;
+
+  const rep001MissingNodeStateId = cloneReport(rep001);
+  delete (
+    rep001MissingNodeStateId.proofDagNodes[0] as unknown as Record<string, unknown>
+  ).stateId;
+
+  // Positive controls: intact full_state_table p001 passes all 4 entrypoints, and compact_dag p001 passes compact mode!
+  const intactDag = checker.verifyProofDag(pos001Orig, ctx001, rep001);
+  const intactRcpt = checker.verifyOriginalRootReceipt({
+    problem: p001,
+    context: ctx001,
+    report: rep001,
+  });
+  const intactMain = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  const intactComp = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001BaStandalone,
+    targetPathMoves: [baMove],
+    targetDagNodeId: rep001BaStandalone.rootDagNodeId,
+    originalRootReport: rep001,
+  });
+
+  const rep001Compact = cloneReport(rep001);
+  delete (rep001Compact as unknown as Record<string, unknown>).stateTable;
+  delete (rep001Compact as unknown as Record<string, unknown>).historyTable;
+  const compactDag = checker.verifyProofDag(pos001Orig, ctx001, rep001Compact, {
+    isCompactDag: true,
+    skipChecksumRecompute: true,
+    encodingMode: 'compact_dag',
+  });
+  const compactFrag = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001Compact,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    intactDag.passed &&
+      intactRcpt.originalRootOutcome === ProofOutcome.ProvenWin &&
+      intactMain.sourceReceipt.passed &&
+      intactMain.originalRootOutcome === ProofOutcome.ProvenWin &&
+      intactComp.sourceReceipt.passed &&
+      intactComp.originalRootOutcome === ProofOutcome.ProvenWin &&
+      compactDag.passed &&
+      compactFrag.sourceReceipt.passed &&
+      compactFrag.sourceReceipt.verificationMode === 'compact_dag' &&
+      compactFrag.originalRootOutcome === ProofOutcome.ProvenWin,
+    'R16 §1 positive controls: intact full_state_table p001 passes all 4 entrypoints and compact_dag p001 (without stateTable/historyTable) passes compact mode',
+    `intact=[${intactDag.passed},${intactRcpt.originalRootOutcome},${intactMain.originalRootOutcome},${intactComp.originalRootOutcome}], compact=[${compactDag.passed},${compactFrag.sourceReceipt.verificationMode},${compactFrag.originalRootOutcome}]`
+  );
+
   for (const [label, damaged] of [
-    ['missing proofDagNodes', rep001MissingDag],
-    ['null proofDagNodes[0]', rep001NullDagRow],
+    ['R15 §2 missing proofDagNodes', rep001MissingDag],
+    ['R15 §2 null proofDagNodes[0]', rep001NullDagRow],
+    ['R16 §1 missing historyTable with non-empty stateTable', rep001MissingHistory],
+    ['R16 §1 missing stateTable[1].parentStateId', rep001MissingParentStateId],
+    ['R16 §1 missing stateTable[0].historyId', rep001MissingHistoryId],
+    ['R16 §1 missing proofDagNodes[0].stateId in full_state_table', rep001MissingNodeStateId],
   ] as const) {
     let threwReceipt = false;
     let threwMain = false;
@@ -3069,7 +3145,7 @@ runSection('Section 13: R15 Receipt Cache Consistency & Zero-Throw Damaged-DAG I
         dagRes !== null &&
         !dagRes.passed &&
         dagRes.errorCode === 'LP-J02',
-      `R15 §2 (P2): p001 with ${label} (intact lproofJson) never throws across all 4 entrypoints, rejects main/receipt/direct with LP-J02, and preserves companion ba SOURCE_VERIFIED`,
+      `${label}: p001 (intact lproofJson) never throws across all 4 entrypoints, rejects main/receipt/direct with LP-J02, and preserves companion ba SOURCE_VERIFIED`,
       `threw=[${threwReceipt},${threwMain},${threwCompanion},${threwDirectDag}], rcpt=${String(rcptRes?.originalRootOutcome)}, main=${mainRes?.sourceReceipt.status}/${mainRes?.sourceReceipt.errorCode}, comp=${compRes?.sourceReceipt.status}/orig=${String(compRes?.originalRootOutcome)}, dag=${dagRes?.errorCode}`
     );
   }
