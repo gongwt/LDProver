@@ -28,6 +28,7 @@ import {
   ProofOutcome,
   PrunedCertificateRecord,
   SearchGoal,
+  SearchPathTraceEvent,
   SolveReport,
   SolverConfig,
   StateTableEntry,
@@ -103,6 +104,7 @@ export class DfpnSolver {
   private stateTable: StateTableEntry[] = [];
   private historyTable: CanonicalSnapshot[][] = [];
   private rootBestMove: number = PASS_MOVE;
+  private tracePathFilterSet: Set<string> | null = null;
 
   constructor(config: SolverConfig) {
     this.config = { ...config };
@@ -148,17 +150,17 @@ export class DfpnSolver {
   }
 
   /**
-   * Public diagnostic accessor for PASS move tactical ordering score parity.
+   * Public diagnostic accessor for actual frontier PASS move tactical score.
+   * Returns 0 when `enableFastCaptureOrdering` is false (matching frontier initialization).
    */
   public evaluatePassMoveScore(
     pos: GoPosition,
     context: ProofContext,
     isOrNode: boolean
   ): number {
+    if (!this.config.enableFastCaptureOrdering) return 0;
     const parentEyeLikeCount =
-      !isOrNode &&
-      pos.consecutivePasses === 0 &&
-      this.config.enableFastCaptureOrdering
+      !isOrNode && pos.consecutivePasses === 0
         ? this.evaluateParentEyeLikeCount(pos, context)
         : 0;
     const emptyTacCtx = this.buildNodeTacticalContext(pos, context);
@@ -216,6 +218,13 @@ export class DfpnSolver {
       ? problem.regionCoords
       : null;
 
+    this.tracePathFilterSet =
+      this.config.onPathTrace &&
+      this.config.tracePathFilters &&
+      this.config.tracePathFilters.length > 0
+        ? new Set(this.config.tracePathFilters)
+        : null;
+
     const rootResult = this.midSearch(
       rootPos,
       context,
@@ -225,7 +234,8 @@ export class DfpnSolver {
       0,
       rootStateId,
       PASS_MOVE,
-      inPathHashes
+      inPathHashes,
+      ''
     );
 
     if (
@@ -1390,7 +1400,8 @@ export class DfpnSolver {
     depth: number,
     currentStateId: number,
     incomingMove: number,
-    inPathHashes: Set<string>
+    inPathHashes: Set<string>,
+    currentPath = ''
   ): {
     pn: number;
     dn: number;
@@ -1401,7 +1412,24 @@ export class DfpnSolver {
     dagNodeId: number;
   } {
     this.numNodes++;
+    const callIndex = this.numNodes;
     const isOrNode = pos.toPlay === context.rootAttacker;
+    const traceThisNode =
+      this.tracePathFilterSet !== null &&
+      this.tracePathFilterSet.has(currentPath);
+    const emitTrace = (
+      ev: Omit<SearchPathTraceEvent, 'callIndex' | 'path' | 'depth' | 'isOrNode'>
+    ): void => {
+      if (traceThisNode && this.config.onPathTrace) {
+        this.config.onPathTrace({
+          ...ev,
+          callIndex: this.numNodes,
+          path: currentPath,
+          depth,
+          isOrNode,
+        });
+      }
+    };
 
     // Step 1 (FR-3.2, FR-3.8): Evaluate Terminal BEFORE InPath cycle detection
     const term = this.terminalEval.evaluateTerminal(pos, context, false);
@@ -1713,6 +1741,41 @@ export class DfpnSolver {
     let finalProofRz = new ProofCertificateRZ();
     let finalDisproofRz = new ProofCertificateRZ();
     let finalDagNodeId = -1;
+    let traceExitReason = 'unknown';
+    let lastWindowSize = children.length;
+
+    if (traceThisNode && this.config.onPathTrace) {
+      let initWindow = children.length;
+      if (this.config.enableProgressiveWidening && frontier.wideningLevel < 6) {
+        const baseK = isOrNode
+          ? Math.min(this.config.wideningBaseK, depth === 0 ? 4 : 3)
+          : Math.min(Math.max(2, Math.floor(this.config.wideningBaseK / 2)), 3);
+        const cap = baseK * Math.pow(2, frontier.wideningLevel);
+        if (cap < children.length) initWindow = cap;
+      }
+      this.config.onPathTrace({
+        kind: 'enter',
+        callIndex,
+        path: currentPath,
+        depth,
+        isOrNode,
+        thPn,
+        thDn,
+        wideningLevel: frontier.wideningLevel,
+        windowSize: initWindow,
+        totalLegal: children.length,
+        topCandidates: children.slice(0, 12).map((c, idx) => ({
+          moveSgf: coordToSgf(c.move, pos.boardSize),
+          rank: idx,
+          tacticalScore: c.tacticalScore,
+          pn: c.pn,
+          dn: c.dn,
+          expanded: c.expanded,
+          prunedOutsideRz: c.prunedOutsideRz,
+          outcome: c.outcome,
+        })),
+      });
+    }
 
     while (true) {
       const totalLegal = children.length;
@@ -1760,6 +1823,18 @@ export class DfpnSolver {
             frontier.representativeOutcome
           )
         ) {
+          if (traceThisNode && playRes.legal) {
+            emitTrace({
+              kind: 'rz_reval_fail',
+              selectedMoveSgf: coordToSgf(ch.move, pos.boardSize),
+              sourceDagNodeId: frontier.representativeDagId,
+              representativeMoveSgf: coordToSgf(
+                frontier.representativeMove,
+                pos.boardSize
+              ),
+              queryZobristHex: nextPos.computeZobristHex(),
+            });
+          }
           return false;
         }
         const qStateId =
@@ -1834,6 +1909,18 @@ export class DfpnSolver {
         ch.dagNodeId = prunedNodeId;
         ch.prunedCert = prunedCert;
         this.prunedOutsideRzCount++;
+        if (traceThisNode) {
+          emitTrace({
+            kind: 'rz_prune',
+            selectedMoveSgf: coordToSgf(ch.move, pos.boardSize),
+            sourceDagNodeId: frontier.representativeDagId,
+            representativeMoveSgf: coordToSgf(
+              frontier.representativeMove,
+              pos.boardSize
+            ),
+            queryZobristHex: nextPos.computeZobristHex(),
+          });
+        }
         return true;
       };
 
@@ -2161,8 +2248,11 @@ export class DfpnSolver {
             subtreeHasCapture
           );
         }
+        traceExitReason = curPn === 0 ? 'proven_win' : 'proven_loss';
         break;
       }
+
+      lastWindowSize = windowSize;
 
       // Threshold cutoff check (FR-4.3: OR condition)
       if (
@@ -2174,6 +2264,15 @@ export class DfpnSolver {
         if (this.isMemoryBudgetExceeded()) {
           this.resourceExhausted = true;
           this.unknownReason = UnknownReason.MemoryBudget;
+          traceExitReason = 'memory_limit';
+        } else if (this.numNodes >= this.config.maxNodes) {
+          traceExitReason = 'node_limit';
+        } else if (curPn >= thPn && curDn >= thDn) {
+          traceExitReason = 'threshold_pn_dn';
+        } else if (curPn >= thPn) {
+          traceExitReason = 'threshold_pn';
+        } else {
+          traceExitReason = 'threshold_dn';
         }
         finalPn = curPn;
         finalDn = curDn;
@@ -2209,6 +2308,16 @@ export class DfpnSolver {
           if (bestIdx < 0 || bestMetric >= widenTrigger) {
             frontier.wideningLevel++;
             this.wideningUpgrades++;
+            if (traceThisNode) {
+              emitTrace({
+                kind: 'widen',
+                wideningLevel: frontier.wideningLevel,
+                windowSize,
+                totalLegal,
+                pn: curPn,
+                dn: curDn,
+              });
+            }
             continue;
           }
           secondBestMetric = Math.min(secondBestMetric, widenTrigger);
@@ -2219,6 +2328,7 @@ export class DfpnSolver {
         finalPn = curPn;
         finalDn = curDn;
         finalOutcome = ProofOutcome.Unknown;
+        traceExitReason = 'saturated';
         if (frontier.anyKoDependent && depth === 0) {
           const koChild = children.find((c) => c.koDependent);
           if (koChild) this.rootBestMove = koChild.move;
@@ -2257,6 +2367,22 @@ export class DfpnSolver {
         childThDn = Math.min(thDn, epsMetricBound);
       }
 
+      if (traceThisNode) {
+        emitTrace({
+          kind: 'select',
+          selectedMoveSgf: coordToSgf(mpc.move, pos.boardSize),
+          selectedRank: bestIdx,
+          pn: mpc.pn,
+          dn: mpc.dn,
+          childThPn,
+          childThDn,
+          wideningLevel: frontier.wideningLevel,
+          windowSize,
+          totalLegal,
+          activeCount: activeIndices.length,
+        });
+      }
+
       const nextPos = pos.clone();
       const playRes = nextPos.playMove(mpc.move);
       if (!playRes.legal) {
@@ -2270,6 +2396,13 @@ export class DfpnSolver {
       }
       mpc.hasCapture = playRes.capturedCoords.length > 0;
 
+      const childPath =
+        this.tracePathFilterSet !== null
+          ? currentPath
+            ? `${currentPath}/${coordToSgf(mpc.move, pos.boardSize)}`
+            : coordToSgf(mpc.move, pos.boardSize)
+          : '';
+
       const subRes = this.midSearch(
         nextPos,
         context,
@@ -2279,7 +2412,8 @@ export class DfpnSolver {
         depth + 1,
         mpc.stateId,
         mpc.move,
-        inPathHashes
+        inPathHashes,
+        childPath
       );
 
       mpc.pn = subRes.pn;
@@ -2322,6 +2456,15 @@ export class DfpnSolver {
         frontier.representativeDagId = mpc.dagNodeId;
         frontier.representativeMove = mpc.move;
         frontier.representativeOutcome = ProofOutcome.ProvenWin;
+        if (traceThisNode) {
+          emitTrace({
+            kind: 'rep_proof',
+            representativeMoveSgf: coordToSgf(mpc.move, pos.boardSize),
+            sourceDagNodeId: mpc.dagNodeId,
+            rzSize: mpc.proofRz.size,
+            outcome: ProofOutcome.ProvenWin,
+          });
+        }
       } else if (
         isOrNode &&
         mpc.move !== PASS_MOVE &&
@@ -2335,10 +2478,42 @@ export class DfpnSolver {
         frontier.representativeDagId = mpc.dagNodeId;
         frontier.representativeMove = mpc.move;
         frontier.representativeOutcome = ProofOutcome.ProvenLoss;
+        if (traceThisNode) {
+          emitTrace({
+            kind: 'rep_proof',
+            representativeMoveSgf: coordToSgf(mpc.move, pos.boardSize),
+            sourceDagNodeId: mpc.dagNodeId,
+            rzSize: mpc.disproofRz.size,
+            outcome: ProofOutcome.ProvenLoss,
+          });
+        }
       }
     }
 
     inPathHashes.delete(zHex);
+
+    if (traceThisNode) {
+      emitTrace({
+        kind: 'return',
+        pn: finalPn,
+        dn: finalDn,
+        outcome: finalOutcome,
+        thPn,
+        thDn,
+        exitReason: traceExitReason,
+        wideningLevel: frontier.wideningLevel,
+        windowSize: lastWindowSize,
+        totalLegal: children.length,
+        sourceDagNodeId:
+          frontier.representativeDagId >= 0
+            ? frontier.representativeDagId
+            : undefined,
+        representativeMoveSgf:
+          frontier.representativeDagId >= 0
+            ? coordToSgf(frontier.representativeMove, pos.boardSize)
+            : undefined,
+      });
+    }
 
     if (depth === 0 && finalOutcome === ProofOutcome.Unknown && children.length > 0) {
       const viable = children.filter(

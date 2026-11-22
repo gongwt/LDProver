@@ -371,9 +371,9 @@ template <int N>
 int32_t DfpnSolver<N>::EvaluatePassMoveScore(const Position<N>& pos,
                                              const ProofContext& context,
                                              bool is_or_node) const {
+  if (!config_.enable_fast_capture_ordering) return 0;
   const int parent_eye_like_count =
-      (!is_or_node && pos.ConsecutivePasses() == 0U &&
-       config_.enable_fast_capture_ordering)
+      (!is_or_node && pos.ConsecutivePasses() == 0U)
           ? EstimateParentEyeLikeCount(pos, context)
           : 0;
   const NodeTacticalContext empty_tctx{};

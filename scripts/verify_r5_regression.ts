@@ -1266,10 +1266,53 @@ runSection('Section 8: R9 §1 Eye-Like Heuristic & AND-Node PASS Score Parity', 
   const okQs = pos31.playMove(sgfToCoord('qs', 19));
   const p31Eye = solverRz.evaluateParentEyeLikeCount(pos31, ctx31);
   const p31Pass = solverRz.evaluatePassMoveScore(pos31, ctx31, false);
+  const solverNoOrder = new DfpnSolver({
+    ...cfgRz,
+    enableFastCaptureOrdering: false,
+  });
+  const p31PassNoOrder = solverNoOrder.evaluatePassMoveScore(pos31, ctx31, false);
   check(
-    okSr && okPass && okQs && p31Eye === 2 && p31Pass === 3850,
-    'R9 §1 p031 after B[sr]->W[pass]->B[qs] yields eyeLike=2 and AND-node PASS score=3850',
-    `ok=${okSr}/${okPass}/${okQs}, eyeLike=${p31Eye}, passScore=${p31Pass}`
+    okSr && okPass && okQs && p31Eye === 2 && p31Pass === 3850 && p31PassNoOrder === 0,
+    'R9/R10 §1 p031 after B[sr]->W[pass]->B[qs] yields eyeLike=2, PASS score=3850 (ordering on) and 0 (ordering off)',
+    `ok=${okSr}/${okPass}/${okQs}, eyeLike=${p31Eye}, passScore=${p31Pass}, passNoOrder=${p31PassNoOrder}`
+  );
+
+  // R10 generic path observer (default off): enabling tracePathFilters must be read-only
+  // and emit enter/select/rep_proof/rz_prune/return events without altering canonicalDagChecksum.
+  const p042 = getSpec('chao_vol1_p042');
+  const rep42Plain = new DfpnSolver(cfgRz).solveProblem(p042);
+  const traceKinds = new Set<string>();
+  let repProofCount = 0;
+  let rzPruneCount = 0;
+  const rep42Traced = new DfpnSolver({
+    ...cfgRz,
+    tracePathFilters: ['rs'],
+    onPathTrace: (ev) => {
+      traceKinds.add(ev.kind);
+      if (ev.kind === 'rep_proof') repProofCount++;
+      if (ev.kind === 'rz_prune') rzPruneCount++;
+    },
+  }).solveProblem(p042);
+  const verPlain = checker.verifySerializedLProofJson(rep42Plain.lproofJson, {
+    problem: p042,
+    scope: 'original_root',
+  });
+  const verTraced = checker.verifySerializedLProofJson(rep42Traced.lproofJson, {
+    problem: p042,
+    scope: 'original_root',
+  });
+  check(
+    rep42Plain.numNodes === rep42Traced.numNodes &&
+      verPlain.passed &&
+      verTraced.passed &&
+      verPlain.canonicalDagChecksum === verTraced.canonicalDagChecksum &&
+      traceKinds.has('enter') &&
+      traceKinds.has('select') &&
+      traceKinds.has('return') &&
+      repProofCount > 0 &&
+      rzPruneCount > 0,
+    'R10 generic path trace observer is read-only (identical nodes & canonicalDagChecksum) and logs enter/select/rep_proof/rz_prune/return on p042 rs',
+    `nodes=${rep42Plain.numNodes}/${rep42Traced.numNodes}, rep=${repProofCount}, prunes=${rzPruneCount}`
   );
 });
 

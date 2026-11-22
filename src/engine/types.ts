@@ -100,6 +100,51 @@ export interface CanonicalSnapshot {
   zobristHex: string;
 }
 
+export interface SearchTraceCandidateSummary {
+  moveSgf: string;
+  rank: number;
+  tacticalScore: number;
+  pn: number;
+  dn: number;
+  expanded: boolean;
+  prunedOutsideRz: boolean;
+  outcome: ProofOutcome;
+}
+
+export interface SearchPathTraceEvent {
+  kind:
+    | 'enter'
+    | 'select'
+    | 'widen'
+    | 'return'
+    | 'rep_proof'
+    | 'rz_prune'
+    | 'rz_reval_fail';
+  callIndex: number;
+  path: string;
+  depth: number;
+  isOrNode: boolean;
+  thPn?: number;
+  thDn?: number;
+  pn?: number;
+  dn?: number;
+  outcome?: ProofOutcome;
+  exitReason?: string;
+  wideningLevel?: number;
+  windowSize?: number;
+  totalLegal?: number;
+  activeCount?: number;
+  selectedMoveSgf?: string;
+  selectedRank?: number;
+  childThPn?: number;
+  childThDn?: number;
+  sourceDagNodeId?: number;
+  representativeMoveSgf?: string;
+  rzSize?: number;
+  queryZobristHex?: string;
+  topCandidates?: SearchTraceCandidateSummary[];
+}
+
 export interface SolverConfig {
   maxNodes: number;
   maxDepth: number;
@@ -114,6 +159,10 @@ export interface SolverConfig {
   attackerAllowKo: boolean;
   defenderAllowKo: boolean;
   useProblemDefaultKo?: boolean;
+  /** Default-off generic path observer filters (e.g. ["", "rr", "rr/rp"]). */
+  tracePathFilters?: string[];
+  /** Default-off read-only callback receiving path trace events when tracePathFilters matches. */
+  onPathTrace?: (event: SearchPathTraceEvent) => void;
 }
 
 export interface PrunedCertificateRecord {

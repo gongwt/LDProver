@@ -747,10 +747,17 @@ void TestSection6RealProblemSolverBreakthrough() {
         DfpnSolver<19>::EstimateParentEyeLikeCount(p31_pos, p031.proof_context);
     const int32_t p31_pass =
         solver.EvaluatePassMoveScore(p31_pos, p031.proof_context, false);
-    Check(ok_sr && ok_pass && ok_qs && p31_eye == 2 && p31_pass == 3850,
-          "R9 §1 p031 after B[sr]->W[pass]->B[qs] yields eyeLike=2 and AND-node PASS score=3850",
+    SolverConfig no_order_cfg = real_cfg;
+    no_order_cfg.enable_fast_capture_ordering = false;
+    DfpnSolver<19> solver_no_order(no_order_cfg);
+    const int32_t p31_pass_no_order =
+        solver_no_order.EvaluatePassMoveScore(p31_pos, p031.proof_context, false);
+    Check(ok_sr && ok_pass && ok_qs && p31_eye == 2 && p31_pass == 3850 &&
+              p31_pass_no_order == 0,
+          "R9/R10 §1 p031 after B[sr]->W[pass]->B[qs] yields eyeLike=2, PASS score=3850 (ordering on) and 0 (ordering off)",
           "eyeLike=" + std::to_string(p31_eye) +
-              ", passScore=" + std::to_string(p31_pass));
+              ", passScore=" + std::to_string(p31_pass) +
+              ", passNoOrder=" + std::to_string(p31_pass_no_order));
   }
 }
 
