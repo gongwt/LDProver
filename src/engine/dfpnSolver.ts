@@ -18,6 +18,7 @@ import {
 } from './relevanceZone';
 import { TranspositionStore } from './transpositionTable';
 import {
+  BranchCoverageObligation,
   BranchCoverageSnapshot,
   BranchMoveCoverageEntry,
   BranchMoveCoverageStatus,
@@ -2749,9 +2750,25 @@ export class DfpnSolver {
 
       const depth = movesFromRoot.length;
       const isOrNode = toPlay === context.rootAttacker;
+      const nodeRole: 'OR_ATTACKER' | 'AND_DEFENDER' = isOrNode
+        ? 'OR_ATTACKER'
+        : 'AND_DEFENDER';
       const obligation: 'EXISTENTIAL_OR' | 'UNIVERSAL_AND' = isOrNode
         ? 'EXISTENTIAL_OR'
         : 'UNIVERSAL_AND';
+      const computeCoverageObligation = (
+        outcome: ProofOutcome
+      ): BranchCoverageObligation => {
+        if (outcome === ProofOutcome.ProvenWin) {
+          return isOrNode ? 'SINGLE_WITNESS' : 'FULL_COVERAGE';
+        }
+        if (outcome === ProofOutcome.ProvenLoss) {
+          return isOrNode ? 'FULL_COVERAGE' : 'SINGLE_WITNESS';
+        }
+        return isOrNode
+          ? 'UNDECIDED_OR_WIN_SINGLE_LOSS_ALL'
+          : 'UNDECIDED_AND_WIN_ALL_LOSS_SINGLE';
+      };
       const frontier = stateId >= 0 ? this.nodeFrontierCache.get(stateId) : undefined;
 
       if (!frontier) {
@@ -2760,17 +2777,20 @@ export class DfpnSolver {
           dagId >= 0 && dagId < this.proofDagNodes.length
             ? this.proofDagNodes[dagId]
             : undefined;
+        const leafOutcome = slotFallback?.outcome ?? ProofOutcome.Unknown;
         return {
           path,
           movesFromRoot: movesFromRoot.slice(),
           movesFromRootSgf: movesFromRootSgf.slice(),
           depth,
           isOrNode,
+          nodeRole,
+          coverageObligation: computeCoverageObligation(leafOutcome),
           obligation,
           toPlay,
           runSource,
           rootOutcome: rootResult.outcome,
-          nodeOutcome: slotFallback?.outcome ?? ProofOutcome.Unknown,
+          nodeOutcome: leafOutcome,
           nodeDagNodeId: dagId,
           terminalEvidence: dagNode?.terminalEvidence ?? 'UNEXPANDED_OR_TERMINAL',
           lastPn: slotFallback?.pn ?? 1,
@@ -2876,6 +2896,8 @@ export class DfpnSolver {
         movesFromRootSgf: movesFromRootSgf.slice(),
         depth,
         isOrNode,
+        nodeRole,
+        coverageObligation: computeCoverageObligation(frontier.nodeOutcome),
         obligation,
         toPlay,
         runSource,

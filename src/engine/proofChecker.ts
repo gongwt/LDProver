@@ -1812,13 +1812,25 @@ export class ProofArtifactManager {
       replayedPruned: number;
       replayedTt: number;
     },
-    recordFailure: (code: string, nid: number | null) => void
+    recordFailure: (code: string, nid: number | null) => void,
+    onVisitNode?: (
+      node: ProofDagNode,
+      pos: GoPosition,
+      parentNode: ProofDagNode | null,
+      incomingMoveFromParent: number | null
+    ) => { ok: boolean; code: string; detail: string },
+    parentNode: ProofDagNode | null = null,
+    incomingMoveFromParent: number | null = null
   ): { ok: boolean; detail: string } {
     if (depth > 256 || nodeId < 0 || nodeId >= report.proofDagNodes.length) {
       recordFailure('LP-S01', nodeId);
       return { ok: false, detail: `DAG 递归超深或节点 #${nodeId} 越界` };
     }
     const node = report.proofDagNodes[nodeId];
+    if (!node || node.nodeId !== nodeId) {
+      recordFailure('LP-N01', nodeId);
+      return { ok: false, detail: `DAG 节点 #${nodeId} 缺失或 nodeId 不匹配` };
+    }
     stats.verifiedStates++;
 
     const expectedIsOr = pos.toPlay === context.rootAttacker;
@@ -1828,6 +1840,27 @@ export class ProofArtifactManager {
         ok: false,
         detail: `节点 #${nodeId} 轮次/AND-OR 角色与真实可达局面冲突`,
       };
+    }
+
+    if (
+      (node.outcome === ProofOutcome.ProvenWin &&
+        (node.pn !== 0 || node.dn < PN_DN_SATURATION)) ||
+      (node.outcome === ProofOutcome.ProvenLoss &&
+        (node.dn !== 0 || node.pn < PN_DN_SATURATION))
+    ) {
+      recordFailure('LP-N15', nodeId);
+      return {
+        ok: false,
+        detail: `节点 #${nodeId} 的 PN/DN (${node.pn}/${node.dn}) 与结论 ${node.outcome} 不一致`,
+      };
+    }
+
+    if (onVisitNode) {
+      const bindRes = onVisitNode(node, pos, parentNode, incomingMoveFromParent);
+      if (!bindRes.ok) {
+        recordFailure(bindRes.code, nodeId);
+        return { ok: false, detail: bindRes.detail };
+      }
     }
 
     if (node.isPrunedOutsideRz || node.isTtHit) {
@@ -1896,6 +1929,13 @@ export class ProofArtifactManager {
     for (let k = 0; k < node.childMoves.length; k++) {
       const mv = node.childMoves[k];
       const cid = node.childNodeIds[k];
+      if (!Number.isInteger(cid) || cid < 0 || cid >= node.nodeId) {
+        recordFailure('LP-T02', nodeId);
+        return {
+          ok: false,
+          detail: `内部节点 #${nodeId} 的子节点索引 #${cid} 越界或违反后序拓扑约束 (child_id < node_id)`,
+        };
+      }
       if (moveToEdge.has(mv)) {
         recordFailure('LP-N11', nodeId);
         return { ok: false, detail: `内部节点 #${nodeId} 存在重复着法边 move=${mv}` };
@@ -1931,7 +1971,7 @@ export class ProofArtifactManager {
       (!node.isOrNode && node.outcome === ProofOutcome.ProvenLoss);
 
     if (existentialMode) {
-      for (const [, edge] of moveToEdge) {
+      for (const [mv, edge] of moveToEdge) {
         const chNode = report.proofDagNodes[edge.cid];
         if (!chNode || chNode.outcome !== node.outcome) continue;
         if (edge.isKoCapture && restrictedSide) continue;
@@ -1945,7 +1985,10 @@ export class ProofArtifactManager {
           independentTerminal,
           depth + 1,
           stats,
-          recordFailure
+          recordFailure,
+          onVisitNode,
+          node,
+          mv
         );
         if (sub.ok) return { ok: true, detail: '' };
         return sub;
@@ -1989,7 +2032,10 @@ export class ProofArtifactManager {
         independentTerminal,
         depth + 1,
         stats,
-        recordFailure
+        recordFailure,
+        onVisitNode,
+        node,
+        lm
       );
       if (!sub.ok) return sub;
     }
@@ -3239,13 +3285,19 @@ export class ProofArtifactManager {
   }
 
   /**
-   * R11 §2.3: Independent sub-proof fragment verifier for a specific DAG node captured inside
-   * a SolveReport (including UNKNOWN original-root runs). Reconstructs authentic board/history
-   * from the original problem contract along `targetPathMoves`, verifies the target DAG node's
-   * complete closure via `verifyCompactDagRecursive`, and optionally verifies semantic replay
-   * of that same source fragment on a distinct `queryPathMoves` position + history.
+   * R11/R12: Independent sub-proof fragment verifier for a specific DAG node captured inside
+   * a SolveReport (including UNKNOWN original-root runs and standalone subposition runs).
    *
-   * Never mutates `rootDagNodeId` and never marks an UNKNOWN original root as PASS.
+   * Enforces:
+   * 1. Problem-intrinsic contract binding (goal, attacker/defender role, crucial stones/op, board,
+   *    walls, region) plus runtime config parity against the report's bound lproof/1 contract.
+   * 2. Authentic runSource & runStartMoves derivation from the report's verified starting state and
+   *    arrival trace, strictly separating `runRootOutcome` from `originalRootOutcome` (which is
+   *    `null` for standalone subposition runs unless an authentic original-root report is supplied).
+   * 3. Full stateTable/historyTable index, cross-table, descendant, and TT/RZ source binding when
+   *    full tables are present (`verificationMode: 'full_state_table'`), plus explicit distinction
+   *    between unclosed sentinel (`targetDagNodeId === -1` -> `UNCLOSED / LP-U01`) and corrupted
+   *    out-of-bounds positive indices (`VERIFICATION_FAILED / LP-N01`).
    */
   public verifySubproofFragment(params: {
     problem: TsumegoProblemSpec;
@@ -3255,6 +3307,7 @@ export class ProofArtifactManager {
     targetDagNodeId: number;
     queryPathMoves?: number[];
     runSource?: 'original_root' | 'standalone_subposition';
+    originalRootReport?: SolveReport;
   }): SubproofFragmentVerificationResult {
     const {
       problem,
@@ -3263,16 +3316,27 @@ export class ProofArtifactManager {
       targetDagNodeId,
       queryPathMoves,
     } = params;
-    const runSource = params.runSource ?? 'original_root';
-    const context =
-      params.context ??
-      deriveDefaultProofContextFromProblem(problem, KoRule.SituationalSuperko);
+    const hasFullTables =
+      Array.isArray(report.stateTable) && report.stateTable.length > 0;
+    const verificationMode: LProofEncodingMode = hasFullTables
+      ? 'full_state_table'
+      : 'compact_dag';
+
     const targetPathSgf = targetPathMoves.map((mv) =>
       coordToSgf(mv, problem.boardSize)
     );
     const queryPathSgf = (queryPathMoves ?? []).map((mv) =>
       coordToSgf(mv, problem.boardSize)
     );
+
+    let derivedRunSource: 'original_root' | 'standalone_subposition' =
+      params.runSource ??
+      report.branchCoverageSnapshots?.[0]?.runSource ??
+      'standalone_subposition';
+    let runStartMoves: number[] = [];
+    let runStartPathSgf: string[] = [];
+    let originalRootOutcome: ProofOutcome | null = null;
+
     const notRequestedQuery: SubproofQueryReplayReceipt = {
       status: 'NOT_REQUESTED',
       passed: false,
@@ -3290,14 +3354,17 @@ export class ProofArtifactManager {
       failedNodeId: number | null = null,
       outcome: ProofOutcome = ProofOutcome.Unknown
     ): SubproofFragmentVerificationResult => ({
-      runSource,
-      originalRootOutcome: report.rootStatus,
+      runSource: derivedRunSource,
+      runStartPathSgf,
+      runRootOutcome: report.rootStatus,
+      originalRootOutcome,
       sourceReceipt: {
         status,
         passed: false,
         errorCode,
         message,
         scope: 'subproof_fragment',
+        verificationMode,
         targetPathSgf,
         targetDagNodeId,
         outcome,
@@ -3321,7 +3388,7 @@ export class ProofArtifactManager {
         : notRequestedQuery,
     });
 
-    // Validate region contract consistency first (R8 §3)
+    // 1. Validate region contract consistency first (R8 §3)
     if (
       problem.hasRegionHint !== undefined &&
       typeof problem.hasRegionHint !== 'boolean'
@@ -3351,36 +3418,68 @@ export class ProofArtifactManager {
       ? new Set<number>(problem.regionCoords)
       : null;
 
+    // 2. R12 §2: Derive problem-intrinsic context independently and reject goal/role/token conflicts
+    const canonicalProbCtx = deriveDefaultProofContextFromProblem(
+      problem,
+      params.context?.koRule ?? KoRule.SituationalSuperko
+    );
+    const sameTokens = (
+      a: ProofContext['initialTokens'],
+      b: ProofContext['initialTokens']
+    ): boolean =>
+      a.length === b.length &&
+      a.every(
+        (t, idx) =>
+          t.initialCoord === b[idx].initialCoord &&
+          t.stoneColor === b[idx].stoneColor &&
+          t.groupIndex === b[idx].groupIndex
+      );
+
+    if (params.context) {
+      const pc = params.context;
+      if (
+        pc.rootAttacker !== canonicalProbCtx.rootAttacker ||
+        pc.attackerGoal !== canonicalProbCtx.attackerGoal ||
+        pc.crucialStoneOp !== canonicalProbCtx.crucialStoneOp ||
+        !sameTokens(pc.initialTokens, canonicalProbCtx.initialTokens)
+      ) {
+        return makeSourceFail(
+          'VERIFICATION_FAILED',
+          'LP-P01',
+          `传入上下文与原题 "${problem.id}" 的攻防角色/目标 (${canonicalProbCtx.attackerGoal}) 或关键子令牌契约冲突。`
+        );
+      }
+    }
+    const context: ProofContext = params.context ?? canonicalProbCtx;
+
+    // 3. Validate report board/wall/region & bound lproof/1 contract + derive authentic runSource (R12 §2, §4)
+    const expWall = sortedUniqueNumbers(problem.immortalWallCoords);
+    const repWall = sortedUniqueNumbers(report.immortalWallCoords ?? []);
+    const expRegion = hasRegionHint
+      ? sortedUniqueNumbers(problem.regionCoords)
+      : [];
+    const repHasRegion =
+      report.hasRegionHint !== undefined
+        ? report.hasRegionHint
+        : (report.regionCoords?.length ?? 0) > 0;
+    const repRegion = repHasRegion
+      ? sortedUniqueNumbers(report.regionCoords ?? [])
+      : [];
+
     if (
-      targetDagNodeId < 0 ||
-      targetDagNodeId >= report.proofDagNodes.length
+      report.boardSize !== problem.boardSize ||
+      !numberArraysEqual(repWall, expWall) ||
+      repHasRegion !== hasRegionHint ||
+      !numberArraysEqual(repRegion, expRegion)
     ) {
       return makeSourceFail(
-        'UNCLOSED',
-        'LP-U01',
-        '该路径在当前运行产物中未形成已闭合的 DAG 片段。',
-        null,
-        ProofOutcome.Unknown
+        'VERIFICATION_FAILED',
+        'LP-P01',
+        `报告产物的棋盘尺寸/围墙/区域声明与原题 "${problem.id}" 不一致。`
       );
     }
 
-    const targetNode = report.proofDagNodes[targetDagNodeId];
-    if (
-      !targetNode ||
-      targetNode.outcome === ProofOutcome.Unknown
-    ) {
-      return makeSourceFail(
-        'UNCLOSED',
-        'LP-U01',
-        `节点 #${targetDagNodeId} 尚未闭合为胜/负证明片段。`,
-        targetDagNodeId,
-        ProofOutcome.Unknown
-      );
-    }
-
-    const replayPathFromOriginalRoot = (
-      moves: number[]
-    ): { ok: true; pos: GoPosition } | { ok: false; code: string; detail: string } => {
+    const buildOriginalRootPos = (): GoPosition => {
       const pos = new GoPosition(
         context,
         problem.boardSize,
@@ -3393,12 +3492,21 @@ export class ProofArtifactManager {
         problem.whiteInitialCoords,
         firstToPlay
       );
+      return pos;
+    };
+
+    const replayPathFromOriginalRoot = (
+      moves: number[],
+      enforceRegionAndKo = true
+    ): { ok: true; pos: GoPosition } | { ok: false; code: string; detail: string } => {
+      const pos = buildOriginalRootPos();
       for (let i = 0; i < moves.length; i++) {
         const mv = moves[i];
         const restrictedSide =
           (pos.toPlay === context.rootAttacker && !context.attackerAllowKo) ||
           (pos.toPlay !== context.rootAttacker && !context.defenderAllowKo);
         if (
+          enforceRegionAndKo &&
           mv !== PASS_MOVE &&
           allowedRegionSet !== null &&
           !allowedRegionSet.has(mv)
@@ -3417,7 +3525,7 @@ export class ProofArtifactManager {
             detail: `路径第 ${i + 1} 手 ${coordToSgf(mv, problem.boardSize)} 非法`,
           };
         }
-        if (playRes.isKoCapture && restrictedSide) {
+        if (enforceRegionAndKo && playRes.isKoCapture && restrictedSide) {
           return {
             ok: false,
             code: 'LP-S12',
@@ -3428,7 +3536,286 @@ export class ProofArtifactManager {
       return { ok: true, pos };
     };
 
-    const targetReplay = replayPathFromOriginalRoot(targetPathMoves);
+    const origPos = buildOriginalRootPos();
+    const expOrigBlack = origPos.getBlackCoords();
+    const expOrigWhite = origPos.getWhiteCoords();
+    const expOrigTurn = origPos.toPlay;
+    const repStartBlack = sortedUniqueNumbers(report.blackInitialCoords ?? []);
+    const repStartWhite = sortedUniqueNumbers(report.whiteInitialCoords ?? []);
+
+    let parsedLproof: Record<string, unknown> | null = null;
+    if (typeof report.lproofJson === 'string' && report.lproofJson.trim().length > 0) {
+      try {
+        const obj = JSON.parse(report.lproofJson);
+        if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+          parsedLproof = obj as Record<string, unknown>;
+        }
+      } catch {
+        return makeSourceFail(
+          'VERIFICATION_FAILED',
+          'LP-J01',
+          '报告内嵌的 lproofJson 无法解析为合法 JSON。'
+        );
+      }
+    }
+
+    if (parsedLproof) {
+      // Bind lproof.context against effective context (catching both goal and ko/rule mismatches)
+      const lpCtx = parsedLproof.context as Record<string, unknown> | undefined;
+      if (lpCtx && typeof lpCtx === 'object') {
+        const lpAttacker = decodeColor(lpCtx.rootAttacker);
+        const lpGoal = lpCtx.attackerGoal;
+        const lpOp = lpCtx.crucialStoneOp;
+        const lpKoRule = lpCtx.koRule;
+        const lpAttKo = lpCtx.attackerAllowKo;
+        const lpDefKo = lpCtx.defenderAllowKo;
+        const lpTokens = Array.isArray(lpCtx.initialTokens)
+          ? (lpCtx.initialTokens as Record<string, unknown>[])
+          : null;
+        const tokensEqual =
+          lpTokens !== null &&
+          lpTokens.length === context.initialTokens.length &&
+          lpTokens.every((t, idx) => {
+            const c = decodeColor(t.stoneColor);
+            return (
+              t.initialCoord === context.initialTokens[idx].initialCoord &&
+              c === context.initialTokens[idx].stoneColor &&
+              t.groupIndex === context.initialTokens[idx].groupIndex
+            );
+          });
+        if (
+          lpAttacker !== context.rootAttacker ||
+          lpGoal !== context.attackerGoal ||
+          lpOp !== context.crucialStoneOp ||
+          lpKoRule !== context.koRule ||
+          lpAttKo !== context.attackerAllowKo ||
+          lpDefKo !== context.defenderAllowKo ||
+          !tokensEqual
+        ) {
+          return makeSourceFail(
+            'VERIFICATION_FAILED',
+            'LP-P01',
+            '报告已绑定的 lproof/1 契约上下文（攻防目标/关键子/劫规则/劫权）与当前待验命题及运行配置不一致。'
+          );
+        }
+      }
+
+      const lpSetup = parsedLproof.problemSetup as
+        | Record<string, unknown>
+        | undefined;
+      if (lpSetup && typeof lpSetup === 'object') {
+        const rootKind = lpSetup.rootKind;
+        if (rootKind === 'traced_subposition') {
+          const originTurn = decodeColor(lpSetup.originFirstToPlay);
+          if (
+            originTurn === null ||
+            !isIntegerArray(lpSetup.originBlackCoords) ||
+            !isIntegerArray(lpSetup.originWhiteCoords) ||
+            !isIntegerArray(lpSetup.initialTraceMoves) ||
+            lpSetup.initialTraceMoves.length === 0
+          ) {
+            return makeSourceFail(
+              'VERIFICATION_FAILED',
+              'LP-J02',
+              '独立子局面产物缺少合法的 originBlackCoords / originWhiteCoords / originFirstToPlay / initialTraceMoves。'
+            );
+          }
+          if (
+            originTurn !== expOrigTurn ||
+            !numberArraysEqual(
+              sortedUniqueNumbers(lpSetup.originBlackCoords),
+              expOrigBlack
+            ) ||
+            !numberArraysEqual(
+              sortedUniqueNumbers(lpSetup.originWhiteCoords),
+              expOrigWhite
+            )
+          ) {
+            return makeSourceFail(
+              'VERIFICATION_FAILED',
+              'LP-P01',
+              `独立子局面产物的原根起点与待验原题 "${problem.id}" 不一致。`
+            );
+          }
+          runStartMoves = lpSetup.initialTraceMoves.slice();
+          runStartPathSgf = runStartMoves.map((mv) =>
+            coordToSgf(mv, problem.boardSize)
+          );
+          derivedRunSource = 'standalone_subposition';
+        } else {
+          if (
+            lpSetup.initialTraceMoves !== undefined &&
+            (!isIntegerArray(lpSetup.initialTraceMoves) ||
+              lpSetup.initialTraceMoves.length > 0)
+          ) {
+            return makeSourceFail(
+              'VERIFICATION_FAILED',
+              'LP-P02',
+              '产物声称 rootKind="initial" 却携带非空 initialTraceMoves。'
+            );
+          }
+          const lpFirst = decodeColor(lpSetup.firstToPlay);
+          if (
+            lpFirst !== expOrigTurn ||
+            !isIntegerArray(lpSetup.blackInitialCoords) ||
+            !isIntegerArray(lpSetup.whiteInitialCoords) ||
+            !numberArraysEqual(
+              sortedUniqueNumbers(lpSetup.blackInitialCoords),
+              expOrigBlack
+            ) ||
+            !numberArraysEqual(
+              sortedUniqueNumbers(lpSetup.whiteInitialCoords),
+              expOrigWhite
+            )
+          ) {
+            return makeSourceFail(
+              'VERIFICATION_FAILED',
+              'LP-P01',
+              `产物初始局面与待验原题 "${problem.id}" 不一致。`
+            );
+          }
+          runStartMoves = [];
+          runStartPathSgf = [];
+          derivedRunSource = 'original_root';
+        }
+      }
+    } else {
+      // No embedded lproofJson: derive strictly by comparing report's starting position to problem root
+      const matchesOrigRoot =
+        report.firstToPlay === expOrigTurn &&
+        numberArraysEqual(repStartBlack, expOrigBlack) &&
+        numberArraysEqual(repStartWhite, expOrigWhite) &&
+        report.inputHash === origPos.computeZobristHex() &&
+        report.branchCoverageSnapshots?.[0]?.runSource !==
+          'standalone_subposition';
+      if (!matchesOrigRoot) {
+        return makeSourceFail(
+          'VERIFICATION_FAILED',
+          'LP-P01',
+          '报告起点与原题初始局面不一致，且缺少可核验的 lproofJson 到达轨迹。'
+        );
+      }
+      runStartMoves = [];
+      runStartPathSgf = [];
+      derivedRunSource = 'original_root';
+    }
+
+    // Verify replayed runStartPos matches report's starting board/toPlay/inputHash
+    const runStartReplay = replayPathFromOriginalRoot(runStartMoves, false);
+    if (!runStartReplay.ok) {
+      return makeSourceFail(
+        'VERIFICATION_FAILED',
+        runStartReplay.code,
+        `运行起点轨迹独立重放失败：${runStartReplay.detail}`
+      );
+    }
+    const runStartPos = runStartReplay.pos;
+    if (
+      report.firstToPlay !== runStartPos.toPlay ||
+      !numberArraysEqual(repStartBlack, runStartPos.getBlackCoords()) ||
+      !numberArraysEqual(repStartWhite, runStartPos.getWhiteCoords()) ||
+      report.inputHash !== runStartPos.computeZobristHex()
+    ) {
+      return makeSourceFail(
+        'VERIFICATION_FAILED',
+        'LP-S02',
+        '运行起点重放盘面与报告声明的起始棋面/先手/inputHash 不一致。'
+      );
+    }
+
+    // Compute originalRootOutcome strictly (NEVER upgrade from standalone subposition win!)
+    if (derivedRunSource === 'original_root') {
+      originalRootOutcome = report.rootStatus;
+    } else if (params.originalRootReport) {
+      const orr = params.originalRootReport;
+      const orrMatchesOrig =
+        orr.boardSize === problem.boardSize &&
+        orr.firstToPlay === expOrigTurn &&
+        numberArraysEqual(
+          sortedUniqueNumbers(orr.blackInitialCoords ?? []),
+          expOrigBlack
+        ) &&
+        numberArraysEqual(
+          sortedUniqueNumbers(orr.whiteInitialCoords ?? []),
+          expOrigWhite
+        ) &&
+        orr.inputHash === origPos.computeZobristHex();
+      originalRootOutcome = orrMatchesOrig ? orr.rootStatus : null;
+    } else {
+      originalRootOutcome = null;
+    }
+
+    // Reject contradictory caller-supplied runSource (R12 §4)
+    if (
+      params.runSource !== undefined &&
+      params.runSource !== derivedRunSource
+    ) {
+      return makeSourceFail(
+        'VERIFICATION_FAILED',
+        'LP-P02',
+        `调用方声明的 runSource="${params.runSource}" 与产物实际运行来源 "${derivedRunSource}" 矛盾。`
+      );
+    }
+
+    // Verify targetPathMoves belongs to this run's starting trajectory (R12 §4)
+    if (derivedRunSource === 'standalone_subposition') {
+      const prefixOk =
+        targetPathMoves.length >= runStartMoves.length &&
+        runStartMoves.every((mv, idx) => targetPathMoves[idx] === mv);
+      if (!prefixOk) {
+        return makeSourceFail(
+          'VERIFICATION_FAILED',
+          'LP-P02',
+          `目标路径 [${targetPathSgf.join('/') || 'root'}] 不以当前独立子局面运行起点 [${runStartPathSgf.join('/')}] 为前缀。`
+        );
+      }
+    }
+
+    // 4. R12 §3: Distinguish unclosed sentinel (-1) from corrupted out-of-bounds positive/invalid DAG node IDs
+    if (targetDagNodeId === -1) {
+      return makeSourceFail(
+        'UNCLOSED',
+        'LP-U01',
+        '该路径在当前运行产物中未形成已闭合的 DAG 片段（sentinel=-1）。',
+        null,
+        ProofOutcome.Unknown
+      );
+    }
+    if (
+      !Number.isInteger(targetDagNodeId) ||
+      targetDagNodeId < -1 ||
+      targetDagNodeId >= report.proofDagNodes.length
+    ) {
+      return makeSourceFail(
+        'VERIFICATION_FAILED',
+        'LP-N01',
+        `目标节点索引 #${targetDagNodeId} 越界或非法（当前 DAG 节点总数 ${report.proofDagNodes.length}）。`,
+        targetDagNodeId,
+        ProofOutcome.Unknown
+      );
+    }
+
+    const targetNode = report.proofDagNodes[targetDagNodeId];
+    if (!targetNode || targetNode.nodeId !== targetDagNodeId) {
+      return makeSourceFail(
+        'VERIFICATION_FAILED',
+        'LP-N01',
+        `目标节点 #${targetDagNodeId} 缺失或 nodeId 字段不一致。`,
+        targetDagNodeId,
+        ProofOutcome.Unknown
+      );
+    }
+    if (targetNode.outcome === ProofOutcome.Unknown) {
+      return makeSourceFail(
+        'UNCLOSED',
+        'LP-U01',
+        `节点 #${targetDagNodeId} 尚未闭合为胜/负证明片段。`,
+        targetDagNodeId,
+        ProofOutcome.Unknown
+      );
+    }
+
+    const targetReplay = replayPathFromOriginalRoot(targetPathMoves, true);
     if (!targetReplay.ok) {
       return makeSourceFail(
         'VERIFICATION_FAILED',
@@ -3440,61 +3827,374 @@ export class ProofArtifactManager {
     }
     const targetPos = targetReplay.pos;
 
-    // Bind targetNode's recorded state & history (when present in full state table)
-    if (
-      report.stateTable &&
-      targetNode.stateId >= 0 &&
-      targetNode.stateId < report.stateTable.length
-    ) {
-      const st = report.stateTable[targetNode.stateId];
-      const expectedBlack = targetPos.getBlackCoords();
-      const expectedWhite = targetPos.getWhiteCoords();
-      const sameArr = (a: number[], b: number[]) =>
-        a.length === b.length && a.every((v, idx) => v === b[idx]);
-      if (
-        !st ||
-        st.toPlay !== targetPos.toPlay ||
-        st.koPoint !== targetPos.koPoint ||
-        st.consecutivePasses !== targetPos.consecutivePasses ||
-        st.survivingTokensMask !== targetPos.survivingTargetTokensMask ||
-        !sameArr(st.blackCoords, expectedBlack) ||
-        !sameArr(st.whiteCoords, expectedWhite)
-      ) {
+    // 5. R12 §3: Strict full-table verification (indices, cross-table links, descendants, TT/RZ sources)
+    if (hasFullTables) {
+      if (!Array.isArray(report.historyTable) || report.historyTable.length === 0) {
         return makeSourceFail(
           'VERIFICATION_FAILED',
-          'LP-N10',
-          `片段节点 #${targetDagNodeId} 的状态表记录与原题路径重放盘面不匹配`,
+          'LP-S02',
+          'full_state_table 模式下缺失有效 historyTable。',
           targetDagNodeId,
           targetNode.outcome
         );
       }
+      // Verify stateTable[0] matches runStartPos
+      const rootSt = report.stateTable[0];
       if (
-        report.historyTable &&
-        targetNode.historyId >= 0 &&
-        targetNode.historyId < report.historyTable.length
+        !rootSt ||
+        rootSt.stateId !== 0 ||
+        rootSt.parentStateId !== -1 ||
+        !Number.isInteger(rootSt.historyId) ||
+        rootSt.historyId < 0 ||
+        rootSt.historyId >= report.historyTable.length ||
+        rootSt.toPlay !== runStartPos.toPlay ||
+        rootSt.koPoint !== runStartPos.koPoint ||
+        rootSt.consecutivePasses !== runStartPos.consecutivePasses ||
+        rootSt.survivingTokensMask !== runStartPos.survivingTargetTokensMask ||
+        rootSt.zobristHex !== runStartPos.computeZobristHex() ||
+        !numberArraysEqual(rootSt.blackCoords, runStartPos.getBlackCoords()) ||
+        !numberArraysEqual(rootSt.whiteCoords, runStartPos.getWhiteCoords()) ||
+        !historyTablesMatch(
+          report.historyTable[rootSt.historyId],
+          runStartPos.historySnapshots
+        )
       ) {
-        const recHist = report.historyTable[targetNode.historyId];
-        const expHist = targetPos.historySnapshots;
-        const histMatch =
-          recHist.length === expHist.length &&
-          recHist.every(
-            (h, idx) =>
-              h.toPlay === expHist[idx].toPlay &&
-              h.zobristHex === expHist[idx].zobristHex &&
-              sameArr(h.blackCoords, expHist[idx].blackCoords) &&
-              sameArr(h.whiteCoords, expHist[idx].whiteCoords)
-          );
-        if (!histMatch) {
-          return makeSourceFail(
-            'VERIFICATION_FAILED',
-            'LP-S02',
-            `片段节点 #${targetDagNodeId} 的历史快照序列（len=${recHist.length}）与真实重放历史（len=${expHist.length}）不一致`,
-            targetDagNodeId,
-            targetNode.outcome
-          );
-        }
+        return makeSourceFail(
+          'VERIFICATION_FAILED',
+          'LP-S02',
+          'stateTable[0] 或其历史快照与运行起点真实重放局面不一致。',
+          targetDagNodeId,
+          targetNode.outcome
+        );
       }
     }
+
+    const verifiedSourceTableIds = new Set<number>();
+
+    const reconstructPosFromStateTable = (
+      stateId: number
+    ): { ok: true; pos: GoPosition } | { ok: false; code: string; detail: string } => {
+      const chain: number[] = [];
+      const visited = new Set<number>();
+      let cur = stateId;
+      while (cur >= 0) {
+        if (
+          !Number.isInteger(cur) ||
+          cur < 0 ||
+          cur >= report.stateTable.length ||
+          visited.has(cur)
+        ) {
+          return {
+            ok: false,
+            code: 'LP-S10',
+            detail: `状态表祖先链在 stateId=${cur} 处越界或存在环`,
+          };
+        }
+        visited.add(cur);
+        const row = report.stateTable[cur];
+        if (!row || row.stateId !== cur) {
+          return {
+            ok: false,
+            code: 'LP-S10',
+            detail: `stateTable[${cur}] 缺失或 stateId 不一致`,
+          };
+        }
+        chain.push(cur);
+        if (cur === 0) break;
+        cur = row.parentStateId;
+      }
+      if (chain[chain.length - 1] !== 0) {
+        return {
+          ok: false,
+          code: 'LP-S10',
+          detail: `stateId=${stateId} 的祖先链未回溯到根状态 stateId=0`,
+        };
+      }
+      const p = runStartPos.clone();
+      for (let i = chain.length - 2; i >= 0; i--) {
+        const row = report.stateTable[chain[i]];
+        const res = p.playMove(row.moveFromParent);
+        if (!res.legal) {
+          return {
+            ok: false,
+            code: 'LP-S09',
+            detail: `状态表 stateId=${row.stateId} 的 moveFromParent=${row.moveFromParent} 非法`,
+          };
+        }
+      }
+      return { ok: true, pos: p };
+    };
+
+    const verifySourceNodeTableIntegrity = (
+      srcDagId: number,
+      guardDepth = 0
+    ): { ok: boolean; code: string; detail: string } => {
+      if (verifiedSourceTableIds.has(srcDagId)) {
+        return { ok: true, code: 'PASS', detail: '' };
+      }
+      if (
+        guardDepth > 32 ||
+        !Number.isInteger(srcDagId) ||
+        srcDagId < 0 ||
+        srcDagId >= report.proofDagNodes.length
+      ) {
+        return {
+          ok: false,
+          code: 'LP-R02',
+          detail: `源证明节点索引 #${srcDagId} 越界或引用链超深`,
+        };
+      }
+      const srcNode = report.proofDagNodes[srcDagId];
+      if (!srcNode || srcNode.nodeId !== srcDagId) {
+        return {
+          ok: false,
+          code: 'LP-R02',
+          detail: `源证明节点 #${srcDagId} 缺失或 nodeId 不一致`,
+        };
+      }
+      if (
+        !Number.isInteger(srcNode.stateId) ||
+        srcNode.stateId < 0 ||
+        srcNode.stateId >= report.stateTable.length ||
+        !Number.isInteger(srcNode.historyId) ||
+        srcNode.historyId < 0 ||
+        srcNode.historyId >= report.historyTable.length
+      ) {
+        return {
+          ok: false,
+          code: 'LP-S10',
+          detail: `源证明节点 #${srcDagId} 的 stateId=${srcNode.stateId} 或 historyId=${srcNode.historyId} 越界`,
+        };
+      }
+      const st = report.stateTable[srcNode.stateId];
+      if (
+        !st ||
+        st.stateId !== srcNode.stateId ||
+        st.historyId !== srcNode.historyId ||
+        st.parentStateId !== srcNode.parentStateId
+      ) {
+        return {
+          ok: false,
+          code: 'LP-S10',
+          detail: `源证明节点 #${srcDagId} 与 stateTable[${srcNode.stateId}] 的 historyId/parentStateId 跨表不一致`,
+        };
+      }
+      const recon = reconstructPosFromStateTable(srcNode.stateId);
+      if (!recon.ok) return recon;
+      const sp = recon.pos;
+      if (
+        st.toPlay !== sp.toPlay ||
+        st.koPoint !== sp.koPoint ||
+        st.consecutivePasses !== sp.consecutivePasses ||
+        st.survivingTokensMask !== sp.survivingTargetTokensMask ||
+        st.zobristHex !== sp.computeZobristHex() ||
+        !numberArraysEqual(st.blackCoords, sp.getBlackCoords()) ||
+        !numberArraysEqual(st.whiteCoords, sp.getWhiteCoords())
+      ) {
+        return {
+          ok: false,
+          code: 'LP-N10',
+          detail: `源证明节点 #${srcDagId} 的 stateTable[${srcNode.stateId}] 盘面与重放局面不一致`,
+        };
+      }
+      if (
+        !historyTablesMatch(
+          report.historyTable[srcNode.historyId],
+          sp.historySnapshots
+        )
+      ) {
+        return {
+          ok: false,
+          code: 'LP-S02',
+          detail: `源证明节点 #${srcDagId} 的 historyTable[${srcNode.historyId}] 与重放超劫历史不一致`,
+        };
+      }
+      if (srcNode.isPrunedOutsideRz || srcNode.isTtHit) {
+        if (
+          srcNode.sourceProofNodeId === null ||
+          srcNode.sourceProofNodeId < 0 ||
+          srcNode.sourceProofNodeId >= srcNode.nodeId
+        ) {
+          return {
+            ok: false,
+            code: 'LP-R02',
+            detail: `源证明节点 #${srcDagId} 的上游 sourceProofNodeId 非法`,
+          };
+        }
+        const nested = verifySourceNodeTableIntegrity(
+          srcNode.sourceProofNodeId,
+          guardDepth + 1
+        );
+        if (!nested.ok) return nested;
+      }
+      verifiedSourceTableIds.add(srcDagId);
+      return { ok: true, code: 'PASS', detail: '' };
+    };
+
+    const verifyNodeFullTableBinding = (
+      node: ProofDagNode,
+      expectedPos: GoPosition,
+      parentNode: ProofDagNode | null,
+      incomingMoveFromParent: number | null
+    ): { ok: boolean; code: string; detail: string } => {
+      if (
+        !Number.isInteger(node.stateId) ||
+        node.stateId < 0 ||
+        node.stateId >= report.stateTable.length
+      ) {
+        return {
+          ok: false,
+          code: 'LP-S10',
+          detail: `节点 #${node.nodeId} 的 stateId=${node.stateId} 超出 stateTable 范围 (len=${report.stateTable.length})`,
+        };
+      }
+      if (
+        !Number.isInteger(node.historyId) ||
+        node.historyId < 0 ||
+        node.historyId >= report.historyTable.length
+      ) {
+        return {
+          ok: false,
+          code: 'LP-S10',
+          detail: `节点 #${node.nodeId} 的 historyId=${node.historyId} 超出 historyTable 范围 (len=${report.historyTable.length})`,
+        };
+      }
+      const st = report.stateTable[node.stateId];
+      if (
+        !st ||
+        st.stateId !== node.stateId ||
+        st.historyId !== node.historyId ||
+        st.parentStateId !== node.parentStateId
+      ) {
+        return {
+          ok: false,
+          code: 'LP-S10',
+          detail: `节点 #${node.nodeId} 与 stateTable[${node.stateId}] 的 stateId/historyId/parentStateId 关联不一致`,
+        };
+      }
+      if (parentNode !== null) {
+        if (
+          node.parentStateId !== parentNode.stateId ||
+          st.parentStateId !== parentNode.stateId
+        ) {
+          return {
+            ok: false,
+            code: 'LP-S10',
+            detail: `子节点 #${node.nodeId} 的 parentStateId=${node.parentStateId} 与父节点 #${parentNode.nodeId} 的 stateId=${parentNode.stateId} 不一致`,
+          };
+        }
+        if (
+          incomingMoveFromParent !== null &&
+          (st.moveFromParent !== incomingMoveFromParent ||
+            node.incomingMove !== incomingMoveFromParent)
+        ) {
+          return {
+            ok: false,
+            code: 'LP-N10',
+            detail: `子节点 #${node.nodeId} 的入边落子与父边着法 ${incomingMoveFromParent} 不一致`,
+          };
+        }
+      } else {
+        // Target root of fragment: verify relative depth vs runStartMoves
+        const relativeLen = targetPathMoves.length - runStartMoves.length;
+        if (relativeLen === 0) {
+          if (node.stateId !== 0 || node.parentStateId !== -1) {
+            return {
+              ok: false,
+              code: 'LP-S10',
+              detail: `运行根节点 #${node.nodeId} 的 stateId=${node.stateId} / parentStateId=${node.parentStateId} 必须为 0 / -1`,
+            };
+          }
+        } else {
+          const expectedIncoming = targetPathMoves[targetPathMoves.length - 1];
+          if (
+            st.moveFromParent !== expectedIncoming ||
+            node.incomingMove !== expectedIncoming
+          ) {
+            return {
+              ok: false,
+              code: 'LP-N10',
+              detail: `片段节点 #${node.nodeId} 的入边着法与目标路径末手不一致`,
+            };
+          }
+        }
+      }
+
+      if (
+        st.toPlay !== expectedPos.toPlay ||
+        st.koPoint !== expectedPos.koPoint ||
+        st.consecutivePasses !== expectedPos.consecutivePasses ||
+        st.survivingTokensMask !== expectedPos.survivingTargetTokensMask ||
+        st.zobristHex !== expectedPos.computeZobristHex() ||
+        !numberArraysEqual(st.blackCoords, expectedPos.getBlackCoords()) ||
+        !numberArraysEqual(st.whiteCoords, expectedPos.getWhiteCoords())
+      ) {
+        return {
+          ok: false,
+          code: 'LP-N10',
+          detail: `节点 #${node.nodeId} 的 stateTable[${node.stateId}] 盘面/劫点/Zobrist 与真实重放局面不匹配`,
+        };
+      }
+
+      const recHist = report.historyTable[node.historyId];
+      const expHist = expectedPos.historySnapshots;
+      if (!recHist || !historyTablesMatch(recHist, expHist)) {
+        return {
+          ok: false,
+          code: 'LP-S02',
+          detail: `节点 #${node.nodeId} 的历史快照序列（len=${recHist?.length ?? 0}）与真实重放历史（len=${expHist.length}）不一致`,
+        };
+      }
+
+      if (node.isPrunedOutsideRz) {
+        const pc = node.prunedCertificate;
+        if (
+          !pc ||
+          node.sourceProofNodeId === null ||
+          node.sourceProofNodeId < 0 ||
+          node.sourceProofNodeId >= node.nodeId ||
+          pc.sourceProofNodeId !== node.sourceProofNodeId
+        ) {
+          return {
+            ok: false,
+            code: 'LP-R02',
+            detail: `RZ 剪枝节点 #${node.nodeId} 缺失合法 prunedCertificate 或 sourceProofNodeId`,
+          };
+        }
+        const srcNode = report.proofDagNodes[node.sourceProofNodeId];
+        if (
+          !srcNode ||
+          pc.queryStateId !== node.stateId ||
+          pc.queryHistoryId !== node.historyId ||
+          pc.sourceStateId !== srcNode.stateId ||
+          pc.sourceHistoryId !== srcNode.historyId
+        ) {
+          return {
+            ok: false,
+            code: 'LP-S10',
+            detail: `RZ 剪枝节点 #${node.nodeId} 的 prunedCertificate 状态/历史引用与节点或源证明不一致`,
+          };
+        }
+        const srcCheck = verifySourceNodeTableIntegrity(node.sourceProofNodeId);
+        if (!srcCheck.ok) return srcCheck;
+      } else if (node.isTtHit) {
+        if (
+          node.sourceProofNodeId === null ||
+          node.sourceProofNodeId < 0 ||
+          node.sourceProofNodeId >= node.nodeId
+        ) {
+          return {
+            ok: false,
+            code: 'LP-R02',
+            detail: `TT 复用节点 #${node.nodeId} 缺失有效 sourceProofNodeId`,
+          };
+        }
+        const srcCheck = verifySourceNodeTableIntegrity(node.sourceProofNodeId);
+        if (!srcCheck.ok) return srcCheck;
+      }
+
+      return { ok: true, code: 'PASS', detail: '' };
+    };
 
     const independentTerminal = new BensonTerminalEvaluator();
     let firstErrorCode = 'PASS';
@@ -3523,7 +4223,10 @@ export class ProofArtifactManager {
       independentTerminal,
       0,
       stats,
-      recordFailure
+      recordFailure,
+      hasFullTables ? verifyNodeFullTableBinding : undefined,
+      null,
+      null
     );
 
     const sourceReceipt: SubproofSourceReceipt = recursiveRes.ok
@@ -3531,7 +4234,7 @@ export class ProofArtifactManager {
           status: 'SOURCE_VERIFIED',
           passed: true,
           errorCode: 'PASS',
-          message: `片段 #${targetDagNodeId} (${targetNode.outcome}) 在路径 [${
+          message: `片段 #${targetDagNodeId} (${targetNode.outcome}, mode=${verificationMode}) 在路径 [${
             targetPathSgf.join(' -> ') || 'root'
           }] 下通过独立闭环校验（核验 ${stats.verifiedStates} 节点 / ${
             stats.verifiedLeaves
@@ -3539,6 +4242,7 @@ export class ProofArtifactManager {
             stats.replayedPruned
           } RZ重放 / ${stats.replayedTt} TT重放）。`,
           scope: 'subproof_fragment',
+          verificationMode,
           targetPathSgf,
           targetDagNodeId,
           outcome: targetNode.outcome,
@@ -3555,6 +4259,7 @@ export class ProofArtifactManager {
           errorCode: firstErrorCode === 'PASS' ? 'LP-S01' : firstErrorCode,
           message: recursiveRes.detail || `片段 #${targetDagNodeId} 独立闭环校验失败`,
           scope: 'subproof_fragment',
+          verificationMode,
           targetPathSgf,
           targetDagNodeId,
           outcome: targetNode.outcome,
@@ -3579,7 +4284,7 @@ export class ProofArtifactManager {
           queryHistoryLength: 0,
         };
       } else {
-        const qReplay = replayPathFromOriginalRoot(queryPathMoves);
+        const qReplay = replayPathFromOriginalRoot(queryPathMoves, true);
         if (!qReplay.ok) {
           queryReplayReceipt = {
             status: 'QUERY_REPLAY_FAILED',
@@ -3630,8 +4335,10 @@ export class ProofArtifactManager {
     }
 
     return {
-      runSource,
-      originalRootOutcome: report.rootStatus,
+      runSource: derivedRunSource,
+      runStartPathSgf,
+      runRootOutcome: report.rootStatus,
+      originalRootOutcome,
       sourceReceipt,
       queryReplayReceipt,
     };

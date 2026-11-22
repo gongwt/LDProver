@@ -176,12 +176,20 @@ export interface BranchMoveCoverageEntry {
   lastExitReason?: string;
 }
 
+export type BranchCoverageObligation =
+  | 'SINGLE_WITNESS'
+  | 'FULL_COVERAGE'
+  | 'UNDECIDED_OR_WIN_SINGLE_LOSS_ALL'
+  | 'UNDECIDED_AND_WIN_ALL_LOSS_SINGLE';
+
 export interface BranchCoverageSnapshot {
   path: string;
   movesFromRoot: number[];
   movesFromRootSgf: string[];
   depth: number;
   isOrNode: boolean;
+  nodeRole: 'OR_ATTACKER' | 'AND_DEFENDER';
+  coverageObligation: BranchCoverageObligation;
   obligation: 'EXISTENTIAL_OR' | 'UNIVERSAL_AND';
   toPlay: Color;
   runSource: 'original_root' | 'standalone_subposition';
@@ -217,6 +225,7 @@ export interface SubproofSourceReceipt {
   errorCode: string;
   message: string;
   scope: 'subproof_fragment';
+  verificationMode: LProofEncodingMode;
   targetPathSgf: string[];
   targetDagNodeId: number;
   outcome: ProofOutcome;
@@ -240,7 +249,9 @@ export interface SubproofQueryReplayReceipt {
 
 export interface SubproofFragmentVerificationResult {
   runSource: 'original_root' | 'standalone_subposition';
-  originalRootOutcome: ProofOutcome;
+  runStartPathSgf: string[];
+  runRootOutcome: ProofOutcome;
+  originalRootOutcome: ProofOutcome | null;
   sourceReceipt: SubproofSourceReceipt;
   queryReplayReceipt: SubproofQueryReplayReceipt;
 }

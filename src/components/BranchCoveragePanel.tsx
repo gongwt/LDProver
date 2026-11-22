@@ -16,12 +16,14 @@ import {
 import { DfpnSolver } from '../engine/dfpnSolver';
 import {
   coordToHumanLabel,
+  coordToSgf,
   GoPosition,
   PASS_MOVE,
   sgfToCoord,
 } from '../engine/position';
 import { ProofArtifactManager } from '../engine/proofChecker';
 import {
+  BranchCoverageObligation,
   BranchCoverageSnapshot,
   BranchMoveCoverageEntry,
   BranchMoveCoverageStatus,
@@ -94,6 +96,28 @@ const STATUS_BADGE_MAP: Record<
   },
 };
 
+const OBLIGATION_LABEL_MAP: Record<
+  BranchCoverageObligation,
+  { label: string; className: string }
+> = {
+  SINGLE_WITNESS: {
+    label: '单见证成立',
+    className: 'bg-emerald-50 text-emerald-800 border-emerald-200',
+  },
+  FULL_COVERAGE: {
+    label: '全覆盖成立',
+    className: 'bg-indigo-50 text-indigo-800 border-indigo-200',
+  },
+  UNDECIDED_OR_WIN_SINGLE_LOSS_ALL: {
+    label: '未决 (胜单 / 负全)',
+    className: 'bg-slate-100 text-slate-700 border-slate-200',
+  },
+  UNDECIDED_AND_WIN_ALL_LOSS_SINGLE: {
+    label: '未决 (胜全 / 负单)',
+    className: 'bg-slate-100 text-slate-700 border-slate-200',
+  },
+};
+
 function fmtBound(val: number | undefined): string {
   if (val === undefined) return '—';
   return val >= PN_DN_SATURATION ? 'SAT' : String(val);
@@ -119,6 +143,9 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
 
   const [selectedPath, setSelectedPath] = useState<string>(defaultSelectedPath);
   const [moveFilter, setMoveFilter] = useState<MoveStatusFilter>('all');
+  const [moveSearchQuery, setMoveSearchQuery] = useState<string>('');
+  const [movePage, setMovePage] = useState<number>(0);
+  const [showAllMoves, setShowAllMoves] = useState<boolean>(false);
   const [customPathInput, setCustomPathInput] = useState<string>('');
   const [customPathError, setCustomPathError] = useState<string | null>(null);
   const [querySiblingMoveSgf, setQuerySiblingMoveSgf] = useState<string>('');
@@ -129,10 +156,15 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
   const [standaloneSubSolve, setStandaloneSubSolve] =
     useState<StandaloneSubSolveReceipt | null>(null);
 
+  const MOVE_PAGE_SIZE = 50;
+
   // Reset local audit state whenever the problem or solve report changes
   useEffect(() => {
     setSelectedPath(defaultSelectedPath);
     setMoveFilter('all');
+    setMoveSearchQuery('');
+    setMovePage(0);
+    setShowAllMoves(false);
     setQuerySiblingMoveSgf('');
     setFragmentReceipt(null);
     setStandaloneSubSolve(null);
@@ -146,24 +178,41 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
 
   const filteredMoves = useMemo(() => {
     if (!activeSnapshot) return [];
+    const q = moveSearchQuery.trim().toLowerCase();
     return activeSnapshot.moves.filter((m) => {
-      if (moveFilter === 'all') return true;
       if (moveFilter === 'closed') {
-        return (
-          m.status === 'PROVEN_SOURCE' ||
-          m.status === 'TT_REPLAYED' ||
-          m.status === 'RZ_REVALIDATED'
-        );
+        if (
+          m.status !== 'PROVEN_SOURCE' &&
+          m.status !== 'TT_REPLAYED' &&
+          m.status !== 'RZ_REVALIDATED'
+        ) {
+          return false;
+        }
+      } else if (moveFilter === 'deferred') {
+        if (m.status !== 'DEFERRED_OUTSIDE_RZ') return false;
+      } else if (moveFilter === 'unresolved') {
+        if (m.status !== 'EXPANDED_UNRESOLVED' && m.status !== 'KO_BARRIER') {
+          return false;
+        }
+      } else if (moveFilter === 'unexpanded') {
+        if (m.status !== 'UNEXPANDED') return false;
       }
-      if (moveFilter === 'deferred') return m.status === 'DEFERRED_OUTSIDE_RZ';
-      if (moveFilter === 'unresolved') {
-        return (
-          m.status === 'EXPANDED_UNRESOLVED' || m.status === 'KO_BARRIER'
-        );
-      }
-      return m.status === 'UNEXPANDED';
+      if (!q) return true;
+      const human = coordToHumanLabel(m.move, problem.boardSize).toLowerCase();
+      return m.moveSgf.toLowerCase().includes(q) || human.includes(q);
     });
-  }, [activeSnapshot, moveFilter]);
+  }, [activeSnapshot, moveFilter, moveSearchQuery, problem.boardSize]);
+
+  const totalMovePages = Math.max(
+    1,
+    Math.ceil(filteredMoves.length / MOVE_PAGE_SIZE)
+  );
+  const clampedMovePage = Math.min(movePage, totalMovePages - 1);
+  const visibleMoves = useMemo(() => {
+    if (showAllMoves) return filteredMoves;
+    const start = clampedMovePage * MOVE_PAGE_SIZE;
+    return filteredMoves.slice(start, start + MOVE_PAGE_SIZE);
+  }, [filteredMoves, showAllMoves, clampedMovePage]);
 
   const parseSgfPath = (
     raw: string
@@ -197,15 +246,17 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
   };
 
   const handleVerifyFragment = (
-    title: string,
-    targetPathMoves: number[],
+    relativeTargetPathMoves: number[],
     targetDagNodeId: number,
-    queryPathMoves?: number[]
+    relativeQueryPathMoves?: number[]
   ) => {
     const checker = new ProofArtifactManager();
-    const fullTargetMoves = [...activeBaseMoves, ...targetPathMoves];
-    const fullQueryMoves = queryPathMoves
-      ? [...activeBaseMoves, ...queryPathMoves]
+    const fullTargetMoves = [...activeBaseMoves, ...relativeTargetPathMoves];
+    const fullTargetSgf = fullTargetMoves.map((mv) =>
+      coordToSgf(mv, problem.boardSize)
+    );
+    const fullQueryMoves = relativeQueryPathMoves
+      ? [...activeBaseMoves, ...relativeQueryPathMoves]
       : undefined;
     const result = checker.verifySubproofFragment({
       problem,
@@ -214,20 +265,24 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
       targetPathMoves: fullTargetMoves,
       targetDagNodeId,
       queryPathMoves: fullQueryMoves,
-      runSource:
-        activeBaseMoves.length > 0 ? 'standalone_subposition' : 'original_root',
     });
-    setFragmentReceipt({ title, result });
+    setFragmentReceipt({
+      title: fullTargetSgf.length > 0 ? fullTargetSgf.join('/') : '(root)',
+      result,
+    });
   };
 
-  const handleRunStandaloneSubSolve = (moves: number[], sgfLabels: string[]) => {
+  const handleRunStandaloneSubSolve = (fullMovesFromOriginalRoot: number[]) => {
     setCustomPathError(null);
+    const fullSgfLabels = fullMovesFromOriginalRoot.map((mv) =>
+      coordToSgf(mv, problem.boardSize)
+    );
     const pos = rootInitialPosition.clone();
-    for (let i = 0; i < moves.length; i++) {
-      const res = pos.playMove(moves[i]);
+    for (let i = 0; i < fullMovesFromOriginalRoot.length; i++) {
+      const res = pos.playMove(fullMovesFromOriginalRoot[i]);
       if (!res.legal) {
         setCustomPathError(
-          `路径第 ${i + 1} 手 ${sgfLabels[i]} 在原题局面下不合法（可能自杀、已有子或违反劫规则）`
+          `路径第 ${i + 1} 手 ${fullSgfLabels[i]} 在原题局面下不合法（可能自杀、已有子或违反劫规则）`
         );
         return;
       }
@@ -252,8 +307,8 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
       }
     );
     setStandaloneSubSolve({
-      pathLabel: sgfLabels.length > 0 ? sgfLabels.join('/') : '(root)',
-      pathSgf: sgfLabels,
+      pathLabel: fullSgfLabels.length > 0 ? fullSgfLabels.join('/') : '(root)',
+      pathSgf: fullSgfLabels,
       report: subReport,
       tracedVerification,
       originalRootVerification,
@@ -267,14 +322,19 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
       setCustomPathError(parsed.error);
       return;
     }
-    handleRunStandaloneSubSolve(parsed.moves, parsed.sgf);
+    handleRunStandaloneSubSolve(parsed.moves);
   };
 
   const runSource = snapshots[0]?.runSource ?? 'original_root';
   const siblingReplayCandidates = useMemo(() => {
     if (!activeSnapshot) return [];
-    return activeSnapshot.moves.slice(0, 60);
-  }, [activeSnapshot]);
+    const q = moveSearchQuery.trim().toLowerCase();
+    if (!q) return activeSnapshot.moves;
+    return activeSnapshot.moves.filter((m) => {
+      const human = coordToHumanLabel(m.move, problem.boardSize).toLowerCase();
+      return m.moveSgf.toLowerCase().includes(q) || human.includes(q);
+    });
+  }, [activeSnapshot, moveSearchQuery, problem.boardSize]);
 
   return (
     <div className="border border-slate-200 bg-white rounded-lg p-6 space-y-5">
@@ -354,7 +414,8 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
           <thead>
             <tr className="border-b border-slate-200 text-slate-500">
               <th className="py-2 pr-3">路径</th>
-              <th className="py-2 px-2">义务</th>
+              <th className="py-2 px-2">节点角色</th>
+              <th className="py-2 px-2">覆盖义务</th>
               <th className="py-2 px-2">节点结论 / DAG</th>
               <th className="py-2 px-2 text-right">闭合 / 合法应手</th>
               <th className="py-2 px-2">来源细分 (源 / TT / RZ重验 / RZ外暂缓 / 未决 / 未展)</th>
@@ -365,12 +426,14 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
           <tbody className="divide-y divide-slate-200">
             {snapshots.map((snap) => {
               const isSelected = snap.path === activeSnapshot?.path;
+              const oblBadge = OBLIGATION_LABEL_MAP[snap.coverageObligation];
               return (
                 <tr
                   key={snap.path || '(root)'}
                   onClick={() => {
                     setSelectedPath(snap.path);
                     setQuerySiblingMoveSgf('');
+                    setMovePage(0);
                   }}
                   className={`cursor-pointer transition-colors ${
                     isSelected ? 'bg-slate-100/90' : 'hover:bg-slate-50'
@@ -379,11 +442,16 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
                   <td className="py-2 pr-3 font-semibold text-slate-900">
                     {snap.path ? snap.path : '(root)'}
                   </td>
-                  <td className="py-2 px-2 text-slate-700">
-                    {snap.obligation === 'EXISTENTIAL_OR'
-                      ? 'OR 存在'
-                      : 'AND 全称'}{' '}
+                  <td className="py-2 px-2 text-slate-700 whitespace-nowrap">
+                    {snap.nodeRole === 'OR_ATTACKER' ? 'OR (攻方)' : 'AND (守方)'}{' '}
                     · {snap.toPlay === Color.Black ? 'B' : 'W'}
+                  </td>
+                  <td className="py-2 px-2 whitespace-nowrap">
+                    <span
+                      className={`inline-block rounded border px-1.5 py-0.5 text-[11px] font-sans font-medium ${oblBadge.className}`}
+                    >
+                      {oblBadge.label}
+                    </span>
                   </td>
                   <td className="py-2 px-2">
                     <span
@@ -454,7 +522,6 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
                       type="button"
                       onClick={() =>
                         handleVerifyFragment(
-                          snap.path || '(root)',
                           snap.movesFromRoot,
                           snap.nodeDagNodeId
                         )
@@ -479,9 +546,11 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
             <div className="font-semibold text-slate-900">
               子证明片段独立校验回执 — 目标路径: <code>{fragmentReceipt.title}</code>
             </div>
-            <span className="font-mono text-slate-500">
-              原搜索结论: {fragmentReceipt.result.originalRootOutcome} (
-              {fragmentReceipt.result.runSource})
+            <span className="font-mono text-slate-600">
+              运行来源: {fragmentReceipt.result.runSource} · 本次运行根:{' '}
+              {fragmentReceipt.result.runRootOutcome} · 原题根:{' '}
+              {fragmentReceipt.result.originalRootOutcome ?? '未提供(仅子局面)'} ·
+              模式: {fragmentReceipt.result.sourceReceipt.verificationMode}
             </span>
           </div>
 
@@ -647,8 +716,22 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
             </div>
 
             <div className="flex flex-wrap items-center gap-2 text-xs">
+              <input
+                type="text"
+                value={moveSearchQuery}
+                onChange={(e) => {
+                  setMoveSearchQuery(e.target.value);
+                  setMovePage(0);
+                }}
+                placeholder="筛选应手 (SGF/坐标)..."
+                className="w-36 rounded border border-slate-300 bg-white px-2 py-1 text-xs font-mono text-slate-800 focus:border-slate-500 focus:outline-none"
+              />
+
               <label className="inline-flex items-center gap-1.5 text-slate-600">
-                <span>复用查询应手:</span>
+                <span>
+                  复用查询应手 ({siblingReplayCandidates.length}/
+                  {activeSnapshot.totalLegalMoves}):
+                </span>
                 <select
                   value={querySiblingMoveSgf}
                   onChange={(e) => setQuerySiblingMoveSgf(e.target.value)}
@@ -657,7 +740,7 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
                   <option value="">(不测复用)</option>
                   {siblingReplayCandidates.map((m) => (
                     <option key={m.moveSgf} value={m.moveSgf}>
-                      {m.moveSgf} ({STATUS_BADGE_MAP[m.status].label})
+                      #{m.rank + 1} {m.moveSgf} ({STATUS_BADGE_MAP[m.status].label})
                     </option>
                   ))}
                 </select>
@@ -685,7 +768,10 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
                   <button
                     key={key}
                     type="button"
-                    onClick={() => setMoveFilter(key)}
+                    onClick={() => {
+                      setMoveFilter(key);
+                      setMovePage(0);
+                    }}
                     className={`px-2 py-0.5 rounded text-[11px] font-medium cursor-pointer ${
                       moveFilter === key
                         ? 'bg-slate-900 text-white'
@@ -714,19 +800,22 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 bg-white">
-                {filteredMoves.slice(0, 150).map((m: BranchMoveCoverageEntry) => {
+                {visibleMoves.map((m: BranchMoveCoverageEntry) => {
                   const badge = STATUS_BADGE_MAP[m.status];
-                  const childMoves = [...activeSnapshot.movesFromRoot, m.move];
-                  const childSgf = [
-                    ...activeSnapshot.movesFromRootSgf,
-                    m.moveSgf,
+                  const relativeChildMoves = [
+                    ...activeSnapshot.movesFromRoot,
+                    m.move,
+                  ];
+                  const fullChildMoves = [
+                    ...activeBaseMoves,
+                    ...relativeChildMoves,
                   ];
                   const queryTarget = querySiblingMoveSgf
                     ? activeSnapshot.moves.find(
                         (cand) => cand.moveSgf === querySiblingMoveSgf
                       )
                     : undefined;
-                  const queryMoves =
+                  const relativeQueryMoves =
                     queryTarget && queryTarget.move !== m.move
                       ? [...activeSnapshot.movesFromRoot, queryTarget.move]
                       : undefined;
@@ -768,10 +857,9 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
                           type="button"
                           onClick={() =>
                             handleVerifyFragment(
-                              childSgf.join('/'),
-                              childMoves,
+                              relativeChildMoves,
                               m.dagNodeId,
-                              queryMoves
+                              relativeQueryMoves
                             )
                           }
                           className="rounded border border-slate-300 bg-white px-2 py-0.5 text-[11px] font-sans font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
@@ -781,10 +869,7 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
                         <button
                           type="button"
                           onClick={() =>
-                            handleRunStandaloneSubSolve(
-                              [...activeBaseMoves, ...childMoves],
-                              childSgf
-                            )
+                            handleRunStandaloneSubSolve(fullChildMoves)
                           }
                           className="rounded border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[11px] font-sans font-medium text-indigo-800 hover:bg-indigo-100 cursor-pointer"
                         >
@@ -797,6 +882,55 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
               </tbody>
             </table>
           </div>
+
+          {filteredMoves.length > MOVE_PAGE_SIZE && (
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600 font-mono">
+              <span>
+                {showAllMoves
+                  ? `已展开全部 ${filteredMoves.length} / 共 ${activeSnapshot.totalLegalMoves} 手`
+                  : `显示第 ${clampedMovePage * MOVE_PAGE_SIZE + 1}–${Math.min(
+                      (clampedMovePage + 1) * MOVE_PAGE_SIZE,
+                      filteredMoves.length
+                    )} 手（筛选结果 ${filteredMoves.length} / 总合法应手 ${
+                      activeSnapshot.totalLegalMoves
+                    }）`}
+              </span>
+              <div className="flex items-center gap-1.5">
+                {!showAllMoves && (
+                  <>
+                    <button
+                      type="button"
+                      disabled={clampedMovePage === 0}
+                      onClick={() => setMovePage((p) => Math.max(0, p - 1))}
+                      className="rounded border border-slate-300 bg-white px-2 py-0.5 text-[11px] font-sans text-slate-700 disabled:opacity-40 hover:bg-slate-50 cursor-pointer disabled:cursor-not-allowed"
+                    >
+                      上一页
+                    </button>
+                    <span>
+                      {clampedMovePage + 1} / {totalMovePages}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={clampedMovePage >= totalMovePages - 1}
+                      onClick={() =>
+                        setMovePage((p) => Math.min(totalMovePages - 1, p + 1))
+                      }
+                      className="rounded border border-slate-300 bg-white px-2 py-0.5 text-[11px] font-sans text-slate-700 disabled:opacity-40 hover:bg-slate-50 cursor-pointer disabled:cursor-not-allowed"
+                    >
+                      下一页
+                    </button>
+                  </>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setShowAllMoves((v) => !v)}
+                  className="rounded border border-slate-300 bg-white px-2 py-0.5 text-[11px] font-sans text-slate-700 hover:bg-slate-50 cursor-pointer"
+                >
+                  {showAllMoves ? '恢复分页' : '显示全部'}
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

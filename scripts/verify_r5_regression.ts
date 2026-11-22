@@ -28,6 +28,7 @@ import {
 import {
   KoRule,
   ProofOutcome,
+  SearchGoal,
   SolverConfig,
   TsumegoProblemSpec,
 } from '../src/engine/types';
@@ -1520,10 +1521,368 @@ runSection('Section 9: R11 Observer Terminal Completeness, Branch Coverage Snaps
   );
 });
 
+runSection('Section 10: R12 Fragment Contract Binding, Full-Table Integrity, Run-Source Provenance & Coverage Semantics', () => {
+  const cfgRz: SolverConfig = {
+    ...defaultConfig(3500),
+    maxDepth: 48,
+    memoryBudgetMb: 512,
+    enableRzPruning: true,
+    useProblemDefaultKo: true,
+  };
+
+  // 10.1 R12 §2: Problem-context goal conflict MUST be rejected with LP-P01 even when old context is passed
+  const p001 = getSpec('p001');
+  const ctx001Live = DfpnSolver.buildProofContext(p001, cfgRz);
+  const rep001 = new DfpnSolver(cfgRz).solveProblem(p001);
+  const baMove = sgfToCoord('ba', 19);
+  const p001ToKill: TsumegoProblemSpec = {
+    ...p001,
+    blackSearchGoal: SearchGoal.ToKill,
+  };
+
+  const fragGoalConflict = checker.verifySubproofFragment({
+    problem: p001ToKill,
+    context: ctx001Live,
+    report: rep001,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+    queryPathMoves: [baMove],
+  });
+  check(
+    fragGoalConflict.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      !fragGoalConflict.sourceReceipt.passed &&
+      fragGoalConflict.sourceReceipt.errorCode === 'LP-P01' &&
+      fragGoalConflict.queryReplayReceipt.status === 'QUERY_REPLAY_FAILED' &&
+      fragGoalConflict.queryReplayReceipt.errorCode === 'LP-P01',
+    'R12 §2 rejects p001 ToLive->ToKill goal conflict even when stale ToLive context is explicitly passed (LP-P01)',
+    `src=${fragGoalConflict.sourceReceipt.status}/${fragGoalConflict.sourceReceipt.errorCode}, q=${fragGoalConflict.queryReplayReceipt.status}/${fragGoalConflict.queryReplayReceipt.errorCode}`
+  );
+
+  // Legitimate runtime config override (attackerAllowKo: true) MUST pass when report & context match,
+  // and MUST fail (LP-P01) when caller passes mismatched ko config.
+  const cfgKoOverride: SolverConfig = {
+    ...cfgRz,
+    useProblemDefaultKo: false,
+    attackerAllowKo: true,
+    defenderAllowKo: true,
+  };
+  const ctx001KoOverride = DfpnSolver.buildProofContext(p001, cfgKoOverride);
+  const rep001KoOverride = new DfpnSolver(cfgKoOverride).solveProblem(p001);
+  const fragKoOverrideOk = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001KoOverride,
+    report: rep001KoOverride,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  const fragKoOverrideMismatch = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001Live,
+    report: rep001KoOverride,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    fragKoOverrideOk.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+      fragKoOverrideOk.sourceReceipt.passed &&
+      fragKoOverrideMismatch.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      fragKoOverrideMismatch.sourceReceipt.errorCode === 'LP-P01',
+    'R12 §2 preserves legitimate runtime ko override (PASS) while rejecting mismatched ko context against report contract (LP-P01)',
+    `ok=${fragKoOverrideOk.sourceReceipt.status}/${fragKoOverrideOk.sourceReceipt.errorCode}, mismatch=${fragKoOverrideMismatch.sourceReceipt.status}/${fragKoOverrideMismatch.sourceReceipt.errorCode}`
+  );
+
+  // 10.2 R12 §3: Full-table index, cross-table, descendant corruption & out-of-bounds positive DAG ID
+  const cloneReport = (r: typeof rep001): typeof rep001 =>
+    JSON.parse(JSON.stringify(r));
+
+  // Control: intact p001 ba leaf & root pass in full_state_table mode
+  const frag001RootOk = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001Live,
+    report: rep001,
+    targetPathMoves: [],
+    targetDagNodeId: rep001.rootDagNodeId,
+  });
+  check(
+    frag001RootOk.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+      frag001RootOk.sourceReceipt.passed &&
+      frag001RootOk.sourceReceipt.verificationMode === 'full_state_table' &&
+      frag001RootOk.runSource === 'original_root' &&
+      frag001RootOk.runRootOutcome === ProofOutcome.ProvenWin &&
+      frag001RootOk.originalRootOutcome === ProofOutcome.ProvenWin,
+    'R12 §3 positive control: intact p001 root verifies in full_state_table mode',
+    `status=${frag001RootOk.sourceReceipt.status}, mode=${frag001RootOk.sourceReceipt.verificationMode}`
+  );
+
+  // (a) ba leaf stateId out of bounds -> LP-S10
+  const rBadStateId = cloneReport(rep001);
+  rBadStateId.proofDagNodes[0].stateId = 999;
+  const fBadStateId = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001Live,
+    report: rBadStateId,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    fBadStateId.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      fBadStateId.sourceReceipt.errorCode === 'LP-S10',
+    'R12 §3 rejects ba leaf with out-of-bounds stateId (LP-S10)',
+    `status=${fBadStateId.sourceReceipt.status}, code=${fBadStateId.sourceReceipt.errorCode}`
+  );
+
+  // (b) ba leaf historyId out of bounds -> LP-S10
+  const rBadHistId = cloneReport(rep001);
+  rBadHistId.proofDagNodes[0].historyId = 999;
+  const fBadHistId = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001Live,
+    report: rBadHistId,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    fBadHistId.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      fBadHistId.sourceReceipt.errorCode === 'LP-S10',
+    'R12 §3 rejects ba leaf with out-of-bounds historyId (LP-S10)',
+    `status=${fBadHistId.sourceReceipt.status}, code=${fBadHistId.sourceReceipt.errorCode}`
+  );
+
+  // (c) stateTable[ba.stateId].historyId changed to 0 (disagrees with node.historyId) -> LP-S10
+  const rCrossHist = cloneReport(rep001);
+  const baStateId = rCrossHist.proofDagNodes[0].stateId;
+  rCrossHist.stateTable[baStateId].historyId = 0;
+  const fCrossHist = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001Live,
+    report: rCrossHist,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    fCrossHist.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      fCrossHist.sourceReceipt.errorCode === 'LP-S10',
+    'R12 §3 rejects cross-table state.historyId != node.historyId mismatch on ba leaf (LP-S10)',
+    `status=${fCrossHist.sourceReceipt.status}, code=${fCrossHist.sourceReceipt.errorCode}`
+  );
+
+  // (d) Root target with corrupted descendant ba stateId -> LP-S10
+  const fDescBadStateId = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001Live,
+    report: rBadStateId,
+    targetPathMoves: [],
+    targetDagNodeId: rep001.rootDagNodeId,
+  });
+  check(
+    fDescBadStateId.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      fDescBadStateId.sourceReceipt.errorCode === 'LP-S10',
+    'R12 §3 root verification rejects out-of-bounds stateId on descendant ba (LP-S10)',
+    `status=${fDescBadStateId.sourceReceipt.status}, code=${fDescBadStateId.sourceReceipt.errorCode}`
+  );
+
+  // (e) Root target with descendant ba stateTable row whiteCoords cleared -> LP-N10
+  const rDescWhiteCleared = cloneReport(rep001);
+  rDescWhiteCleared.stateTable[baStateId].whiteCoords = [];
+  const fDescWhiteCleared = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001Live,
+    report: rDescWhiteCleared,
+    targetPathMoves: [],
+    targetDagNodeId: rep001.rootDagNodeId,
+  });
+  check(
+    fDescWhiteCleared.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      fDescWhiteCleared.sourceReceipt.errorCode === 'LP-N10',
+    'R12 §3 root verification rejects descendant ba state row with cleared whiteCoords (LP-N10)',
+    `status=${fDescWhiteCleared.sourceReceipt.status}, code=${fDescWhiteCleared.sourceReceipt.errorCode}`
+  );
+
+  // (f) Positive out-of-bounds DAG node ID -> VERIFICATION_FAILED / LP-N01 (distinct from -1 -> UNCLOSED / LP-U01)
+  const fPosOob = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001Live,
+    report: rep001,
+    targetPathMoves: [],
+    targetDagNodeId: 999,
+  });
+  const fUnclosedSentinel = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001Live,
+    report: rep001,
+    targetPathMoves: [],
+    targetDagNodeId: -1,
+  });
+  check(
+    fPosOob.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      fPosOob.sourceReceipt.errorCode === 'LP-N01' &&
+      fUnclosedSentinel.sourceReceipt.status === 'UNCLOSED' &&
+      fUnclosedSentinel.sourceReceipt.errorCode === 'LP-U01',
+    'R12 §3 distinguishes corrupted positive out-of-bounds targetDagNodeId (LP-N01) from unclosed sentinel -1 (LP-U01)',
+    `posOob=${fPosOob.sourceReceipt.status}/${fPosOob.sourceReceipt.errorCode}, sentinel=${fUnclosedSentinel.sourceReceipt.status}/${fUnclosedSentinel.sourceReceipt.errorCode}`
+  );
+
+  // (g) Explicit compact_dag semantic mode when stateTable is absent
+  const rCompact = cloneReport(rep001);
+  rCompact.stateTable = [];
+  rCompact.historyTable = [];
+  const fCompact = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001Live,
+    report: rCompact,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    fCompact.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+      fCompact.sourceReceipt.verificationMode === 'compact_dag',
+    'R12 §3 explicitly tags state-table-free fragment checks with verificationMode=compact_dag',
+    `status=${fCompact.sourceReceipt.status}, mode=${fCompact.sourceReceipt.verificationMode}`
+  );
+
+  // 10.3 R12 §4: Authentic runSource derivation & separating runRootOutcome vs originalRootOutcome on p162
+  const p162 = getSpec('chao_vol2_p162');
+  const ctx162 = DfpnSolver.buildProofContext(p162, cfgRz);
+  const rep162Orig = new DfpnSolver(cfgRz).solveProblem(p162);
+  const srMove = sgfToCoord('sr', 19);
+  const subPos162 = DfpnSolver.buildInitialPosition(p162, ctx162);
+  subPos162.playMove(srMove);
+  subPos162.playMove(PASS_MOVE);
+  const rep162Sub = new DfpnSolver(cfgRz).solveFromPosition(
+    p162,
+    subPos162,
+    ctx162
+  );
+
+  // Omitting runSource MUST still derive standalone_subposition and keep originalRootOutcome === null!
+  const frag162Omitted = checker.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+  });
+  check(
+    frag162Omitted.runSource === 'standalone_subposition' &&
+      frag162Omitted.runStartPathSgf.join('/') === 'sr/pass' &&
+      frag162Omitted.runRootOutcome === ProofOutcome.ProvenWin &&
+      frag162Omitted.originalRootOutcome === null &&
+      frag162Omitted.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+      frag162Omitted.sourceReceipt.passed,
+    'R12 §4 omitting runSource on standalone p162/sr/pass derives standalone_subposition and leaves originalRootOutcome=null (never upgrades original root to PROVEN_WIN)',
+    `src=${frag162Omitted.runSource}, start=${frag162Omitted.runStartPathSgf.join('/')}, runRoot=${frag162Omitted.runRootOutcome}, origRoot=${String(frag162Omitted.originalRootOutcome)}, receipt=${frag162Omitted.sourceReceipt.status}`
+  );
+
+  // Passing explicit contradictory runSource: 'original_root' MUST reject with LP-P02
+  const frag162Contradict = checker.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    runSource: 'original_root',
+  });
+  check(
+    frag162Contradict.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      frag162Contradict.sourceReceipt.errorCode === 'LP-P02' &&
+      frag162Contradict.runSource === 'standalone_subposition' &&
+      frag162Contradict.originalRootOutcome === null,
+    'R12 §4 rejects explicit contradictory runSource=original_root on standalone p162/sr/pass report (LP-P02)',
+    `status=${frag162Contradict.sourceReceipt.status}, code=${frag162Contradict.sourceReceipt.errorCode}, derived=${frag162Contradict.runSource}`
+  );
+
+  // Target path not belonging to standalone run starting trajectory MUST reject with LP-P02
+  const frag162WrongPrefix = checker.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+  });
+  check(
+    frag162WrongPrefix.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      frag162WrongPrefix.sourceReceipt.errorCode === 'LP-P02',
+    'R12 §4 rejects targetPathMoves outside standalone subposition arrival prefix (LP-P02)',
+    `status=${frag162WrongPrefix.sourceReceipt.status}, code=${frag162WrongPrefix.sourceReceipt.errorCode}`
+  );
+
+  // Supplying authentic originalRootReport exposes originalRootOutcome=UNKNOWN alongside runRootOutcome=PROVEN_WIN
+  const frag162WithOrig = checker.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162Orig,
+  });
+  check(
+    frag162WithOrig.runSource === 'standalone_subposition' &&
+      frag162WithOrig.runRootOutcome === ProofOutcome.ProvenWin &&
+      frag162WithOrig.originalRootOutcome === ProofOutcome.Unknown &&
+      frag162WithOrig.sourceReceipt.passed,
+    'R12 §4 binding authentic originalRootReport reports runRootOutcome=PROVEN_WIN alongside originalRootOutcome=UNKNOWN',
+    `runRoot=${frag162WithOrig.runRootOutcome}, origRoot=${String(frag162WithOrig.originalRootOutcome)}`
+  );
+
+  // 10.4 R12 §5: Outcome-aware coverageObligation (p007 OR loss = FULL_COVERAGE) + p042 140th move replay
+  const p007 = getSpec('p007');
+  const rep007 = new DfpnSolver(cfgRz).solveProblem(p007);
+  const p007RootSnap = rep007.branchCoverageSnapshots?.find((s) => s.path === '');
+  const p001RootSnap = rep001.branchCoverageSnapshots?.find((s) => s.path === '');
+  check(
+    Boolean(p007RootSnap) &&
+      p007RootSnap!.nodeRole === 'OR_ATTACKER' &&
+      p007RootSnap!.nodeOutcome === ProofOutcome.ProvenLoss &&
+      p007RootSnap!.coverageObligation === 'FULL_COVERAGE' &&
+      p007RootSnap!.closedCount === 3 &&
+      p007RootSnap!.totalLegalMoves === 3 &&
+      p001RootSnap?.nodeRole === 'OR_ATTACKER' &&
+      p001RootSnap?.coverageObligation === 'SINGLE_WITNESS',
+    'R12 §5 p007 OR PROVEN_LOSS (3/3) reports nodeRole=OR_ATTACKER & coverageObligation=FULL_COVERAGE while p001 OR PROVEN_WIN reports SINGLE_WITNESS',
+    `p007=${p007RootSnap?.nodeRole}/${p007RootSnap?.coverageObligation} (${p007RootSnap?.closedCount}/${p007RootSnap?.totalLegalMoves}), p001=${p001RootSnap?.coverageObligation}`
+  );
+
+  const p042 = getSpec('chao_vol1_p042');
+  const ctx42 = DfpnSolver.buildProofContext(p042, cfgRz);
+  const rep42 = new DfpnSolver(cfgRz).solveProblem(p042);
+  const rsSnap = rep42.branchCoverageSnapshots?.find((s) => s.path === 'rs');
+  const passEntry42 = rsSnap?.moves.find((m) => m.move === PASS_MOVE);
+  const lastMoveEntry42 = rsSnap?.moves[139];
+  const rsMove = sgfToCoord('rs', 19);
+  check(
+    Boolean(rsSnap) &&
+      rsSnap!.nodeRole === 'AND_DEFENDER' &&
+      rsSnap!.coverageObligation === 'FULL_COVERAGE' &&
+      rsSnap!.moves.length === 140 &&
+      Boolean(passEntry42) &&
+      Boolean(lastMoveEntry42),
+    'R12 §5 p042/rs exposes all 140 legal moves with nodeRole=AND_DEFENDER & coverageObligation=FULL_COVERAGE',
+    `role=${rsSnap?.nodeRole}, obl=${rsSnap?.coverageObligation}, len=${rsSnap?.moves.length}`
+  );
+  if (passEntry42 && lastMoveEntry42) {
+    const frag42Tail = checker.verifySubproofFragment({
+      problem: p042,
+      context: ctx42,
+      report: rep42,
+      targetPathMoves: [rsMove, PASS_MOVE],
+      targetDagNodeId: passEntry42.dagNodeId,
+      queryPathMoves: [rsMove, lastMoveEntry42.move],
+    });
+    check(
+      frag42Tail.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+        frag42Tail.sourceReceipt.verificationMode === 'full_state_table' &&
+        frag42Tail.queryReplayReceipt.status === 'QUERY_REPLAY_VERIFIED',
+      `R12 §5 p042 rs/pass source + 140th sibling move (${lastMoveEntry42.moveSgf}) query replay passes in full_state_table mode`,
+      `src=${frag42Tail.sourceReceipt.status}/${frag42Tail.sourceReceipt.verificationMode}, q=${frag42Tail.queryReplayReceipt.status}`
+    );
+  }
+});
+
 console.log(
   `\n========================================\nR5 TS Regression Summary: ${passedAssertions}/${totalAssertions} passed, ${failures.length} failed.\n========================================`
 );
 if (failures.length > 0) {
   process.exit(1);
 }
+
 
