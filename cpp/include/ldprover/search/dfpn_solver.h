@@ -100,6 +100,18 @@ class DfpnSolver {
                            std::nullopt,
                        const std::string& problem_id = "");
 
+  // Heuristic eye-like liberty potential of surviving crucial chains (1:1 parity
+  // with TS BensonTerminalEvaluator::estimateHeuristicShapePotential):
+  // +2 for fully surrounded empty point (enemy_nbs == 0 && friendly_nbs == deg),
+  // +1 for protected tiger's mouth (enemy_nbs == 0 && friendly_nbs >= max(2, deg-1)).
+  static int EstimateParentEyeLikeCount(const Position<N>& pos,
+                                        const ProofContext& context);
+
+  // Public diagnostic accessor for PASS move tactical ordering score parity.
+  int32_t EvaluatePassMoveScore(const Position<N>& pos,
+                                const ProofContext& context,
+                                bool is_or_node) const;
+
  private:
   struct MoveEvalMeta {
     int32_t score = 0;
@@ -152,9 +164,6 @@ class DfpnSolver {
 
   NodeTacticalContext BuildNodeTacticalContext(
       const Position<N>& pos, const ProofContext& context) const;
-
-  int EstimateParentEyeLikeCount(const Position<N>& pos,
-                                 const ProofContext& context) const;
 
   // FR-4.10: Deterministic FastCapture tactical move evaluation with dynamic
   // tactical attention, 1-ply Benson UCA detection, and crucial liberty delta.

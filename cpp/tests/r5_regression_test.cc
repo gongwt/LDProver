@@ -735,6 +735,104 @@ void TestSection6RealProblemSolverBreakthrough() {
               mem.canonical_dag_checksum == file.canonical_dag_checksum,
           "Native C++20 p031 passes memory & external-bound original_root verification",
           "mem=" + mem.error_code + ", file=" + file.error_code);
+
+    // Real p031 defensive line: B[sr] -> W[pass] -> B[qs] forms two tiger's mouths (rs, ss)
+    Position<19> p31_pos = p031.initial_position;
+    const int16_t kMoveQs =
+        static_cast<int16_t>(Position<19>::CoordFromRowCol(18, 16));
+    const bool ok_sr = p31_pos.PlayMove(kMoveSr);
+    const bool ok_pass = p31_pos.PlayMove(ldprover::kPassMove);
+    const bool ok_qs = p31_pos.PlayMove(kMoveQs);
+    const int p31_eye =
+        DfpnSolver<19>::EstimateParentEyeLikeCount(p31_pos, p031.proof_context);
+    const int32_t p31_pass =
+        solver.EvaluatePassMoveScore(p31_pos, p031.proof_context, false);
+    Check(ok_sr && ok_pass && ok_qs && p31_eye == 2 && p31_pass == 3850,
+          "R9 §1 p031 after B[sr]->W[pass]->B[qs] yields eyeLike=2 and AND-node PASS score=3850",
+          "eyeLike=" + std::to_string(p31_eye) +
+              ", passScore=" + std::to_string(p31_pass));
+  }
+}
+
+void TestSection7R9EyeLikePassParity() {
+  std::cout << "\n=== 7. R9 §1 Eye-Like Heuristic & AND-Node PASS Score Parity ===\n";
+  ProblemContractParser<19> parser;
+
+  SolverConfig cfg_rz = DefaultConfig(3500U);
+  cfg_rz.max_depth = 48U;
+  cfg_rz.enable_rz_pruning = true;
+
+  SolverConfig cfg_no_rz = cfg_rz;
+  cfg_no_rz.enable_rz_pruning = false;
+
+  DfpnSolver<19> solver_rz(cfg_rz);
+  DfpnSolver<19> solver_no_rz(cfg_no_rz);
+
+  struct EyeShapeCase {
+    std::string name;
+    std::string sgf;
+    std::string crucial;
+    int expected_eye_like;
+    int32_t expected_pass_rz;
+    int32_t expected_pass_no_rz;
+  };
+
+  const std::vector<EyeShapeCase> cases = {
+      {"full_eye_corner",
+       "(;GM[1]FF[4]SZ[19]PL[W]AB[ba][ab][bb]AW[dd])",
+       "bb",
+       2,
+       3850,
+       3850},
+      {"single_tiger_mouth",
+       "(;GM[1]FF[4]SZ[19]PL[W]AB[ba][bb][cb]AW[dd])",
+       "bb",
+       1,
+       3450,
+       360},
+      {"double_tiger_mouth",
+       "(;GM[1]FF[4]SZ[19]PL[W]AB[ca][cb][cc][dc][ec][eb][ea]AW[gg])",
+       "dc",
+       2,
+       3850,
+       3850},
+      {"diag_enemy_full_eye",
+       "(;GM[1]FF[4]SZ[19]PL[W]AB[ba][ab][ca][cb][cc][bc][ac]AW[bb])",
+       "ba",
+       2,
+       3850,
+       3850},
+  };
+
+  for (const auto& tc : cases) {
+    const std::string raw_json =
+        std::string("{\"masked_sgf_str\":\"") + tc.sgf +
+        "\",\"winning_color\":\"b\",\"turn_color\":\"w\","
+        "\"black_crucial_stone\":\"" +
+        tc.crucial +
+        "\",\"white_crucial_stone\":\"\",\"black_search_goal\":\"TOLIVE\","
+        "\"white_search_goal\":\"TOKILL\",\"black_ko_rule\":\"disallow_ko\","
+        "\"white_ko_rule\":\"allow_ko\","
+        "\"region\":\"aa,ba,ca,da,ab,bb,cb,db,ac,bc,cc,dc\"}";
+    const ParsedProblem<19> parsed = parser.ParseTsumegoJsonObject(
+        "r9_eye_" + tc.name, raw_json, TurnConflictPolicy::kRejectStrict);
+    Check(parsed.valid, "R9 §1 eye-shape fixture parses cleanly: " + tc.name,
+          parsed.error_message);
+    if (!parsed.valid) continue;
+
+    const int eye_like = DfpnSolver<19>::EstimateParentEyeLikeCount(
+        parsed.initial_position, parsed.proof_context);
+    const int32_t pass_rz = solver_rz.EvaluatePassMoveScore(
+        parsed.initial_position, parsed.proof_context, false);
+    const int32_t pass_no_rz = solver_no_rz.EvaluatePassMoveScore(
+        parsed.initial_position, parsed.proof_context, false);
+    Check(eye_like == tc.expected_eye_like &&
+              pass_rz == tc.expected_pass_rz &&
+              pass_no_rz == tc.expected_pass_no_rz,
+          "R9 §1 eye-shape " + tc.name + " matches TS eyeLike & PASS scores",
+          "got eyeLike=" + std::to_string(eye_like) +
+              ", passRz=" + std::to_string(pass_rz) +
+              ", passNoRz=" + std::to_string(pass_no_rz));
   }
 }
 
@@ -747,6 +845,7 @@ int main() {
   TestSection4R7ProtocolEdgeCases();
   TestSection5R8ProblemContractAndConsistency();
   TestSection6RealProblemSolverBreakthrough();
+  TestSection7R9EyeLikePassParity();
 
   const int failed = g_total - g_passed;
   std::cout << "\n========================================\n"

@@ -134,6 +134,45 @@ export class DfpnSolver {
   }
 
   /**
+   * Heuristic eye-like liberty potential of surviving crucial chains
+   * (1:1 parity with C++ DfpnSolver<N>::EstimateParentEyeLikeCount).
+   */
+  public evaluateParentEyeLikeCount(
+    pos: GoPosition,
+    context: ProofContext
+  ): number {
+    return this.terminalEval.estimateHeuristicShapePotential(
+      pos,
+      context.initialTokens
+    ).eyeLikeCount;
+  }
+
+  /**
+   * Public diagnostic accessor for PASS move tactical ordering score parity.
+   */
+  public evaluatePassMoveScore(
+    pos: GoPosition,
+    context: ProofContext,
+    isOrNode: boolean
+  ): number {
+    const parentEyeLikeCount =
+      !isOrNode &&
+      pos.consecutivePasses === 0 &&
+      this.config.enableFastCaptureOrdering
+        ? this.evaluateParentEyeLikeCount(pos, context)
+        : 0;
+    const emptyTacCtx = this.buildNodeTacticalContext(pos, context);
+    return this.evaluateCandidateMove(
+      pos,
+      context,
+      PASS_MOVE,
+      isOrNode,
+      parentEyeLikeCount,
+      emptyTacCtx
+    ).score;
+  }
+
+  /**
    * Solves from an arbitrary legal `GoPosition` (either the problem root or an interactive
    * manual move sequence carrying authentic `historySnapshots` and `survivingTargetTokensMask`).
    */
@@ -1883,8 +1922,10 @@ export class DfpnSolver {
           windowSumDn = clampSat(windowSumDn + ch.dn);
         }
         if (hasActiveRz && minPn >= 48 && minPn < PN_DN_SATURATION) {
-          // Just-in-time relaxation: all sharp in-RZ moves are closed; only stale !inAttention
-          // unexpanded in-RZ obligations remain. Relax their initial pn so we close them cleanly.
+          // High-cost unexpanded in-RZ JIT relaxation: once all sharp (< 48) in-RZ
+          // candidates have closed or exceeded 48, relax remaining unexpanded high-cost
+          // in-RZ moves (both !inAttention and low-ranked in-attention candidates) to pn=8
+          // so stale initial bounds do not stall closure of a nearly proven RZ.
           let relaxed = false;
           for (let k = 0; k < activeIndices.length; k++) {
             const ch = children[activeIndices[k]];
@@ -1923,9 +1964,10 @@ export class DfpnSolver {
           minDn = Math.min(minDn, ch.dn);
         }
         if (hasActiveRz && minDn >= 48 && minDn < PN_DN_SATURATION) {
-          // Just-in-time relaxation: all sharp in-RZ defenses are already proven; only stale
-          // !inAttention unexpanded in-RZ defenses (dn=96+) remain. Relax them to dn=4 so we
-          // finish closing the RZ instead of spiking ancestor dn and bouncing out of the subtree!
+          // High-cost unexpanded in-RZ JIT relaxation: once all sharp (< 48) in-RZ
+          // defenses have closed or exceeded 48, relax remaining unexpanded high-cost
+          // in-RZ defenses (both !inAttention and low-ranked in-attention candidates) to dn=4
+          // so stale initial bounds do not spike ancestor dn and bounce out of the subtree.
           let relaxed = false;
           for (let k = 0; k < activeIndices.length; k++) {
             const ch = children[activeIndices[k]];

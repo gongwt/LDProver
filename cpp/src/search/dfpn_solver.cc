@@ -324,19 +324,16 @@ DfpnSolver<N>::BuildNodeTacticalContext(const Position<N>& pos,
 }
 
 template <int N>
-int DfpnSolver<N>::EstimateParentEyeLikeCount(
-    const Position<N>& pos, const ProofContext& context) const {
-  const Color target_color =
-      !context.initial_tokens.empty()
-          ? context.initial_tokens[0].stone_color
-          : (context.attacker_goal == SearchGoal::kToLive
-                 ? context.root_attacker
-                 : OppositeColor(context.root_attacker));
-  const Color opp_color = OppositeColor(target_color);
+int DfpnSolver<N>::EstimateParentEyeLikeCount(const Position<N>& pos,
+                                              const ProofContext& context) {
+  if (context.initial_tokens.empty()) return 0;
+  const Color target_color = context.initial_tokens[0].stone_color;
+  const Color enemy_color = OppositeColor(target_color);
 
-  // Check single-point true-eye-like empty neighbors of surviving crucial chains.
-  BitBoard<N> checked_empty;
-  int eye_like = 0;
+  // Count protected tiger's-mouth (+1) and fully surrounded single-point (+2)
+  // eye-like liberties adjacent to surviving crucial chains (1:1 parity with TS
+  // BensonTerminalEvaluator::estimateHeuristicShapePotential).
+  BitBoard<N> candidate_eye_pts;
   for (size_t idx = 0; idx < context.initial_tokens.size() && idx < 64U; ++idx) {
     if ((pos.SurvivingTargetTokensMask() & (1ULL << idx)) == 0ULL) continue;
     const int t_coord = context.initial_tokens[idx].initial_coord;
@@ -344,30 +341,45 @@ int DfpnSolver<N>::EstimateParentEyeLikeCount(
     if (pos.StoneAt(t_coord) != target_color) continue;
     BitBoard<N> libs;
     (void)pos.FloodFillChain(t_coord, &libs);
-    for (int ep : libs.ToCoords()) {
-      if (checked_empty.Get(ep)) continue;
-      checked_empty.Set(ep, true);
-      const auto ep_ortho = pos.OrthogonalNeighbors(ep);
-      bool all_target = true;
-      for (int nb : ep_ortho) {
-        if (pos.StoneAt(nb) != target_color) {
-          all_target = false;
-          break;
-        }
-      }
-      if (!all_target) continue;
-      const auto ep_diag = pos.DiagonalNeighbors(ep);
-      int enemy_diags = 0;
-      for (int d : ep_diag) {
-        if (pos.StoneAt(d) == opp_color) ++enemy_diags;
-      }
-      const int max_enemy_diags = (ep_diag.size() == 4U) ? 1 : 0;
-      if (enemy_diags <= max_enemy_diags) {
-        ++eye_like;
+    candidate_eye_pts |= libs;
+  }
+
+  int eye_like_count = 0;
+  for (int pt : candidate_eye_pts.ToCoords()) {
+    const auto nbs = pos.OrthogonalNeighbors(pt);
+    int friendly_nbs = 0;
+    int enemy_nbs = 0;
+    for (int nb : nbs) {
+      const Color st = pos.StoneAt(nb);
+      if (st == target_color) {
+        ++friendly_nbs;
+      } else if (st == enemy_color) {
+        ++enemy_nbs;
       }
     }
+    const int deg = static_cast<int>(nbs.size());
+    if (enemy_nbs == 0 && friendly_nbs == deg) {
+      eye_like_count += 2;  // Fully surrounded single-point eye candidate
+    } else if (enemy_nbs == 0 && friendly_nbs >= std::max(2, deg - 1)) {
+      eye_like_count += 1;  // Protected tiger's mouth
+    }
   }
-  return eye_like;
+  return eye_like_count;
+}
+
+template <int N>
+int32_t DfpnSolver<N>::EvaluatePassMoveScore(const Position<N>& pos,
+                                             const ProofContext& context,
+                                             bool is_or_node) const {
+  const int parent_eye_like_count =
+      (!is_or_node && pos.ConsecutivePasses() == 0U &&
+       config_.enable_fast_capture_ordering)
+          ? EstimateParentEyeLikeCount(pos, context)
+          : 0;
+  const NodeTacticalContext empty_tctx{};
+  return EvaluateCandidateMove(pos, context, empty_tctx, kPassMove, is_or_node,
+                               parent_eye_like_count)
+      .score;
 }
 
 template <int N>
@@ -1350,8 +1362,10 @@ void DfpnSolver<N>::MidSearch(
         sum_dn += children[idx].dn;
       }
       if (has_active_rz && min_pn >= 48U && min_pn < kPnDnSaturation) {
-        // Just-in-time relaxation: all sharp in-RZ moves are closed; relax
-        // stale !in_attention unprobed in-RZ obligations to close cleanly.
+        // High-cost unexpanded in-RZ JIT relaxation: once all sharp (< 48) in-RZ
+        // candidates have closed or exceeded 48, relax remaining unexpanded
+        // high-cost in-RZ moves (both !in_attention and low-ranked in-attention
+        // candidates) to pn=8 so stale initial bounds do not stall closure.
         bool relaxed = false;
         for (size_t idx : active_indices) {
           auto& ch = children[idx];
@@ -1390,9 +1404,11 @@ void DfpnSolver<N>::MidSearch(
         min_dn = std::min(min_dn, children[idx].dn);
       }
       if (has_active_rz && min_dn >= 48U && min_dn < kPnDnSaturation) {
-        // Just-in-time relaxation: all sharp in-RZ defenses are proven; relax
-        // stale !in_attention unprobed in-RZ defenses (dn=96+) to dn=4 so
-        // ancestor dn does not spike and bounce out of a nearly closed subtree.
+        // High-cost unexpanded in-RZ JIT relaxation: once all sharp (< 48) in-RZ
+        // defenses have closed or exceeded 48, relax remaining unexpanded
+        // high-cost in-RZ defenses (both !in_attention and low-ranked
+        // in-attention candidates) to dn=4 so stale initial bounds do not spike
+        // ancestor dn and bounce out of a nearly closed subtree.
         bool relaxed = false;
         for (size_t idx : active_indices) {
           auto& ch = children[idx];

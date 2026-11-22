@@ -5,7 +5,12 @@
 // Run via: npx tsx scripts/verify_r5_regression.ts
 
 import { DfpnSolver } from '../src/engine/dfpnSolver';
-import { coordFromRowCol, GoPosition } from '../src/engine/position';
+import {
+  coordFromRowCol,
+  GoPosition,
+  PASS_MOVE,
+  sgfToCoord,
+} from '../src/engine/position';
 import {
   SRS_BENCHMARK_PROBLEMS_CATALOG,
   TSUMEGO_PROBLEMS_CATALOG,
@@ -1161,6 +1166,111 @@ runSection('Section 7: Real-Problem Solver Breakthrough (p031 + Zero-Leaf Guardr
       `leaves=${leafCount}, dag=${rep.proofDagNodes.length}, pruned=${rep.prunedOutsideRzCount}`
     );
   }
+});
+
+// =============================================================================
+// Section 8: R9 §1 Eye-Like Heuristic & AND-Node PASS Score Parity
+// =============================================================================
+runSection('Section 8: R9 §1 Eye-Like Heuristic & AND-Node PASS Score Parity', () => {
+  const cfgRz: SolverConfig = {
+    ...defaultConfig(3500),
+    maxDepth: 48,
+    memoryBudgetMb: 512,
+    useProblemDefaultKo: true,
+    enableRzPruning: true,
+  };
+  const cfgNoRz: SolverConfig = {
+    ...cfgRz,
+    enableRzPruning: false,
+  };
+  const solverRz = new DfpnSolver(cfgRz);
+  const solverNoRz = new DfpnSolver(cfgNoRz);
+
+  const eyeCases: Array<{
+    name: string;
+    sgf: string;
+    crucial: string;
+    expectedEyeLike: number;
+    expectedPassRz: number;
+    expectedPassNoRz: number;
+  }> = [
+    {
+      name: 'full_eye_corner',
+      sgf: '(;GM[1]FF[4]SZ[19]PL[W]AB[ba][ab][bb]AW[dd])',
+      crucial: 'bb',
+      expectedEyeLike: 2,
+      expectedPassRz: 3850,
+      expectedPassNoRz: 3850,
+    },
+    {
+      name: 'single_tiger_mouth',
+      sgf: '(;GM[1]FF[4]SZ[19]PL[W]AB[ba][bb][cb]AW[dd])',
+      crucial: 'bb',
+      expectedEyeLike: 1,
+      expectedPassRz: 3450,
+      expectedPassNoRz: 360,
+    },
+    {
+      name: 'double_tiger_mouth',
+      sgf: '(;GM[1]FF[4]SZ[19]PL[W]AB[ca][cb][cc][dc][ec][eb][ea]AW[gg])',
+      crucial: 'dc',
+      expectedEyeLike: 2,
+      expectedPassRz: 3850,
+      expectedPassNoRz: 3850,
+    },
+    {
+      name: 'diag_enemy_full_eye',
+      sgf: '(;GM[1]FF[4]SZ[19]PL[W]AB[ba][ab][ca][cb][cc][bc][ac]AW[bb])',
+      crucial: 'ba',
+      expectedEyeLike: 2,
+      expectedPassRz: 3850,
+      expectedPassNoRz: 3850,
+    },
+  ];
+
+  for (const tc of eyeCases) {
+    const raw: RawStudyLdRzProblemJson = {
+      masked_sgf_str: tc.sgf,
+      winning_color: 'b',
+      turn_color: 'w',
+      black_crucial_stone: tc.crucial,
+      white_crucial_stone: '',
+      black_search_goal: 'TOLIVE',
+      white_search_goal: 'TOKILL',
+      black_ko_rule: 'disallow_ko',
+      white_ko_rule: 'allow_ko',
+      region: 'aa,ba,ca,da,ab,bb,cb,db,ac,bc,cc,dc',
+      answer_firstmove: '',
+    };
+    const spec = parseStudyLdRzJsonToProblemSpec(`r9_eye_${tc.name}`, raw);
+    const ctx = DfpnSolver.buildProofContext(spec, cfgRz);
+    const pos = DfpnSolver.buildInitialPosition(spec, ctx);
+    const eyeLike = solverRz.evaluateParentEyeLikeCount(pos, ctx);
+    const passRz = solverRz.evaluatePassMoveScore(pos, ctx, false);
+    const passNoRz = solverNoRz.evaluatePassMoveScore(pos, ctx, false);
+    check(
+      eyeLike === tc.expectedEyeLike &&
+        passRz === tc.expectedPassRz &&
+        passNoRz === tc.expectedPassNoRz,
+      `R9 §1 eye-shape ${tc.name}: eyeLike=${tc.expectedEyeLike}, passRz=${tc.expectedPassRz}, passNoRz=${tc.expectedPassNoRz}`,
+      `got eyeLike=${eyeLike}, passRz=${passRz}, passNoRz=${passNoRz}`
+    );
+  }
+
+  // Real p031 defensive line: B[sr] -> W[pass] -> B[qs] forms two tiger's mouths (rs, ss)
+  const p031 = getSpec('chao_vol1_p031');
+  const ctx31 = DfpnSolver.buildProofContext(p031, cfgRz);
+  const pos31 = DfpnSolver.buildInitialPosition(p031, ctx31);
+  const okSr = pos31.playMove(sgfToCoord('sr', 19));
+  const okPass = pos31.playMove(PASS_MOVE);
+  const okQs = pos31.playMove(sgfToCoord('qs', 19));
+  const p31Eye = solverRz.evaluateParentEyeLikeCount(pos31, ctx31);
+  const p31Pass = solverRz.evaluatePassMoveScore(pos31, ctx31, false);
+  check(
+    okSr && okPass && okQs && p31Eye === 2 && p31Pass === 3850,
+    'R9 §1 p031 after B[sr]->W[pass]->B[qs] yields eyeLike=2 and AND-node PASS score=3850',
+    `ok=${okSr}/${okPass}/${okQs}, eyeLike=${p31Eye}, passScore=${p31Pass}`
+  );
 });
 
 console.log(
