@@ -3151,6 +3151,204 @@ runSection('Section 13: R15 Receipt Cache Consistency & Zero-Throw Damaged-DAG I
   }
 });
 
+runSection('Section 14: R17 Encoding Mode Single Source of Truth & Public Serializer Structural Guard', () => {
+  const cfgRz: SolverConfig = {
+    ...defaultConfig(3500),
+    maxDepth: 48,
+    memoryBudgetMb: 512,
+    enableRzPruning: true,
+    useProblemDefaultKo: true,
+  };
+  const cloneReport = <T,>(r: T): T => JSON.parse(JSON.stringify(r));
+
+  const p001 = getSpec('p001');
+  const ctx001 = DfpnSolver.buildProofContext(p001, cfgRz);
+  const pos001 = DfpnSolver.buildInitialPosition(p001, ctx001);
+  const rep001Full = new DfpnSolver(cfgRz).solveProblem(p001);
+
+  const rep001Compact = cloneReport(rep001Full);
+  delete (rep001Compact as unknown as Record<string, unknown>).stateTable;
+  delete (rep001Compact as unknown as Record<string, unknown>).historyTable;
+
+  const chk02Detail = (vr: ReturnType<typeof checker.verifyProofDag>): string =>
+    vr.auditChecks.find((c) => c.checkId === 'CHK-02')?.detail ?? '';
+
+  // 14.1 R17 §1 (P1): Enum-only compact_dag (with skipChecksumRecompute AND with default checksum option!)
+  let threwEnumOnlySkip = false;
+  let vrEnumOnlySkip: ReturnType<typeof checker.verifyProofDag> | null = null;
+  try {
+    vrEnumOnlySkip = checker.verifyProofDag(pos001, ctx001, rep001Compact, {
+      encodingMode: 'compact_dag',
+      skipChecksumRecompute: true,
+    });
+  } catch {
+    threwEnumOnlySkip = true;
+  }
+
+  let threwEnumOnlyDefault = false;
+  let vrEnumOnlyDefault: ReturnType<typeof checker.verifyProofDag> | null = null;
+  try {
+    // Default skipChecksumRecompute=false with mismatched full-table proofChecksum -> structured LP-C01, NO TypeError!
+    vrEnumOnlyDefault = checker.verifyProofDag(pos001, ctx001, rep001Compact, {
+      encodingMode: 'compact_dag',
+    });
+  } catch {
+    threwEnumOnlyDefault = true;
+  }
+
+  // With matching compact canonical digest and default checksum option -> PASS with compact_dag audit!
+  const rep001CompactDigest = cloneReport(rep001Compact);
+  rep001CompactDigest.proofChecksum = vrEnumOnlySkip?.canonicalDagChecksum ?? '';
+  const vrEnumOnlyDefaultValid = checker.verifyProofDag(
+    pos001,
+    ctx001,
+    rep001CompactDigest,
+    { encodingMode: 'compact_dag' }
+  );
+
+  check(
+    !threwEnumOnlySkip &&
+      vrEnumOnlySkip !== null &&
+      vrEnumOnlySkip.passed &&
+      vrEnumOnlySkip.encodingMode === 'compact_dag' &&
+      chk02Detail(vrEnumOnlySkip).includes('紧凑 DAG 模式') &&
+      !threwEnumOnlyDefault &&
+      vrEnumOnlyDefault !== null &&
+      !vrEnumOnlyDefault.passed &&
+      vrEnumOnlyDefault.errorCode === 'LP-C01' &&
+      vrEnumOnlyDefault.encodingMode === 'compact_dag' &&
+      chk02Detail(vrEnumOnlyDefault).includes('紧凑 DAG 模式') &&
+      vrEnumOnlyDefaultValid.passed &&
+      vrEnumOnlyDefaultValid.encodingMode === 'compact_dag' &&
+      chk02Detail(vrEnumOnlyDefaultValid).includes('紧凑 DAG 模式'),
+    'R17 §1 (P1) enum-only compact_dag never throws (with or without skipChecksumRecompute) and aligns encodingMode + CHK-02 compact audit',
+    `skip=${vrEnumOnlySkip?.passed}/${vrEnumOnlySkip?.encodingMode}, defMismatch=${vrEnumOnlyDefault?.errorCode}/${vrEnumOnlyDefault?.encodingMode}, defValid=${vrEnumOnlyDefaultValid.passed}/${vrEnumOnlyDefaultValid.encodingMode}`
+  );
+
+  // 14.2 R17 §1 (P1): Legacy boolean-only & matching pairs align top-level encodingMode and CHK-02 detail
+  const vrBoolCompact = checker.verifyProofDag(pos001, ctx001, rep001Compact, {
+    isCompactDag: true,
+    skipChecksumRecompute: true,
+  });
+  const vrBoolFull = checker.verifyProofDag(pos001, ctx001, rep001Full, {
+    isCompactDag: false,
+  });
+  const vrEnumFull = checker.verifyProofDag(pos001, ctx001, rep001Full, {
+    encodingMode: 'full_state_table',
+  });
+  const vrBothCompact = checker.verifyProofDag(pos001, ctx001, rep001Compact, {
+    encodingMode: 'compact_dag',
+    isCompactDag: true,
+    skipChecksumRecompute: true,
+  });
+  const vrBothFull = checker.verifyProofDag(pos001, ctx001, rep001Full, {
+    encodingMode: 'full_state_table',
+    isCompactDag: false,
+  });
+  check(
+    vrBoolCompact.passed &&
+      vrBoolCompact.encodingMode === 'compact_dag' &&
+      chk02Detail(vrBoolCompact).includes('紧凑 DAG 模式') &&
+      vrBoolFull.passed &&
+      vrBoolFull.encodingMode === 'full_state_table' &&
+      !chk02Detail(vrBoolFull).includes('紧凑 DAG 模式') &&
+      vrEnumFull.passed &&
+      vrEnumFull.encodingMode === 'full_state_table' &&
+      !chk02Detail(vrEnumFull).includes('紧凑 DAG 模式') &&
+      vrBothCompact.passed &&
+      vrBothCompact.encodingMode === 'compact_dag' &&
+      chk02Detail(vrBothCompact).includes('紧凑 DAG 模式') &&
+      vrBothFull.passed &&
+      vrBothFull.encodingMode === 'full_state_table' &&
+      !chk02Detail(vrBothFull).includes('紧凑 DAG 模式'),
+    'R17 §1 (P1) legacy boolean-only, enum-only full_state_table, and matching pairs all pass with consistent encodingMode and CHK-02 replay detail',
+    `boolC=${vrBoolCompact.encodingMode}, boolF=${vrBoolFull.encodingMode}, enumF=${vrEnumFull.encodingMode}, bothC=${vrBothCompact.encodingMode}, bothF=${vrBothFull.encodingMode}`
+  );
+
+  // 14.3 R17 §1 (P1): Conflicting encodingMode vs isCompactDag options MUST be rejected with LP-J02!
+  const vrConflictFullTrue = checker.verifyProofDag(pos001, ctx001, rep001Full, {
+    encodingMode: 'full_state_table',
+    isCompactDag: true,
+  });
+  const vrConflictCompactFalse = checker.verifyProofDag(
+    pos001,
+    ctx001,
+    rep001Compact,
+    {
+      encodingMode: 'compact_dag',
+      isCompactDag: false,
+      skipChecksumRecompute: true,
+    }
+  );
+  const vrUnknownEnum = checker.verifyProofDag(pos001, ctx001, rep001Full, {
+    encodingMode: 'invalid_mode' as unknown as 'full_state_table',
+  });
+  check(
+    !vrConflictFullTrue.passed &&
+      vrConflictFullTrue.errorCode === 'LP-J02' &&
+      !vrConflictCompactFalse.passed &&
+      vrConflictCompactFalse.errorCode === 'LP-J02' &&
+      !vrUnknownEnum.passed &&
+      vrUnknownEnum.errorCode === 'LP-J02',
+    'R17 §1 (P1) rejects conflicting (full_state_table + isCompactDag=true), (compact_dag + isCompactDag=false), and invalid encodingMode enum with LP-J02',
+    `c1=${vrConflictFullTrue.passed}/${vrConflictFullTrue.errorCode}, c2=${vrConflictCompactFalse.passed}/${vrConflictCompactFalse.errorCode}, inv=${vrUnknownEnum.passed}/${vrUnknownEnum.errorCode}`
+  );
+
+  // 14.4 R17 §2 (P2): Public serializeLProofJson validates full_state_table structure before emitting JSON
+  const exportedOk = checker.serializeLProofJson(pos001, ctx001, rep001Full);
+  const parsedExportOk = JSON.parse(exportedOk.json);
+  const roundTripOk = checker.verifySerializedLProofJson(exportedOk.json, {
+    problem: p001,
+    context: ctx001,
+    scope: 'original_root',
+  });
+  check(
+    roundTripOk.passed &&
+      parsedExportOk.encodingMode === 'full_state_table' &&
+      parsedExportOk.stateTable.length === 2 &&
+      parsedExportOk.historySnapshotIds.length === 2,
+    'R17 §2 positive control: intact p001 exports valid full_state_table lproof/1 (2 states, 2 historySnapshotIds) and round-trips PASS',
+    `passed=${roundTripOk.passed}, states=${parsedExportOk.stateTable?.length}, hists=${parsedExportOk.historySnapshotIds?.length}`
+  );
+
+  const repMissingHist = cloneReport(rep001Full);
+  delete (repMissingHist as unknown as Record<string, unknown>).historyTable;
+
+  const repMissingParent = cloneReport(rep001Full);
+  delete (
+    repMissingParent.stateTable[1] as unknown as Record<string, unknown>
+  ).parentStateId;
+
+  const repMissingDag = cloneReport(rep001Full);
+  delete (repMissingDag as unknown as Record<string, unknown>).proofDagNodes;
+
+  const repEmptyStates = cloneReport(rep001Full);
+  repEmptyStates.stateTable = [];
+
+  for (const [label, badRep] of [
+    ['missing historyTable', repMissingHist],
+    ['missing stateTable[1].parentStateId', repMissingParent],
+    ['missing proofDagNodes', repMissingDag],
+    ['empty stateTable on PROVEN_WIN', repEmptyStates],
+  ] as const) {
+    let rejectedWithLpJ02 = false;
+    let errMsg = '';
+    try {
+      checker.serializeLProofJson(pos001, ctx001, badRep);
+    } catch (e) {
+      const err = e as Error & { errorCode?: string };
+      errMsg = err?.message ?? String(e);
+      rejectedWithLpJ02 =
+        err?.errorCode === 'LP-J02' || errMsg.includes('LP-J02');
+    }
+    check(
+      rejectedWithLpJ02,
+      `R17 §2 (P2): public serializeLProofJson refuses to emit unverifiable lproof/1 for p001 with ${label} (LP-J02)`,
+      `err=${errMsg}`
+    );
+  }
+});
+
 console.log(
   `\n========================================\nR5 TS Regression Summary: ${passedAssertions}/${totalAssertions} passed, ${failures.length} failed.\n========================================`
 );

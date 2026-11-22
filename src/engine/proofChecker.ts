@@ -1198,6 +1198,58 @@ export class ProofArtifactManager {
     context: ProofContext,
     report: SolveReport
   ): { json: string; checksum: string } {
+    // R17 §2 (P2): Enforce full_state_table structural integrity at the public export boundary
+    // so damaged reports (e.g., missing historyTable or missing parentStateId) cannot emit a
+    // checksummed lproof/1 file that fails re-verification.
+    const structCheck = validateReportMemoryStructure(
+      report,
+      'full_state_table'
+    );
+    if (!structCheck.ok) {
+      const err = new Error(
+        `serializeLProofJson 拒绝导出残缺的 full_state_table 报告 (${structCheck.code})：${structCheck.detail}`
+      ) as Error & { errorCode: string };
+      err.errorCode = structCheck.code;
+      throw err;
+    }
+    if (
+      report.hasRegionHint !== undefined &&
+      typeof report.hasRegionHint !== 'boolean'
+    ) {
+      const err = new Error(
+        'serializeLProofJson 拒绝导出非法 hasRegionHint 类型报告 (LP-J02)。'
+      ) as Error & { errorCode: string };
+      err.errorCode = 'LP-J02';
+      throw err;
+    }
+    if (
+      report.hasRegionHint === false &&
+      (report.regionCoords?.length ?? 0) > 0
+    ) {
+      const err = new Error(
+        'serializeLProofJson 拒绝导出矛盾区域声明（hasRegionHint=false 且 regionCoords 非空，LP-J02）。'
+      ) as Error & { errorCode: string };
+      err.errorCode = 'LP-J02';
+      throw err;
+    }
+    if (
+      report.rootStatus !== ProofOutcome.Unknown &&
+      report.stateTable.length === 0
+    ) {
+      const err = new Error(
+        'serializeLProofJson 拒绝导出空 stateTable 的已定论 full_state_table 报告 (LP-J02)。'
+      ) as Error & { errorCode: string };
+      err.errorCode = 'LP-J02';
+      throw err;
+    }
+    return this.serializeLProofJsonInternal(initialPos, context, report);
+  }
+
+  private serializeLProofJsonInternal(
+    initialPos: GoPosition,
+    context: ProofContext,
+    report: SolveReport
+  ): { json: string; checksum: string } {
     const immortalWallCoords = Array.from(initialPos.immortalWallSet).sort(
       (a, b) => a - b
     );
@@ -1207,10 +1259,7 @@ export class ProofArtifactManager {
     // Losslessly deduplicate CanonicalSnapshots across historyTable via snapshotPool
     const snapshotPool: CanonicalSnapshot[] = [];
     const snapshotIndexByKey = new Map<string, number>();
-    const rawHistoryTable = Array.isArray(report.historyTable)
-      ? report.historyTable
-      : [];
-    const historySnapshotIds: number[][] = rawHistoryTable.map((snaps) =>
+    const historySnapshotIds: number[][] = report.historyTable.map((snaps) =>
       snaps.map((s) => {
         const key = `${s.toPlay}:${s.zobristHex}:${s.blackCoords.join(
           ','
@@ -3111,10 +3160,6 @@ export class ProofArtifactManager {
       }
     };
 
-    const isCompactDag = Boolean(options?.isCompactDag);
-    const effectiveEncodingMode: LProofEncodingMode =
-      options?.encodingMode ??
-      (isCompactDag ? 'compact_dag' : 'full_state_table');
     const inferredRootKind: 'initial' | 'traced_subposition' =
       options?.verifiedRootKind ??
       (initialPos.playedMoveTrace.length > 0 ? 'traced_subposition' : 'initial');
@@ -3123,6 +3168,86 @@ export class ProofArtifactManager {
       (inferredRootKind === 'traced_subposition'
         ? 'traced_within_rules'
         : 'original_root');
+
+    // R17 §1 (P1): Resolve ONE single effective encodingMode used consistently by pre-check,
+    // checksum recomputation, state/compact replay, and the returned VerificationReport.
+    // Explicitly reject unknown enum values, non-boolean isCompactDag, or conflicting options.
+    const rawEncMode = options?.encodingMode as unknown;
+    const rawCompactFlag = options?.isCompactDag as unknown;
+    const makeModeOptionFailure = (
+      reportedMode: LProofEncodingMode,
+      detail: string
+    ): VerificationReport => ({
+      encodingMode: reportedMode,
+      verifiedScope: effectiveScope,
+      verifiedRootKind: inferredRootKind,
+      verifiedGoal: context.attackerGoal,
+      verifiedAttackerAllowKo: context.attackerAllowKo,
+      verifiedDefenderAllowKo: context.defenderAllowKo,
+      traceOutsideRegion: Boolean(options?.traceOutsideRegion),
+      traceHasRestrictedKoCapture: Boolean(options?.traceHasRestrictedKoCapture),
+      passed: false,
+      schemaVersion: 'lproof/1',
+      jcsSha256Checksum:
+        report && typeof report === 'object' && typeof report.proofChecksum === 'string'
+          ? report.proofChecksum
+          : '',
+      verifiedNodes: 0,
+      verifiedStates: 0,
+      verifiedHistories: 0,
+      replayedPrunedCertificates: 0,
+      replayedTtHits: 0,
+      failedNodeId: null,
+      errorCode: 'LP-J02',
+      message: `校验编码模式参数非法或冲突 (LP-J02)：${detail}`,
+      auditChecks: [
+        {
+          checkId: 'CHK-01',
+          requirementRef: 'FR-8.3 / R17 §1',
+          title: '编码模式参数一致性校验',
+          passed: false,
+          detail,
+        },
+      ],
+    });
+
+    if (
+      rawEncMode !== undefined &&
+      rawEncMode !== 'full_state_table' &&
+      rawEncMode !== 'compact_dag'
+    ) {
+      return makeModeOptionFailure(
+        'full_state_table',
+        `encodingMode="${String(rawEncMode)}" 非法（必须为 "full_state_table" 或 "compact_dag"）。`
+      );
+    }
+    if (rawCompactFlag !== undefined && typeof rawCompactFlag !== 'boolean') {
+      return makeModeOptionFailure(
+        rawEncMode === 'compact_dag' ? 'compact_dag' : 'full_state_table',
+        `isCompactDag=${String(rawCompactFlag)} 类型非法（必须为布尔值或省略）。`
+      );
+    }
+    if (rawEncMode !== undefined && rawCompactFlag !== undefined) {
+      const modeFromBool: LProofEncodingMode = rawCompactFlag
+        ? 'compact_dag'
+        : 'full_state_table';
+      if (rawEncMode !== modeFromBool) {
+        return makeModeOptionFailure(
+          rawEncMode,
+          `显式传入的 encodingMode="${rawEncMode}" 与 isCompactDag=${String(
+            rawCompactFlag
+          )} 相互冲突。`
+        );
+      }
+    }
+
+    const effectiveEncodingMode: LProofEncodingMode =
+      rawEncMode !== undefined
+        ? (rawEncMode as LProofEncodingMode)
+        : rawCompactFlag === true
+        ? 'compact_dag'
+        : 'full_state_table';
+    const isCompactDag = effectiveEncodingMode === 'compact_dag';
 
     // R15 P2 + R16 P2: Encoding-mode-aware zero-throw structural validation of
     // report / proofDagNodes / stateTable / historyTable BEFORE any canonical
@@ -3321,14 +3446,29 @@ export class ProofArtifactManager {
     let displayChecksum = report.proofChecksum;
     let canonicalSchemaChecksum: string | undefined = undefined;
     if (!options?.skipChecksumRecompute) {
-      const recomputed = this.serializeLProofJson(initialPos, context, report);
-      checksumValid = recomputed.checksum === report.proofChecksum;
-      displayChecksum = recomputed.checksum;
-      canonicalSchemaChecksum = this.computeCanonicalSchemaChecksum(
-        initialPos,
-        context,
-        report
-      );
+      if (isCompactDag) {
+        const compactDigest = this.computeCanonicalSchemaChecksum(
+          initialPos,
+          context,
+          report
+        );
+        canonicalSchemaChecksum = compactDigest;
+        checksumValid = compactDigest === report.proofChecksum;
+        displayChecksum = compactDigest;
+      } else {
+        const recomputed = this.serializeLProofJsonInternal(
+          initialPos,
+          context,
+          report
+        );
+        checksumValid = recomputed.checksum === report.proofChecksum;
+        displayChecksum = recomputed.checksum;
+        canonicalSchemaChecksum = this.computeCanonicalSchemaChecksum(
+          initialPos,
+          context,
+          report
+        );
+      }
     } else if (report.rootStatus !== ProofOutcome.Unknown) {
       canonicalSchemaChecksum = this.computeCanonicalSchemaChecksum(
         initialPos,
