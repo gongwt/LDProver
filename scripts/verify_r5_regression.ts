@@ -2724,6 +2724,357 @@ runSection('Section 12: R14 No-File Original-Root Evidence Discipline, Defensive
   );
 });
 
+runSection('Section 13: R15 Receipt Cache Consistency & Zero-Throw Damaged-DAG Isolation', () => {
+  const cfgRz: SolverConfig = {
+    ...defaultConfig(3500),
+    maxDepth: 48,
+    memoryBudgetMb: 512,
+    enableRzPruning: true,
+    useProblemDefaultKo: true,
+  };
+  const cloneReport = <T,>(r: T): T => JSON.parse(JSON.stringify(r));
+
+  const p162 = getSpec('chao_vol2_p162');
+  const ctx162 = DfpnSolver.buildProofContext(p162, cfgRz);
+  const rep162Orig = new DfpnSolver(cfgRz).solveProblem(p162);
+  const srMove = sgfToCoord('sr', 19);
+  const subPos162 = DfpnSolver.buildInitialPosition(p162, ctx162);
+  subPos162.playMove(srMove);
+  subPos162.playMove(PASS_MOVE);
+  const rep162Sub = new DfpnSolver(cfgRz).solveFromPosition(
+    p162,
+    subPos162,
+    ctx162
+  );
+
+  // 13.1 R15 §1 (P1) Direction A: Invalid non-string lproofJson -> fixed in-place to no-file + full runContract
+  // Cold, same-instance implicit reuse, and cross-instance old-receipt reuse MUST ALL agree (UNKNOWN / 3500)!
+  const rep162Fixable = cloneReport(rep162Orig);
+  (rep162Fixable as unknown as Record<string, unknown>).lproofJson = 12345;
+
+  const sameChecker162 = new ProofArtifactManager();
+  const badReceipt162 = sameChecker162.verifyOriginalRootReceipt({
+    problem: p162,
+    context: ctx162,
+    report: rep162Fixable,
+  });
+  const badFrag162 = sameChecker162.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162Fixable,
+  });
+  check(
+    badReceipt162.originalRootOutcome === null &&
+      badReceipt162.originalRootNodes === null &&
+      Boolean(badReceipt162.originalRootBindingNote?.includes('LP-J01')) &&
+      badFrag162.sourceReceipt.passed &&
+      badFrag162.originalRootOutcome === null &&
+      Boolean(badFrag162.originalRootBindingNote?.includes('LP-J01')),
+    'R15 §1A setup: non-string lproofJson=12345 rejected with LP-J01 while sr/pass stays SOURCE_VERIFIED',
+    `rcptNote=${String(badReceipt162.originalRootBindingNote)}`
+  );
+
+  // Fix in place to supported no-file + intact runContract form
+  delete (rep162Fixable as unknown as Record<string, unknown>).lproofJson;
+  const fixedSameInst = sameChecker162.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162Fixable,
+  });
+  const fixedCrossInst = new ProofArtifactManager().verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162Fixable,
+    verifiedOriginalRootReceipt: badReceipt162,
+  });
+  const fixedColdInst = new ProofArtifactManager().verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162Fixable,
+  });
+  const fixedReceiptAfter = new ProofArtifactManager().verifyOriginalRootReceipt({
+    problem: p162,
+    context: ctx162,
+    report: rep162Fixable,
+  });
+  check(
+    badReceipt162.reportContentFingerprint !== fixedReceiptAfter.reportContentFingerprint &&
+      fixedSameInst.sourceReceipt.passed &&
+      fixedCrossInst.sourceReceipt.passed &&
+      fixedColdInst.sourceReceipt.passed &&
+      fixedSameInst.originalRootOutcome === ProofOutcome.Unknown &&
+      fixedSameInst.originalRootNodes === 3500 &&
+      fixedSameInst.originalRootBindingNote === undefined &&
+      fixedCrossInst.originalRootOutcome === ProofOutcome.Unknown &&
+      fixedCrossInst.originalRootNodes === 3500 &&
+      fixedCrossInst.originalRootBindingNote === undefined &&
+      fixedColdInst.originalRootOutcome === ProofOutcome.Unknown &&
+      fixedColdInst.originalRootNodes === 3500 &&
+      fixedColdInst.originalRootBindingNote === undefined,
+    'R15 §1A (P1): correcting non-string lproofJson -> undefined yields identical UNKNOWN/3500 across same-instance, cross-instance old receipt, and cold checker (distinct fingerprints)',
+    `same=${String(fixedSameInst.originalRootOutcome)}/${String(fixedSameInst.originalRootNodes)}/${String(fixedSameInst.originalRootBindingNote)}, cross=${String(fixedCrossInst.originalRootOutcome)}/${String(fixedCrossInst.originalRootNodes)}, cold=${String(fixedColdInst.originalRootOutcome)}/${String(fixedColdInst.originalRootNodes)}`
+  );
+
+  // 13.2 R15 §1 (P1) Direction B: Valid no-file p162 -> subsequently corrupted in-place with non-string lproofJson
+  const validToBadChecker = new ProofArtifactManager();
+  const rep162ValidThenBad = cloneReport(rep162Orig);
+  delete (rep162ValidThenBad as unknown as Record<string, unknown>).lproofJson;
+  const goodReceipt162 = validToBadChecker.verifyOriginalRootReceipt({
+    problem: p162,
+    context: ctx162,
+    report: rep162ValidThenBad,
+  });
+  // Corrupt in place to non-string
+  (rep162ValidThenBad as unknown as Record<string, unknown>).lproofJson = { bogus: true };
+  const corrSameInst = validToBadChecker.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162ValidThenBad,
+  });
+  const corrCrossInst = new ProofArtifactManager().verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162ValidThenBad,
+    verifiedOriginalRootReceipt: goodReceipt162,
+  });
+  const corrColdInst = new ProofArtifactManager().verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162ValidThenBad,
+  });
+  check(
+    goodReceipt162.originalRootOutcome === ProofOutcome.Unknown &&
+      corrSameInst.sourceReceipt.passed &&
+      corrCrossInst.sourceReceipt.passed &&
+      corrColdInst.sourceReceipt.passed &&
+      corrSameInst.originalRootOutcome === null &&
+      corrSameInst.originalRootNodes === null &&
+      Boolean(corrSameInst.originalRootBindingNote?.includes('LP-J01')) &&
+      corrCrossInst.originalRootOutcome === null &&
+      corrCrossInst.originalRootNodes === null &&
+      Boolean(corrCrossInst.originalRootBindingNote?.includes('LP-J01')) &&
+      corrColdInst.originalRootOutcome === null &&
+      corrColdInst.originalRootNodes === null &&
+      Boolean(corrColdInst.originalRootBindingNote?.includes('LP-J01')),
+    'R15 §1B (P1): corrupting valid no-file p162 in-place to non-string lproofJson invalidates cache/receipt identically across same-instance, cross-instance, and cold checker (LP-J01)',
+    `same=${String(corrSameInst.originalRootOutcome)}/${String(corrSameInst.originalRootBindingNote)}, cross=${String(corrCrossInst.originalRootOutcome)}, cold=${String(corrColdInst.originalRootOutcome)}`
+  );
+
+  // 13.3 R15 §1 (P1) Numeric boundary: non-integer float 2^32 + 0.5 vs safe integer 2^32 (and 1.5 vs 1) on p001, both directions!
+  const p001 = getSpec('p001');
+  const ctx001 = DfpnSolver.buildProofContext(p001, cfgRz);
+  const rep001 = new DfpnSolver(cfgRz).solveProblem(p001);
+  const baMove = sgfToCoord('ba', p001.boardSize);
+
+  const rep001NumBoundary = cloneReport(rep001);
+  const floatBoundary = 4294967296.5;
+  const intBoundary = 4294967296;
+  rep001NumBoundary.numNodes = floatBoundary;
+
+  const numChecker = new ProofArtifactManager();
+  const badNumReceipt = numChecker.verifyOriginalRootReceipt({
+    problem: p001,
+    context: ctx001,
+    report: rep001NumBoundary,
+  });
+  // Fix numNodes in place from 4294967296.5 -> 4294967296
+  rep001NumBoundary.numNodes = intBoundary;
+  const numFixedSame = numChecker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001NumBoundary,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  const numFixedCross = new ProofArtifactManager().verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001NumBoundary,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+    verifiedOriginalRootReceipt: badNumReceipt,
+  });
+  const numFixedCold = new ProofArtifactManager().verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001NumBoundary,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  const goodNumReceipt = numChecker.verifyOriginalRootReceipt({
+    problem: p001,
+    context: ctx001,
+    report: rep001NumBoundary,
+  });
+  // Reverse direction: corrupt valid 4294967296 back to 4294967296.5!
+  rep001NumBoundary.numNodes = floatBoundary;
+  const numCorrSame = numChecker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001NumBoundary,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  const numCorrCross = new ProofArtifactManager().verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001NumBoundary,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+    verifiedOriginalRootReceipt: goodNumReceipt,
+  });
+  const numCorrCold = new ProofArtifactManager().verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001NumBoundary,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    badNumReceipt.originalRootOutcome === null &&
+      Boolean(badNumReceipt.originalRootBindingNote?.includes('LP-J02')) &&
+      badNumReceipt.reportContentFingerprint !== goodNumReceipt.reportContentFingerprint &&
+      numFixedSame.originalRootOutcome === ProofOutcome.ProvenWin &&
+      numFixedSame.originalRootNodes === intBoundary &&
+      numFixedCross.originalRootOutcome === ProofOutcome.ProvenWin &&
+      numFixedCross.originalRootNodes === intBoundary &&
+      numFixedCold.originalRootOutcome === ProofOutcome.ProvenWin &&
+      numFixedCold.originalRootNodes === intBoundary &&
+      numCorrSame.originalRootOutcome === null &&
+      numCorrSame.originalRootNodes === null &&
+      Boolean(numCorrSame.originalRootBindingNote?.includes('LP-J02')) &&
+      numCorrCross.originalRootOutcome === null &&
+      numCorrCross.originalRootNodes === null &&
+      Boolean(numCorrCross.originalRootBindingNote?.includes('LP-J02')) &&
+      numCorrCold.originalRootOutcome === null &&
+      numCorrCold.originalRootNodes === null &&
+      Boolean(numCorrCold.originalRootBindingNote?.includes('LP-J02')),
+    'R15 §1C (P1): IEEE-754 float64 fingerprinting + pre-cache count validation keep 4294967296.5 <-> 4294967296 consistent across cold, same-instance, and cross-instance calls in both directions',
+    `fpDiff=${badNumReceipt.reportContentFingerprint !== goodNumReceipt.reportContentFingerprint}, fixed=${String(numFixedSame.originalRootOutcome)}/${String(numFixedCross.originalRootOutcome)}/${String(numFixedCold.originalRootOutcome)}, corr=${String(numCorrSame.originalRootOutcome)}/${String(numCorrCross.originalRootOutcome)}/${String(numCorrCold.originalRootOutcome)}`
+  );
+
+  // 13.4 R15 §2 (P2): Damaged proofDagNodes (missing array OR null element) on p001 with intact lproofJson
+  // MUST NOT throw TypeError on ANY public entrypoint, and MUST preserve standalone ba SOURCE_VERIFIED!
+  const pos001Orig = DfpnSolver.buildInitialPosition(p001, ctx001);
+  const pos001AfterBa = pos001Orig.clone();
+  pos001AfterBa.playMove(baMove);
+  const rep001BaStandalone = new DfpnSolver(cfgRz).solveFromPosition(
+    p001,
+    pos001AfterBa,
+    ctx001
+  );
+
+  const rep001MissingDag = cloneReport(rep001);
+  delete (rep001MissingDag as unknown as Record<string, unknown>).proofDagNodes;
+
+  const rep001NullDagRow = cloneReport(rep001);
+  (rep001NullDagRow.proofDagNodes as unknown[])[0] = null;
+
+  for (const [label, damaged] of [
+    ['missing proofDagNodes', rep001MissingDag],
+    ['null proofDagNodes[0]', rep001NullDagRow],
+  ] as const) {
+    let threwReceipt = false;
+    let threwMain = false;
+    let threwCompanion = false;
+    let threwDirectDag = false;
+
+    let rcptRes: ReturnType<typeof checker.verifyOriginalRootReceipt> | null = null;
+    let mainRes: ReturnType<typeof checker.verifySubproofFragment> | null = null;
+    let compRes: ReturnType<typeof checker.verifySubproofFragment> | null = null;
+    let dagRes: ReturnType<typeof checker.verifyProofDag> | null = null;
+
+    try {
+      rcptRes = checker.verifyOriginalRootReceipt({
+        problem: p001,
+        context: ctx001,
+        report: damaged,
+      });
+    } catch {
+      threwReceipt = true;
+    }
+
+    try {
+      mainRes = checker.verifySubproofFragment({
+        problem: p001,
+        context: ctx001,
+        report: damaged,
+        targetPathMoves: [baMove],
+        targetDagNodeId: 0,
+      });
+    } catch {
+      threwMain = true;
+    }
+
+    try {
+      compRes = checker.verifySubproofFragment({
+        problem: p001,
+        context: ctx001,
+        report: rep001BaStandalone,
+        targetPathMoves: [baMove],
+        targetDagNodeId: rep001BaStandalone.rootDagNodeId,
+        originalRootReport: damaged,
+      });
+    } catch {
+      threwCompanion = true;
+    }
+
+    try {
+      dagRes = checker.verifyProofDag(pos001Orig, ctx001, damaged);
+    } catch {
+      threwDirectDag = true;
+    }
+
+    check(
+      !threwReceipt &&
+        !threwMain &&
+        !threwCompanion &&
+        !threwDirectDag &&
+        rcptRes !== null &&
+        rcptRes.originalRootOutcome === null &&
+        rcptRes.originalRootNodes === null &&
+        Boolean(rcptRes.originalRootBindingNote?.includes('LP-J02')) &&
+        mainRes !== null &&
+        mainRes.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+        mainRes.sourceReceipt.errorCode === 'LP-J02' &&
+        mainRes.originalRootOutcome === null &&
+        mainRes.originalRootNodes === null &&
+        compRes !== null &&
+        compRes.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+        compRes.sourceReceipt.passed &&
+        compRes.originalRootOutcome === null &&
+        compRes.originalRootNodes === null &&
+        Boolean(compRes.originalRootBindingNote?.includes('LP-J02')) &&
+        dagRes !== null &&
+        !dagRes.passed &&
+        dagRes.errorCode === 'LP-J02',
+      `R15 §2 (P2): p001 with ${label} (intact lproofJson) never throws across all 4 entrypoints, rejects main/receipt/direct with LP-J02, and preserves companion ba SOURCE_VERIFIED`,
+      `threw=[${threwReceipt},${threwMain},${threwCompanion},${threwDirectDag}], rcpt=${String(rcptRes?.originalRootOutcome)}, main=${mainRes?.sourceReceipt.status}/${mainRes?.sourceReceipt.errorCode}, comp=${compRes?.sourceReceipt.status}/orig=${String(compRes?.originalRootOutcome)}, dag=${dagRes?.errorCode}`
+    );
+  }
+});
+
 console.log(
   `\n========================================\nR5 TS Regression Summary: ${passedAssertions}/${totalAssertions} passed, ${failures.length} failed.\n========================================`
 );

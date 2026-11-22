@@ -189,6 +189,7 @@ export function canonicalizeJsonJcs(value: unknown): string {
 }
 
 function numberArraysEqual(a: number[], b: number[]): boolean {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) {
     if (a[i] !== b[i]) return false;
@@ -200,11 +201,13 @@ function historyTablesMatch(
   claimed: CanonicalSnapshot[] | undefined,
   rebuilt: CanonicalSnapshot[]
 ): boolean {
-  if (!claimed || claimed.length !== rebuilt.length) return false;
+  if (!Array.isArray(claimed) || claimed.length !== rebuilt.length) return false;
   for (let i = 0; i < rebuilt.length; i++) {
     const c = claimed[i];
     const r = rebuilt[i];
     if (
+      !c ||
+      typeof c !== 'object' ||
       c.toPlay !== r.toPlay ||
       c.zobristHex !== r.zobristHex ||
       !numberArraysEqual(c.blackCoords, r.blackCoords) ||
@@ -235,7 +238,10 @@ function decodeColor(val: unknown): Color | null {
 function isIntegerArray(val: unknown): val is number[] {
   if (!Array.isArray(val)) return false;
   for (let i = 0; i < val.length; i++) {
-    if (typeof val[i] !== 'number' || !Number.isInteger(val[i])) return false;
+    const item = val[i];
+    if ((item | 0) !== item && (typeof item !== 'number' || !Number.isInteger(item))) {
+      return false;
+    }
   }
   return true;
 }
@@ -451,13 +457,16 @@ export function deriveDefaultProofContextFromProblem(
   };
 }
 
+type ValidLproofKind = 'string' | 'undefined' | 'null';
+
 interface InternalOriginalRootReceiptRecord {
   readonly scope: 'original_root';
   readonly contractDigest: string;
   readonly reportContentFingerprint: string;
+  readonly lproofKind: ValidLproofKind;
   readonly lproofJson: string;
-  readonly originalRootOutcome: ProofOutcome | null;
-  readonly originalRootNodes: number | null;
+  readonly originalRootOutcome: ProofOutcome;
+  readonly originalRootNodes: number;
   readonly originalRootBindingNote?: string;
 }
 
@@ -499,6 +508,182 @@ function sameTargetTokensSafe(a: unknown, b: TargetToken[]): boolean {
 
 function isValidNonNegativeNodeCount(n: unknown): n is number {
   return typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
+}
+
+/**
+ * R15 P2: Zero-throw structural validator for in-memory SolveReport DAG/state/history arrays.
+ * Runs BEFORE any `.map` / `.length` / `.nodeId` dereference in verifyProofDag,
+ * verifyOriginalRootReceipt, and verifySubproofFragment so missing or null-element arrays
+ * return structured LP-J02 failures instead of throwing TypeError.
+ */
+function validateReportMemoryStructure(
+  report: unknown
+):
+  | { ok: true }
+  | { ok: false; code: 'LP-J02'; detail: string; failedNodeId: number | null } {
+  if (!report || typeof report !== 'object' || Array.isArray(report)) {
+    return {
+      ok: false,
+      code: 'LP-J02',
+      detail: 'SolveReport 缺失或非合法对象。',
+      failedNodeId: null,
+    };
+  }
+  const r = report as Record<string, unknown>;
+  if (!Array.isArray(r.proofDagNodes)) {
+    return {
+      ok: false,
+      code: 'LP-J02',
+      detail: 'SolveReport.proofDagNodes 缺失或非数组。',
+      failedNodeId: null,
+    };
+  }
+  const nodes = r.proofDagNodes as unknown[];
+  for (let i = 0; i < nodes.length; i++) {
+    const raw = nodes[i];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: `proofDagNodes[${i}] 缺失或非合法对象。`,
+        failedNodeId: i,
+      };
+    }
+    const n = raw as Record<string, unknown>;
+    if (
+      typeof n.nodeId !== 'number' ||
+      !Number.isInteger(n.nodeId) ||
+      typeof n.isOrNode !== 'boolean' ||
+      decodeColor(n.toPlay) === null ||
+      typeof n.incomingMove !== 'number' ||
+      !Number.isInteger(n.incomingMove) ||
+      typeof n.pn !== 'number' ||
+      !Number.isFinite(n.pn) ||
+      typeof n.dn !== 'number' ||
+      !Number.isFinite(n.dn) ||
+      typeof n.outcome !== 'string' ||
+      typeof n.isPrunedOutsideRz !== 'boolean' ||
+      typeof n.isTtHit !== 'boolean' ||
+      !isIntegerArray(n.childNodeIds) ||
+      !isIntegerArray(n.childMoves) ||
+      !isIntegerArray(n.proofRzCoords) ||
+      !isIntegerArray(n.disproofRzCoords)
+    ) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: `proofDagNodes[${i}] 缺少必需字段或字段类型非法。`,
+        failedNodeId: i,
+      };
+    }
+    if (n.prunedCertificate !== null && n.prunedCertificate !== undefined) {
+      if (
+        typeof n.prunedCertificate !== 'object' ||
+        Array.isArray(n.prunedCertificate)
+      ) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: `proofDagNodes[${i}].prunedCertificate 结构非法。`,
+          failedNodeId: i,
+        };
+      }
+      const pc = n.prunedCertificate as Record<string, unknown>;
+      if (!isIntegerArray(pc.certificateRzCoords)) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: `proofDagNodes[${i}].prunedCertificate.certificateRzCoords 缺失或非法。`,
+          failedNodeId: i,
+        };
+      }
+    }
+  }
+
+  if (r.stateTable !== undefined) {
+    if (!Array.isArray(r.stateTable)) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: 'SolveReport.stateTable 非数组。',
+        failedNodeId: null,
+      };
+    }
+    const states = r.stateTable as unknown[];
+    for (let i = 0; i < states.length; i++) {
+      const st = states[i];
+      if (!st || typeof st !== 'object' || Array.isArray(st)) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: `stateTable[${i}] 缺失或非合法对象。`,
+          failedNodeId: null,
+        };
+      }
+      const sto = st as Record<string, unknown>;
+      if (
+        typeof sto.zobristHex !== 'string' ||
+        !Array.isArray(sto.blackCoords) ||
+        !Array.isArray(sto.whiteCoords)
+      ) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: `stateTable[${i}] 缺少必需字段或坐标数组非法。`,
+          failedNodeId: null,
+        };
+      }
+    }
+  }
+
+  if (r.historyTable !== undefined) {
+    if (!Array.isArray(r.historyTable)) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: 'SolveReport.historyTable 非数组。',
+        failedNodeId: null,
+      };
+    }
+    const histories = r.historyTable as unknown[];
+    for (let i = 0; i < histories.length; i++) {
+      const h = histories[i];
+      if (!Array.isArray(h)) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: `historyTable[${i}] 非快照数组。`,
+          failedNodeId: null,
+        };
+      }
+      for (let j = 0; j < h.length; j++) {
+        const snap = h[j];
+        if (!snap || typeof snap !== 'object' || Array.isArray(snap)) {
+          return {
+            ok: false,
+            code: 'LP-J02',
+            detail: `historyTable[${i}][${j}] 缺失或非合法对象。`,
+            failedNodeId: null,
+          };
+        }
+        const so = snap as Record<string, unknown>;
+        if (
+          typeof so.zobristHex !== 'string' ||
+          !Array.isArray(so.blackCoords) ||
+          !Array.isArray(so.whiteCoords)
+        ) {
+          return {
+            ok: false,
+            code: 'LP-J02',
+            detail: `historyTable[${i}][${j}] 缺少必需字段或坐标数组非法。`,
+            failedNodeId: null,
+          };
+        }
+      }
+    }
+  }
+
+  return { ok: true };
 }
 
 function computeExternalContractDigest(
@@ -596,6 +781,9 @@ function parseLproofHeaderCached(raw: string): ParsedLproofHeaderCacheEntry {
 }
 
 const FP_STATE = new Int32Array(4);
+const FP_F64_BUF = new ArrayBuffer(8);
+const FP_F64 = new Float64Array(FP_F64_BUF);
+const FP_F64_I32 = new Int32Array(FP_F64_BUF);
 
 function fpMixInt(v: number): void {
   const x = v | 0;
@@ -617,18 +805,20 @@ function fpMixScalar(val: unknown): void {
   const t = typeof val;
   if (t === 'number') {
     const n = val as number;
-    if ((n | 0) === n) {
+    if ((n | 0) === n && (n !== 0 || 1 / n > 0)) {
       fpMixInt(0x44444440);
       fpMixInt(n);
       return;
     }
-    if (!Number.isFinite(n)) {
-      fpMixInt(Number.isNaN(n) ? 0x44444441 : n > 0 ? 0x44444442 : 0x44444443);
+    if (Number.isNaN(n)) {
+      fpMixInt(0x44444441);
       return;
     }
+    // Exact IEEE-754 float64 bit representation (prevents 2^32 vs 2^32+0.5 or float collisions)
+    FP_F64[0] = n;
     fpMixInt(0x44444444);
-    fpMixInt(n | 0);
-    fpMixInt(Math.floor(n / 0x100000000) | 0);
+    fpMixInt(FP_F64_I32[0]);
+    fpMixInt(FP_F64_I32[1]);
     return;
   }
   if (t === 'boolean') {
@@ -651,7 +841,20 @@ function fpMixScalar(val: unknown): void {
     FP_STATE[3] = Math.imul(FP_STATE[3] ^ b, 0x27d4eb2f);
     return;
   }
-  fpMixInt(0x66666666);
+  if (t === 'bigint') {
+    fpMixInt(0x66666663);
+    fpMixScalar((val as bigint).toString(16));
+    return;
+  }
+  if (t === 'symbol') {
+    fpMixInt(0x66666665);
+    return;
+  }
+  if (t === 'function') {
+    fpMixInt(0x66666664);
+    return;
+  }
+  fpMixInt(Array.isArray(val) ? 0x66666661 : 0x66666662);
 }
 
 function fpMixIntArray(arr: unknown): void {
@@ -664,9 +867,9 @@ function fpMixIntArray(arr: unknown): void {
   let b = Math.imul(FP_STATE[1] ^ len, 0x85ebca6b);
   for (let i = 0; i < len; i++) {
     const item = arr[i];
-    if ((item | 0) === item) {
-      a = Math.imul(a ^ item, 0x01000193);
-      b = Math.imul(b ^ (item + i), 0x85ebca6b);
+    if ((item | 0) === item && (item !== 0 || 1 / (item as number) > 0)) {
+      a = Math.imul(a ^ (item as number), 0x01000193);
+      b = Math.imul(b ^ ((item as number) + i), 0x85ebca6b);
     } else {
       FP_STATE[0] = a;
       FP_STATE[1] = b;
@@ -683,10 +886,11 @@ function fpMixIntArray(arr: unknown): void {
 
 /**
  * Fast, zero-throw 128-bit structural fingerprint over ALL live audit-relevant fields
- * of a SolveReport (excluding lproofJson string, which is checked via exact immutable
- * string equality `===`). Detects ANY in-place or cloned mutation on metadata,
- * runContract, proofDagNodes, stateTable, or historyTable without relying on mutable
- * object references, Zobrist hashes, or self-reported checksums.
+ * of a SolveReport (with exact runtime type discrimination for lproofJson and exact
+ * IEEE-754 float64 bit hashing for non-int32 numbers; string lproofJson content is
+ * additionally verified via exact immutable string equality `===`). Detects ANY in-place
+ * or cloned mutation on metadata, runContract, proofDagNodes, stateTable, or historyTable
+ * without relying on mutable object references, Zobrist hashes, or self-reported checksums.
  */
 function computeLiveReportFingerprint(report: SolveReport): string {
   FP_STATE[0] = 0x811c9dc5 | 0;
@@ -721,9 +925,18 @@ function computeLiveReportFingerprint(report: SolveReport): string {
   fpMixScalar(report.numNodes);
   fpMixScalar(report.rootDagNodeId);
   fpMixScalar(report.proofChecksum);
-  fpMixScalar(
-    typeof report.lproofJson === 'string' ? report.lproofJson.length : -1
-  );
+  const lpVal = report.lproofJson as unknown;
+  if (lpVal === undefined) {
+    fpMixInt(0x61000000);
+  } else if (lpVal === null) {
+    fpMixInt(0x61000001);
+  } else if (typeof lpVal === 'string') {
+    fpMixInt(0x61000002);
+    fpMixInt(lpVal.length);
+  } else {
+    fpMixInt(0x61000003);
+    fpMixScalar(lpVal);
+  }
   fpMixScalar(report.branchCoverageSnapshots?.[0]?.runSource);
   fpMixIntArray(report.blackInitialCoords);
   fpMixIntArray(report.whiteInitialCoords);
@@ -2835,6 +3048,47 @@ export class ProofArtifactManager {
         ? 'traced_within_rules'
         : 'original_root');
 
+    // R15 P2: Zero-throw structural validation of report / proofDagNodes / stateTable / historyTable
+    // BEFORE any canonical projection (.map/.nodeId) or checksum recomputation!
+    const memStructureCheck = validateReportMemoryStructure(report);
+    if (!memStructureCheck.ok) {
+      return {
+        encodingMode: effectiveEncodingMode,
+        verifiedScope: effectiveScope,
+        verifiedRootKind: inferredRootKind,
+        verifiedGoal: context.attackerGoal,
+        verifiedAttackerAllowKo: context.attackerAllowKo,
+        verifiedDefenderAllowKo: context.defenderAllowKo,
+        traceOutsideRegion: Boolean(options?.traceOutsideRegion),
+        traceHasRestrictedKoCapture: Boolean(
+          options?.traceHasRestrictedKoCapture
+        ),
+        passed: false,
+        schemaVersion: 'lproof/1',
+        jcsSha256Checksum:
+          report && typeof report === 'object' && typeof report.proofChecksum === 'string'
+            ? report.proofChecksum
+            : '',
+        verifiedNodes: 0,
+        verifiedStates: 0,
+        verifiedHistories: 0,
+        replayedPrunedCertificates: 0,
+        replayedTtHits: 0,
+        failedNodeId: memStructureCheck.failedNodeId,
+        errorCode: memStructureCheck.code,
+        message: `内存证明报告结构损坏 (${memStructureCheck.code})：${memStructureCheck.detail}`,
+        auditChecks: [
+          {
+            checkId: 'CHK-01',
+            requirementRef: 'FR-8.3 / R15 §2',
+            title: '内存证明 DAG 与状态/历史表结构完整性校验',
+            passed: false,
+            detail: memStructureCheck.detail,
+          },
+        ],
+      };
+    }
+
     // R8 §3: Reject non-boolean or contradictory hasRegionHint=false + non-empty regionCoords
     // in the in-memory verification entrypoint instead of silently rewriting regionCoords.
     if (
@@ -4582,12 +4836,94 @@ export class ProofArtifactManager {
     verificationSource: 'verified_now' | 'reused_receipt';
     receipt: VerifiedOriginalRootReceipt;
   } {
-    const liveFingerprint = computeLiveReportFingerprint(candReport);
-    const liveLproofStr =
-      typeof candReport?.lproofJson === 'string' ? candReport.lproofJson : '';
+    // R15 P1: Structurally invalid, contract-invalid, or failed original-root reports NEVER
+    // populate verifiedOriginalRootCache or VERIFIED_ORIGINAL_ROOT_RECEIPT_REGISTRY.
+    const makeNonReusableFailure = (note: string) => {
+      const receiptObj: VerifiedOriginalRootReceipt = Object.freeze({
+        scope: 'original_root',
+        contractDigest: env.contractDigest,
+        reportContentFingerprint: computeLiveReportFingerprint(candReport),
+        originalRootOutcome: null,
+        originalRootNodes: null,
+        originalRootBindingNote: note,
+      });
+      return {
+        outcome: null,
+        nodes: null,
+        note,
+        verificationSource: 'verified_now' as const,
+        receipt: receiptObj,
+      };
+    };
 
-    // 1. Check explicitly supplied unforgeable receipt (valid ONLY when scope, external contractDigest,
-    //    live 128-bit content fingerprint, AND exact immutable lproofJson string ALL match!)
+    // 1. R15 P1 & P2: Run cheap pre-cache validation (lproofJson field type, contract binding,
+    //    root provenance, numNodes safe-integer range, rootStatus, and DAG/table structural shape)
+    //    BEFORE any cache or supplied-receipt lookup!
+    const contractRes =
+      preValidated ?? this.validateSingleReportContract(candReport, problem, env);
+    if (!contractRes.ok) {
+      return makeNonReusableFailure(
+        `原根报告未通过契约绑定 (${contractRes.code})：${contractRes.detail}`
+      );
+    }
+    if (contractRes.derivedRunSource !== 'original_root') {
+      return makeNonReusableFailure(
+        '原根报告来自独立子局面 (traced_subposition)，不能代表原题根部结论 (LP-P02)。'
+      );
+    }
+    if (!isValidNonNegativeNodeCount(candReport.numNodes)) {
+      return makeNonReusableFailure(
+        `原根报告的已耗搜索节点数 numNodes=${String(
+          candReport.numNodes
+        )} 非法（必须为非负安全整数，LP-J02）。`
+      );
+    }
+
+    if (!preValidated) {
+      const memStruct = validateReportMemoryStructure(candReport);
+      if (!memStruct.ok) {
+        return makeNonReusableFailure(
+          `原根报告内存 DAG/状态表结构损坏 (${memStruct.code})：${memStruct.detail}`
+        );
+      }
+    }
+
+    if (candReport.rootStatus === ProofOutcome.Unknown) {
+      // R14 §2: UNKNOWN without lproofJson is ONLY attributed when full proposition contract
+      // (goal, role, crucial tokens, ko rules, region, and valid initial rootKind) is bound!
+      if (!contractRes.hasFullPropositionContract) {
+        return makeNonReusableFailure(
+          '原根报告既缺少内嵌 lproof/1 文件证书，也缺少结构化 runContract（仅有配置指纹，无法核验攻防目标与关键子归属），无法确认原根结论。'
+        );
+      }
+    } else if (
+      candReport.rootStatus !== ProofOutcome.ProvenWin &&
+      candReport.rootStatus !== ProofOutcome.ProvenLoss
+    ) {
+      return makeNonReusableFailure(
+        `原根报告 rootStatus="${String(candReport.rootStatus)}" 非法 (LP-J02)。`
+      );
+    } else if (!contractRes.hasEmbeddedLproof) {
+      // R14 §2: Proven original-root verdicts require dual (file + memory) independent verification;
+      // when lproofJson is absent, preserve valid fragment receipts while leaving originalRootOutcome null!
+      return makeNonReusableFailure(
+        `原根声称 ${candReport.rootStatus}，但缺少内嵌 lproof/1 文件证书，无法完成文件+内存双重复核（仅保留当前片段独立校验回执）。`
+      );
+    }
+
+    // 2. Compute lossless live fingerprint + exact lproofJson runtime kind & immutable string
+    const liveFingerprint = computeLiveReportFingerprint(candReport);
+    const liveLproofKind: ValidLproofKind =
+      candReport.lproofJson === undefined
+        ? 'undefined'
+        : candReport.lproofJson === null
+        ? 'null'
+        : 'string';
+    const liveLproofStr =
+      liveLproofKind === 'string' ? (candReport.lproofJson as string) : '';
+
+    // 3. Check explicitly supplied unforgeable receipt (valid-only registry: requires scope,
+    //    external contractDigest, lossless 128-bit fingerprint, exact lproofKind, AND lproofJson ===)
     if (suppliedReceipt !== undefined) {
       const reg = VERIFIED_ORIGINAL_ROOT_RECEIPT_REGISTRY.get(suppliedReceipt);
       if (
@@ -4595,6 +4931,7 @@ export class ProofArtifactManager {
         reg.scope === 'original_root' &&
         reg.contractDigest === env.contractDigest &&
         reg.reportContentFingerprint === liveFingerprint &&
+        reg.lproofKind === liveLproofKind &&
         reg.lproofJson === liveLproofStr
       ) {
         return {
@@ -4607,12 +4944,13 @@ export class ProofArtifactManager {
       }
     }
 
-    // 2. Check per-instance content-bound cache (keyed by external contractDigest + live 128-bit fingerprint + exact lproofJson)
-    const cacheKey = `${env.contractDigest}|${liveFingerprint}`;
+    // 4. Check per-instance valid-only content-bound cache
+    const cacheKey = `${env.contractDigest}|${liveFingerprint}|${liveLproofKind}`;
     const cached = this.verifiedOriginalRootCache.get(cacheKey);
     if (
       cached &&
       cached.scope === 'original_root' &&
+      cached.lproofKind === liveLproofKind &&
       cached.lproofJson === liveLproofStr
     ) {
       const receiptObj: VerifiedOriginalRootReceipt = Object.freeze({
@@ -4635,20 +4973,15 @@ export class ProofArtifactManager {
       };
     }
 
-    // 3. Perform fresh, zero-trust verification
-    const finish = (
-      outcome: ProofOutcome | null,
-      nodes: number | null,
-      note?: string
-    ) => {
+    const cacheAndReturnValid = (outcome: ProofOutcome, nodes: number) => {
       const record: InternalOriginalRootReceiptRecord = {
         scope: 'original_root',
         contractDigest: env.contractDigest,
         reportContentFingerprint: liveFingerprint,
+        lproofKind: liveLproofKind,
         lproofJson: liveLproofStr,
         originalRootOutcome: outcome,
         originalRootNodes: nodes,
-        originalRootBindingNote: note,
       };
       if (this.verifiedOriginalRootCache.size >= 32) {
         const oldestKey = this.verifiedOriginalRootCache.keys().next().value;
@@ -4663,91 +4996,30 @@ export class ProofArtifactManager {
         reportContentFingerprint: record.reportContentFingerprint,
         originalRootOutcome: record.originalRootOutcome,
         originalRootNodes: record.originalRootNodes,
-        ...(record.originalRootBindingNote !== undefined
-          ? { originalRootBindingNote: record.originalRootBindingNote }
-          : {}),
       });
       VERIFIED_ORIGINAL_ROOT_RECEIPT_REGISTRY.set(receiptObj, record);
       return {
         outcome,
         nodes,
-        note,
+        note: undefined,
         verificationSource: 'verified_now' as const,
         receipt: receiptObj,
       };
     };
 
-    const contractRes =
-      preValidated ?? this.validateSingleReportContract(candReport, problem, env);
-    if (!contractRes.ok) {
-      return finish(
-        null,
-        null,
-        `原根报告未通过契约绑定 (${contractRes.code})：${contractRes.detail}`
-      );
-    }
-    if (contractRes.derivedRunSource !== 'original_root') {
-      return finish(
-        null,
-        null,
-        '原根报告来自独立子局面 (traced_subposition)，不能代表原题根部结论 (LP-P02)。'
-      );
-    }
-    if (!isValidNonNegativeNodeCount(candReport.numNodes)) {
-      return finish(
-        null,
-        null,
-        `原根报告的已耗搜索节点数 numNodes=${String(
-          candReport.numNodes
-        )} 非法（必须为非负安全整数，LP-J02）。`
-      );
-    }
-
     if (candReport.rootStatus === ProofOutcome.Unknown) {
-      // R14 §2: UNKNOWN without lproofJson is ONLY attributed when full proposition contract
-      // (goal, role, crucial tokens, ko rules, region, and valid initial rootKind) is bound!
-      if (!contractRes.hasFullPropositionContract) {
-        return finish(
-          null,
-          null,
-          '原根报告既缺少内嵌 lproof/1 文件证书，也缺少结构化 runContract（仅有配置指纹，无法核验攻防目标与关键子归属），无法确认原根结论。'
-        );
-      }
-      return finish(ProofOutcome.Unknown, candReport.numNodes);
+      return cacheAndReturnValid(ProofOutcome.Unknown, candReport.numNodes);
     }
 
-    if (
-      candReport.rootStatus !== ProofOutcome.ProvenWin &&
-      candReport.rootStatus !== ProofOutcome.ProvenLoss
-    ) {
-      return finish(
-        null,
-        null,
-        `原根报告 rootStatus="${String(candReport.rootStatus)}" 非法 (LP-J02)。`
-      );
-    }
-
-    // R14 §2: Proven original-root verdicts require dual (file + memory) independent verification;
-    // when lproofJson is absent, preserve valid fragment receipts while leaving originalRootOutcome null!
-    if (!contractRes.hasEmbeddedLproof) {
-      return finish(
-        null,
-        null,
-        `原根声称 ${candReport.rootStatus}，但缺少内嵌 lproof/1 文件证书，无法完成文件+内存双重复核（仅保留当前片段独立校验回执）。`
-      );
-    }
-
-    // Execute full dual verification (tracked for R14 §4 acceptance tests)
+    // 5. Execute full dual verification (tracked for R14 §4 acceptance tests)
     this.wholeRootVerificationCount++;
-    const fileVr = this.verifySerializedLProofJson(candReport.lproofJson, {
+    const fileVr = this.verifySerializedLProofJson(liveLproofStr, {
       problem,
       context: env.context,
       scope: 'original_root',
     });
     if (!fileVr.passed) {
-      return finish(
-        null,
-        null,
+      return makeNonReusableFailure(
         `原根声称 ${candReport.rootStatus}，但 lproof/1 证书未通过 original_root 独立校验 (${fileVr.errorCode})：${fileVr.message}`
       );
     }
@@ -4762,13 +5034,11 @@ export class ProofArtifactManager {
       verifiedRootKind: 'initial',
     });
     if (!memVr.passed) {
-      return finish(
-        null,
-        null,
+      return makeNonReusableFailure(
         `原根声称 ${candReport.rootStatus}，但内存证明 DAG 未通过 original_root 独立校验 (${memVr.errorCode})：${memVr.message}`
       );
     }
-    return finish(candReport.rootStatus, candReport.numNodes);
+    return cacheAndReturnValid(candReport.rootStatus, candReport.numNodes);
   }
 
   /**
@@ -4980,13 +5250,23 @@ export class ProofArtifactManager {
       return { ok: true, pos };
     };
 
-    // 2. Validate main report contract (R13 §3 + R14 §2/§3)
+    // 2. Validate main report contract & memory DAG/table structure (R13 §3 + R14 §2/§3 + R15 §2)
     const mainContract = this.validateSingleReportContract(report, problem, env);
     if (!mainContract.ok) {
       return makeSourceFail(
         'VERIFICATION_FAILED',
         mainContract.code,
         mainContract.detail
+      );
+    }
+
+    const mainStruct = validateReportMemoryStructure(report);
+    if (!mainStruct.ok) {
+      return makeSourceFail(
+        'VERIFICATION_FAILED',
+        mainStruct.code,
+        `报告内存 DAG/状态表结构损坏：${mainStruct.detail}`,
+        mainStruct.failedNodeId
       );
     }
 
