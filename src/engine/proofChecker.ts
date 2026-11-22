@@ -27,10 +27,12 @@ import {
   SubproofFragmentVerificationResult,
   SubproofQueryReplayReceipt,
   SubproofSourceReceipt,
+  TargetToken,
   TerminalStatus,
   TsumegoProblemSpec,
   VerificationReport,
   VerificationScope,
+  VerifiedOriginalRootReceipt,
 } from './types';
 
 // Standard FIPS 180-4 SHA-256 round constants
@@ -449,7 +451,461 @@ export function deriveDefaultProofContextFromProblem(
   };
 }
 
+interface InternalOriginalRootReceiptRecord {
+  readonly scope: 'original_root';
+  readonly contractDigest: string;
+  readonly reportContentFingerprint: string;
+  readonly lproofJson: string;
+  readonly originalRootOutcome: ProofOutcome | null;
+  readonly originalRootNodes: number | null;
+  readonly originalRootBindingNote?: string;
+}
+
+const VERIFIED_ORIGINAL_ROOT_RECEIPT_REGISTRY = new WeakMap<
+  VerifiedOriginalRootReceipt,
+  InternalOriginalRootReceiptRecord
+>();
+
+function isValidTargetTokenShape(t: unknown): t is TargetToken {
+  if (!t || typeof t !== 'object' || Array.isArray(t)) return false;
+  const obj = t as Record<string, unknown>;
+  return (
+    typeof obj.initialCoord === 'number' &&
+    Number.isInteger(obj.initialCoord) &&
+    obj.initialCoord >= 0 &&
+    (obj.stoneColor === Color.Black || obj.stoneColor === Color.White) &&
+    typeof obj.groupIndex === 'number' &&
+    Number.isInteger(obj.groupIndex) &&
+    obj.groupIndex >= 0
+  );
+}
+
+function sameTargetTokensSafe(a: unknown, b: TargetToken[]): boolean {
+  if (!Array.isArray(a) || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const t = a[i];
+    if (!isValidTargetTokenShape(t)) return false;
+    const bt = b[i];
+    if (
+      t.initialCoord !== bt.initialCoord ||
+      t.stoneColor !== bt.stoneColor ||
+      t.groupIndex !== bt.groupIndex
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isValidNonNegativeNodeCount(n: unknown): n is number {
+  return typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
+}
+
+function computeExternalContractDigest(
+  problem: TsumegoProblemSpec,
+  context: ProofContext,
+  scope: 'original_root'
+): string {
+  const hasRegionHint =
+    problem.hasRegionHint !== undefined
+      ? problem.hasRegionHint
+      : (problem.regionCoords?.length ?? 0) > 0;
+  const payload = {
+    scope,
+    boardSize: problem.boardSize,
+    turnColor: problem.turnColor,
+    blackInitialCoords: sortedUniqueNumbers(problem.blackInitialCoords ?? []),
+    whiteInitialCoords: sortedUniqueNumbers(problem.whiteInitialCoords ?? []),
+    immortalWallCoords: sortedUniqueNumbers(problem.immortalWallCoords ?? []),
+    hasRegionHint,
+    regionCoords: hasRegionHint
+      ? sortedUniqueNumbers(problem.regionCoords ?? [])
+      : [],
+    rootAttacker: context.rootAttacker,
+    attackerGoal: context.attackerGoal,
+    crucialStoneOp: context.crucialStoneOp,
+    koRule: context.koRule,
+    attackerAllowKo: context.attackerAllowKo,
+    defenderAllowKo: context.defenderAllowKo,
+    initialTokens: context.initialTokens.map((t) => ({
+      initialCoord: t.initialCoord,
+      stoneColor: t.stoneColor,
+      groupIndex: t.groupIndex,
+    })),
+  };
+  return `sha256-jcs:${sha256Hex(canonicalizeJsonJcs(payload))}`;
+}
+
+interface ParsedLproofHeaderSnapshot {
+  readonly ok: true;
+  readonly magic: unknown;
+  readonly rootOutcome: unknown;
+  readonly rootNode: unknown;
+  readonly context: unknown;
+  readonly problemSetup: unknown;
+}
+
+type ParsedLproofHeaderCacheEntry =
+  | ParsedLproofHeaderSnapshot
+  | { readonly ok: false; readonly code: 'LP-J01'; readonly detail: string };
+
+const PARSED_LPROOF_HEADER_CACHE = new Map<
+  string,
+  ParsedLproofHeaderCacheEntry
+>();
+
+function parseLproofHeaderCached(raw: string): ParsedLproofHeaderCacheEntry {
+  const hit = PARSED_LPROOF_HEADER_CACHE.get(raw);
+  if (hit !== undefined) return hit;
+
+  let entry: ParsedLproofHeaderCacheEntry;
+  try {
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      entry = {
+        ok: false,
+        code: 'LP-J01',
+        detail: '报告内嵌的 lproofJson 顶层不是合法 JSON 对象。',
+      };
+    } else {
+      const rec = obj as Record<string, unknown>;
+      // Retain ONLY the tiny contract header fields (not nodes/stateTable/historyTable)
+      entry = {
+        ok: true,
+        magic: rec.magic,
+        rootOutcome: rec.rootOutcome,
+        rootNode: rec.rootNode,
+        context: rec.context,
+        problemSetup: rec.problemSetup,
+      };
+    }
+  } catch {
+    entry = {
+      ok: false,
+      code: 'LP-J01',
+      detail: '报告内嵌的 lproofJson 无法解析为合法 JSON。',
+    };
+  }
+
+  if (PARSED_LPROOF_HEADER_CACHE.size >= 16) {
+    const oldest = PARSED_LPROOF_HEADER_CACHE.keys().next().value;
+    if (oldest !== undefined) PARSED_LPROOF_HEADER_CACHE.delete(oldest);
+  }
+  PARSED_LPROOF_HEADER_CACHE.set(raw, entry);
+  return entry;
+}
+
+const FP_STATE = new Int32Array(4);
+
+function fpMixInt(v: number): void {
+  const x = v | 0;
+  FP_STATE[0] = Math.imul(FP_STATE[0] ^ x, 0x01000193);
+  FP_STATE[1] = Math.imul(FP_STATE[1] ^ (x + 0x9e3779b9), 0x85ebca6b);
+  FP_STATE[2] = Math.imul(FP_STATE[2] ^ (x ^ 0x5bd1e995), 0xc2b2ae35);
+  FP_STATE[3] = Math.imul(FP_STATE[3] ^ ((x << 7) | (x >>> 25)), 0x27d4eb2f);
+}
+
+function fpMixScalar(val: unknown): void {
+  if (val === null) {
+    fpMixInt(0x11111111);
+    return;
+  }
+  if (val === undefined) {
+    fpMixInt(0x22222222);
+    return;
+  }
+  const t = typeof val;
+  if (t === 'number') {
+    const n = val as number;
+    if ((n | 0) === n) {
+      fpMixInt(0x44444440);
+      fpMixInt(n);
+      return;
+    }
+    if (!Number.isFinite(n)) {
+      fpMixInt(Number.isNaN(n) ? 0x44444441 : n > 0 ? 0x44444442 : 0x44444443);
+      return;
+    }
+    fpMixInt(0x44444444);
+    fpMixInt(n | 0);
+    fpMixInt(Math.floor(n / 0x100000000) | 0);
+    return;
+  }
+  if (t === 'boolean') {
+    fpMixInt(val ? 0x33333331 : 0x33333330);
+    return;
+  }
+  if (t === 'string') {
+    const s = val as string;
+    const len = s.length;
+    let a = Math.imul(FP_STATE[0] ^ (0x55555550 ^ len), 0x01000193);
+    let b = Math.imul(FP_STATE[1] ^ len, 0x85ebca6b);
+    for (let i = 0; i < len; i++) {
+      const cu = s.charCodeAt(i);
+      a = Math.imul(a ^ cu, 0x01000193);
+      b = Math.imul(b ^ (cu + i), 0x85ebca6b);
+    }
+    FP_STATE[0] = a;
+    FP_STATE[1] = b;
+    FP_STATE[2] = Math.imul(FP_STATE[2] ^ a, 0xc2b2ae35);
+    FP_STATE[3] = Math.imul(FP_STATE[3] ^ b, 0x27d4eb2f);
+    return;
+  }
+  fpMixInt(0x66666666);
+}
+
+function fpMixIntArray(arr: unknown): void {
+  if (!Array.isArray(arr)) {
+    fpMixInt(0x77777770);
+    return;
+  }
+  const len = arr.length;
+  let a = Math.imul(FP_STATE[0] ^ (0x77777771 ^ len), 0x01000193);
+  let b = Math.imul(FP_STATE[1] ^ len, 0x85ebca6b);
+  for (let i = 0; i < len; i++) {
+    const item = arr[i];
+    if ((item | 0) === item) {
+      a = Math.imul(a ^ item, 0x01000193);
+      b = Math.imul(b ^ (item + i), 0x85ebca6b);
+    } else {
+      FP_STATE[0] = a;
+      FP_STATE[1] = b;
+      fpMixScalar(item);
+      a = FP_STATE[0];
+      b = FP_STATE[1];
+    }
+  }
+  FP_STATE[0] = a;
+  FP_STATE[1] = b;
+  FP_STATE[2] = Math.imul(FP_STATE[2] ^ a, 0xc2b2ae35);
+  FP_STATE[3] = Math.imul(FP_STATE[3] ^ b, 0x27d4eb2f);
+}
+
+/**
+ * Fast, zero-throw 128-bit structural fingerprint over ALL live audit-relevant fields
+ * of a SolveReport (excluding lproofJson string, which is checked via exact immutable
+ * string equality `===`). Detects ANY in-place or cloned mutation on metadata,
+ * runContract, proofDagNodes, stateTable, or historyTable without relying on mutable
+ * object references, Zobrist hashes, or self-reported checksums.
+ */
+function computeLiveReportFingerprint(report: SolveReport): string {
+  FP_STATE[0] = 0x811c9dc5 | 0;
+  FP_STATE[1] = 0x9e3779b9 | 0;
+  FP_STATE[2] = 0x243f6a88 | 0;
+  FP_STATE[3] = 0xb7e15162 | 0;
+
+  if (!report || typeof report !== 'object') {
+    fpMixInt(0x0dead000);
+    return `${(FP_STATE[0] >>> 0).toString(16).padStart(8, '0')}${(
+      FP_STATE[1] >>> 0
+    )
+      .toString(16)
+      .padStart(8, '0')}${(FP_STATE[2] >>> 0).toString(16).padStart(8, '0')}${(
+      FP_STATE[3] >>> 0
+    )
+      .toString(16)
+      .padStart(8, '0')}`;
+  }
+
+  fpMixScalar(report.problemId);
+  fpMixScalar(report.boardSize);
+  fpMixScalar(report.firstToPlay);
+  fpMixScalar(report.hasRegionHint);
+  fpMixScalar(report.inputHash);
+  fpMixScalar(report.configFingerprint);
+  fpMixScalar(report.rootStatus);
+  fpMixScalar(report.rootPn);
+  fpMixScalar(report.rootDn);
+  fpMixScalar(report.bestMove);
+  fpMixScalar(report.bestMoveSgf);
+  fpMixScalar(report.numNodes);
+  fpMixScalar(report.rootDagNodeId);
+  fpMixScalar(report.proofChecksum);
+  fpMixScalar(
+    typeof report.lproofJson === 'string' ? report.lproofJson.length : -1
+  );
+  fpMixScalar(report.branchCoverageSnapshots?.[0]?.runSource);
+  fpMixIntArray(report.blackInitialCoords);
+  fpMixIntArray(report.whiteInitialCoords);
+  fpMixIntArray(report.immortalWallCoords);
+  fpMixIntArray(report.regionCoords);
+
+  // Structured runContract
+  const rc = report.runContract as unknown;
+  if (rc === undefined) {
+    fpMixInt(0x21000000);
+  } else if (!rc || typeof rc !== 'object' || Array.isArray(rc)) {
+    fpMixInt(0x21000001);
+  } else {
+    const rco = rc as Record<string, unknown>;
+    fpMixInt(0x21000002);
+    fpMixScalar(rco.boardSize);
+    fpMixIntArray(rco.immortalWallCoords);
+    fpMixScalar(rco.hasRegionHint);
+    fpMixIntArray(rco.regionCoords);
+    fpMixScalar(rco.rootAttacker);
+    fpMixScalar(rco.attackerGoal);
+    fpMixScalar(rco.crucialStoneOp);
+    fpMixScalar(rco.koRule);
+    fpMixScalar(rco.attackerAllowKo);
+    fpMixScalar(rco.defenderAllowKo);
+    fpMixScalar(rco.rootKind);
+    fpMixIntArray(rco.initialTraceMoves);
+    if (!Array.isArray(rco.initialTokens)) {
+      fpMixInt(0x21000003);
+    } else {
+      fpMixInt(rco.initialTokens.length);
+      for (let i = 0; i < rco.initialTokens.length; i++) {
+        const tok = rco.initialTokens[i];
+        if (!tok || typeof tok !== 'object' || Array.isArray(tok)) {
+          fpMixInt(0x21000004);
+        } else {
+          const to = tok as Record<string, unknown>;
+          fpMixScalar(to.initialCoord);
+          fpMixScalar(to.stoneColor);
+          fpMixScalar(to.groupIndex);
+        }
+      }
+    }
+  }
+
+  // proofDagNodes
+  const nodes = report.proofDagNodes as unknown;
+  if (!Array.isArray(nodes)) {
+    fpMixInt(0x31000000);
+  } else {
+    fpMixInt(0x31000001);
+    fpMixInt(nodes.length);
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i] as unknown;
+      if (!n || typeof n !== 'object') {
+        fpMixInt(0x31000002);
+        continue;
+      }
+      const no = n as ProofDagNode;
+      fpMixScalar(no.nodeId);
+      fpMixScalar(no.stateId);
+      fpMixScalar(no.historyId);
+      fpMixScalar(no.parentStateId);
+      fpMixScalar(no.isOrNode);
+      fpMixScalar(no.toPlay);
+      fpMixScalar(no.incomingMove);
+      fpMixScalar(no.incomingMoveSgf);
+      fpMixScalar(no.pn);
+      fpMixScalar(no.dn);
+      fpMixScalar(no.outcome);
+      fpMixScalar(no.terminalEvidence);
+      fpMixScalar(no.isPrunedOutsideRz);
+      fpMixScalar(no.isTtHit);
+      fpMixScalar(no.isKoDependentBarrier);
+      fpMixScalar(no.sourceProofNodeId);
+      fpMixIntArray(no.proofRzCoords);
+      fpMixIntArray(no.disproofRzCoords);
+      fpMixIntArray(no.childNodeIds);
+      fpMixIntArray(no.childMoves);
+      const pc = no.prunedCertificate as unknown;
+      if (!pc || typeof pc !== 'object') {
+        fpMixInt(0x31000003);
+      } else {
+        const pco = pc as Record<string, unknown>;
+        fpMixInt(0x31000004);
+        fpMixScalar(pco.queryStateId);
+        fpMixScalar(pco.queryHistoryId);
+        fpMixScalar(pco.sourceStateId);
+        fpMixScalar(pco.sourceHistoryId);
+        fpMixScalar(pco.sourceProofNodeId);
+        fpMixScalar(pco.contextId);
+        fpMixScalar(pco.prunedMove);
+        fpMixScalar(pco.representativeMove);
+        fpMixScalar(pco.reason);
+        fpMixIntArray(pco.certificateRzCoords);
+      }
+    }
+  }
+
+  // stateTable
+  const states = report.stateTable as unknown;
+  if (!Array.isArray(states)) {
+    fpMixInt(0x41000000);
+  } else {
+    fpMixInt(0x41000001);
+    fpMixInt(states.length);
+    for (let i = 0; i < states.length; i++) {
+      const st = states[i] as unknown;
+      if (!st || typeof st !== 'object') {
+        fpMixInt(0x41000002);
+        continue;
+      }
+      const sto = st as StateTableEntry;
+      fpMixScalar(sto.stateId);
+      fpMixScalar(sto.parentStateId);
+      fpMixScalar(sto.moveFromParent);
+      fpMixScalar(sto.toPlay);
+      fpMixScalar(sto.koPoint);
+      fpMixScalar(sto.consecutivePasses);
+      fpMixScalar(sto.survivingTokensMask);
+      fpMixScalar(sto.zobristHex);
+      fpMixScalar(sto.historyId);
+      fpMixIntArray(sto.blackCoords);
+      fpMixIntArray(sto.whiteCoords);
+    }
+  }
+
+  // historyTable
+  const histories = report.historyTable as unknown;
+  if (!Array.isArray(histories)) {
+    fpMixInt(0x51000000);
+  } else {
+    fpMixInt(0x51000001);
+    fpMixInt(histories.length);
+    for (let i = 0; i < histories.length; i++) {
+      const h = histories[i] as unknown;
+      if (!Array.isArray(h)) {
+        fpMixInt(0x51000002);
+        continue;
+      }
+      fpMixInt(h.length);
+      for (let j = 0; j < h.length; j++) {
+        const snap = h[j] as unknown;
+        if (!snap || typeof snap !== 'object') {
+          fpMixInt(0x51000003);
+          continue;
+        }
+        const so = snap as CanonicalSnapshot;
+        fpMixScalar(so.toPlay);
+        fpMixScalar(so.zobristHex);
+        fpMixIntArray(so.blackCoords);
+        fpMixIntArray(so.whiteCoords);
+      }
+    }
+  }
+
+  return `${(FP_STATE[0] >>> 0).toString(16).padStart(8, '0')}${(
+    FP_STATE[1] >>> 0
+  )
+    .toString(16)
+    .padStart(8, '0')}${(FP_STATE[2] >>> 0).toString(16).padStart(8, '0')}${(
+    FP_STATE[3] >>> 0
+  )
+    .toString(16)
+    .padStart(8, '0')}`;
+}
+
 export class ProofArtifactManager {
+  private wholeRootVerificationCount = 0;
+  private readonly verifiedOriginalRootCache = new Map<
+    string,
+    InternalOriginalRootReceiptRecord
+  >();
+
+  public getWholeRootVerificationCount(): number {
+    return this.wholeRootVerificationCount;
+  }
+
+  public resetWholeRootVerificationCount(): void {
+    this.wholeRootVerificationCount = 0;
+  }
+
   // FR-8.3: Serialize self-contained canonical lproof/1 JSON DAG with RFC 8785 JCS SHA-256 checksum
   public serializeLProofJson(
     initialPos: GoPosition,
@@ -3299,6 +3755,1073 @@ export class ProofArtifactManager {
    *    between unclosed sentinel (`targetDagNodeId === -1` -> `UNCLOSED / LP-U01`) and corrupted
    *    out-of-bounds positive indices (`VERIFICATION_FAILED / LP-N01`).
    */
+  /**
+   * Shared zero-throw contract validation + original-root dual verification core
+   * used by both `verifyOriginalRootReceipt` and `verifySubproofFragment` (R13/R14).
+   */
+  private validateExternalProblemAndContext(
+    problem: TsumegoProblemSpec,
+    suppliedContext?: ProofContext
+  ):
+    | {
+        ok: true;
+        context: ProofContext;
+        hasRegionHint: boolean;
+        effectiveRegionMask: number[] | null;
+        allowedRegionSet: Set<number> | null;
+        expWall: number[];
+        expRegion: number[];
+        origPos: GoPosition;
+        expOrigBlack: number[];
+        expOrigWhite: number[];
+        expOrigTurn: Color;
+        expOrigHash: string;
+        contractDigest: string;
+      }
+    | { ok: false; code: string; detail: string } {
+    if (!problem || typeof problem !== 'object') {
+      return { ok: false, code: 'LP-J02', detail: '原题对象缺失或非法。' };
+    }
+    if (
+      problem.hasRegionHint !== undefined &&
+      typeof problem.hasRegionHint !== 'boolean'
+    ) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: '原题 hasRegionHint 类型非法。',
+      };
+    }
+    if (!isIntegerArray(problem.regionCoords)) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: '原题 regionCoords 类型非法。',
+      };
+    }
+    if (problem.hasRegionHint === false && problem.regionCoords.length > 0) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: '原题存在矛盾区域声明：hasRegionHint=false 且 regionCoords 非空。',
+      };
+    }
+    if (
+      !isIntegerArray(problem.immortalWallCoords) ||
+      !isIntegerArray(problem.blackInitialCoords) ||
+      !isIntegerArray(problem.whiteInitialCoords)
+    ) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: '原题棋子或围墙坐标数组非法。',
+      };
+    }
+
+    const hasRegionHint =
+      problem.hasRegionHint !== undefined
+        ? problem.hasRegionHint
+        : problem.regionCoords.length > 0;
+    const effectiveRegionMask: number[] | null = hasRegionHint
+      ? problem.regionCoords.slice()
+      : null;
+    const allowedRegionSet: Set<number> | null = hasRegionHint
+      ? new Set<number>(problem.regionCoords)
+      : null;
+
+    const canonicalProbCtx = deriveDefaultProofContextFromProblem(
+      problem,
+      suppliedContext?.koRule ?? KoRule.SituationalSuperko
+    );
+    if (suppliedContext !== undefined) {
+      if (!suppliedContext || typeof suppliedContext !== 'object') {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: '传入上下文对象非法。',
+        };
+      }
+      if (
+        !Array.isArray(suppliedContext.initialTokens) ||
+        !suppliedContext.initialTokens.every(isValidTargetTokenShape)
+      ) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: '传入上下文 initialTokens 缺失或包含非法令牌元素。',
+        };
+      }
+      if (
+        suppliedContext.rootAttacker !== canonicalProbCtx.rootAttacker ||
+        suppliedContext.attackerGoal !== canonicalProbCtx.attackerGoal ||
+        suppliedContext.crucialStoneOp !== canonicalProbCtx.crucialStoneOp ||
+        !sameTargetTokensSafe(
+          suppliedContext.initialTokens,
+          canonicalProbCtx.initialTokens
+        )
+      ) {
+        return {
+          ok: false,
+          code: 'LP-P01',
+          detail: `传入上下文与原题 "${problem.id}" 的攻防角色/目标 (${canonicalProbCtx.attackerGoal}) 或关键子令牌契约冲突。`,
+        };
+      }
+    }
+    const context: ProofContext = suppliedContext ?? canonicalProbCtx;
+    const expWall = sortedUniqueNumbers(problem.immortalWallCoords);
+    const expRegion = hasRegionHint
+      ? sortedUniqueNumbers(problem.regionCoords)
+      : [];
+
+    const origPos = new GoPosition(
+      context,
+      problem.boardSize,
+      problem.immortalWallCoords
+    );
+    const firstToPlay = problem.turnColor === 'W' ? Color.White : Color.Black;
+    origPos.setupInitialStones(
+      problem.blackInitialCoords,
+      problem.whiteInitialCoords,
+      firstToPlay
+    );
+
+    return {
+      ok: true,
+      context,
+      hasRegionHint,
+      effectiveRegionMask,
+      allowedRegionSet,
+      expWall,
+      expRegion,
+      origPos,
+      expOrigBlack: origPos.getBlackCoords(),
+      expOrigWhite: origPos.getWhiteCoords(),
+      expOrigTurn: origPos.toPlay,
+      expOrigHash: origPos.computeZobristHex(),
+      contractDigest: computeExternalContractDigest(
+        problem,
+        context,
+        'original_root'
+      ),
+    };
+  }
+
+  private validateSingleReportContract(
+    candReport: SolveReport,
+    problem: TsumegoProblemSpec,
+    env: {
+      context: ProofContext;
+      hasRegionHint: boolean;
+      allowedRegionSet: Set<number> | null;
+      expWall: number[];
+      expRegion: number[];
+      origPos: GoPosition;
+      expOrigBlack: number[];
+      expOrigWhite: number[];
+      expOrigTurn: Color;
+      expOrigHash: string;
+    }
+  ):
+    | {
+        ok: true;
+        derivedRunSource: 'original_root' | 'standalone_subposition';
+        runStartMoves: number[];
+        runStartPos: GoPosition;
+        hasEmbeddedLproof: boolean;
+        hasStructuredRunContract: boolean;
+        hasFullPropositionContract: boolean;
+      }
+    | { ok: false; code: string; detail: string } {
+    const {
+      context,
+      hasRegionHint,
+      expWall,
+      expRegion,
+      origPos,
+      expOrigBlack,
+      expOrigWhite,
+      expOrigTurn,
+      expOrigHash,
+    } = env;
+
+    if (!candReport || typeof candReport !== 'object' || Array.isArray(candReport)) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: '报告对象缺失或结构非法。',
+      };
+    }
+
+    // (a) Outer SolveReport structural & board / wall / 3-state region checks
+    if (
+      candReport.hasRegionHint !== undefined &&
+      typeof candReport.hasRegionHint !== 'boolean'
+    ) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: '报告 hasRegionHint 类型非法（必须为布尔值或省略）。',
+      };
+    }
+    if (
+      (candReport.immortalWallCoords !== undefined &&
+        !isIntegerArray(candReport.immortalWallCoords)) ||
+      (candReport.regionCoords !== undefined &&
+        !isIntegerArray(candReport.regionCoords)) ||
+      !isIntegerArray(candReport.blackInitialCoords) ||
+      !isIntegerArray(candReport.whiteInitialCoords)
+    ) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: '报告的棋子/围墙/区域坐标数组缺失或包含非法元素。',
+      };
+    }
+    if (
+      candReport.hasRegionHint === false &&
+      (candReport.regionCoords?.length ?? 0) > 0
+    ) {
+      return {
+        ok: false,
+        code: 'LP-J02',
+        detail: '报告存在矛盾区域声明：hasRegionHint=false 且 regionCoords 非空。',
+      };
+    }
+    const candWall = sortedUniqueNumbers(candReport.immortalWallCoords ?? []);
+    const candHasRegion =
+      candReport.hasRegionHint !== undefined
+        ? candReport.hasRegionHint
+        : (candReport.regionCoords?.length ?? 0) > 0;
+    const candRegion = candHasRegion
+      ? sortedUniqueNumbers(candReport.regionCoords ?? [])
+      : [];
+
+    if (
+      candReport.boardSize !== problem.boardSize ||
+      !numberArraysEqual(candWall, expWall) ||
+      candHasRegion !== hasRegionHint ||
+      !numberArraysEqual(candRegion, expRegion)
+    ) {
+      return {
+        ok: false,
+        code: 'LP-P01',
+        detail: `报告产物的棋盘尺寸/围墙/区域声明与原题 "${problem.id}" 不一致。`,
+      };
+    }
+
+    // (b) Structured runContract metadata (strict zero-throw type, enum, & trace checks regardless of lproofJson!)
+    let hasStructuredRunContract = false;
+    let rcRootKind: 'initial' | 'traced_subposition' | null = null;
+    let rcInitialTraceMoves: number[] = [];
+
+    if (candReport.runContract !== undefined) {
+      const rc = candReport.runContract as unknown;
+      if (!rc || typeof rc !== 'object' || Array.isArray(rc)) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: '报告 runContract 字段结构非法。',
+        };
+      }
+      const rco = rc as Record<string, unknown>;
+      if (
+        typeof rco.boardSize !== 'number' ||
+        !Number.isInteger(rco.boardSize) ||
+        !isIntegerArray(rco.immortalWallCoords) ||
+        typeof rco.hasRegionHint !== 'boolean' ||
+        !isIntegerArray(rco.regionCoords) ||
+        typeof rco.attackerAllowKo !== 'boolean' ||
+        typeof rco.defenderAllowKo !== 'boolean' ||
+        !Array.isArray(rco.initialTokens) ||
+        !rco.initialTokens.every(isValidTargetTokenShape) ||
+        !isIntegerArray(rco.initialTraceMoves)
+      ) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: '报告 runContract 缺少必需字段或包含非法/空值元素（如 initialTokens/coords/trace）。',
+        };
+      }
+      if (rco.hasRegionHint === false && rco.regionCoords.length > 0) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: '报告 runContract 存在矛盾区域声明：hasRegionHint=false 且 regionCoords 非空。',
+        };
+      }
+      // R14 §2: Unconditionally validate runContract.rootKind enum and trace correspondence!
+      if (
+        rco.rootKind !== 'initial' &&
+        rco.rootKind !== 'traced_subposition'
+      ) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: `报告 runContract.rootKind="${String(
+            rco.rootKind
+          )}" 非法（必须为 "initial" 或 "traced_subposition"）。`,
+        };
+      }
+      if (rco.rootKind === 'initial' && rco.initialTraceMoves.length > 0) {
+        return {
+          ok: false,
+          code: 'LP-P02',
+          detail: '报告 runContract 声称 rootKind="initial" 却携带非空 initialTraceMoves。',
+        };
+      }
+      if (
+        rco.rootKind === 'traced_subposition' &&
+        rco.initialTraceMoves.length === 0
+      ) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: '报告 runContract 声称 rootKind="traced_subposition" 但缺失非空 initialTraceMoves。',
+        };
+      }
+
+      const rcWall = sortedUniqueNumbers(rco.immortalWallCoords);
+      const rcRegion = rco.hasRegionHint
+        ? sortedUniqueNumbers(rco.regionCoords)
+        : [];
+      if (
+        rco.boardSize !== problem.boardSize ||
+        !numberArraysEqual(rcWall, expWall) ||
+        rco.hasRegionHint !== hasRegionHint ||
+        !numberArraysEqual(rcRegion, expRegion) ||
+        rco.rootAttacker !== context.rootAttacker ||
+        rco.attackerGoal !== context.attackerGoal ||
+        rco.crucialStoneOp !== context.crucialStoneOp ||
+        rco.koRule !== context.koRule ||
+        rco.attackerAllowKo !== context.attackerAllowKo ||
+        rco.defenderAllowKo !== context.defenderAllowKo ||
+        !sameTargetTokensSafe(rco.initialTokens, context.initialTokens)
+      ) {
+        return {
+          ok: false,
+          code: 'LP-P01',
+          detail: '报告 runContract（棋盘/围墙/区域/攻防目标/关键子/劫规则/劫权）与当前待验原题或运行上下文不一致。',
+        };
+      }
+      hasStructuredRunContract = true;
+      rcRootKind = rco.rootKind;
+      rcInitialTraceMoves = rco.initialTraceMoves.slice();
+    }
+
+    // (c) Defense-in-depth configFingerprint parity (covers koRule/ako/dko only)
+    if (
+      typeof candReport.configFingerprint === 'string' &&
+      candReport.configFingerprint.length > 0
+    ) {
+      const koMatch = candReport.configFingerprint.match(/:(SSK|PSK|SIMPLE):/);
+      if (koMatch && koMatch[1] !== context.koRule) {
+        return {
+          ok: false,
+          code: 'LP-P01',
+          detail: `报告 configFingerprint 的劫规则 (${koMatch[1]}) 与待验上下文 (${context.koRule}) 不一致。`,
+        };
+      }
+      const akoDkoMatch = candReport.configFingerprint.match(
+        /:ako=(true|false):dko=(true|false)(?::|$)/
+      );
+      if (akoDkoMatch) {
+        const fpAko = akoDkoMatch[1] === 'true';
+        const fpDko = akoDkoMatch[2] === 'true';
+        if (
+          fpAko !== context.attackerAllowKo ||
+          fpDko !== context.defenderAllowKo
+        ) {
+          return {
+            ok: false,
+            code: 'LP-P01',
+            detail: `报告 configFingerprint 的劫权 (ako=${fpAko}, dko=${fpDko}) 与待验上下文 (ako=${context.attackerAllowKo}, dko=${context.defenderAllowKo}) 不一致。`,
+          };
+        }
+      }
+    }
+
+    const candStartBlack = sortedUniqueNumbers(candReport.blackInitialCoords);
+    const candStartWhite = sortedUniqueNumbers(candReport.whiteInitialCoords);
+
+    let parsedLproof: ParsedLproofHeaderSnapshot | null = null;
+    if (
+      candReport.lproofJson !== undefined &&
+      candReport.lproofJson !== null &&
+      typeof candReport.lproofJson !== 'string'
+    ) {
+      return {
+        ok: false,
+        code: 'LP-J01',
+        detail: '报告内嵌的 lproofJson 类型非法（非字符串）。',
+      };
+    }
+    if (
+      typeof candReport.lproofJson === 'string' &&
+      candReport.lproofJson.trim().length > 0
+    ) {
+      const parsedHeader = parseLproofHeaderCached(candReport.lproofJson);
+      if (!parsedHeader.ok) {
+        return {
+          ok: false,
+          code: parsedHeader.code,
+          detail: parsedHeader.detail,
+        };
+      }
+      parsedLproof = parsedHeader;
+    }
+
+    let candRunSource: 'original_root' | 'standalone_subposition' =
+      'original_root';
+    let candStartMoves: number[] = [];
+
+    if (parsedLproof) {
+      // (d) Mandatory lproof/1 contract & cross-binding with outer SolveReport (R13 §3)
+      if (parsedLproof.magic !== 'lproof/1') {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: `报告内嵌 lproofJson 的 magic="${String(
+            parsedLproof.magic
+          )}" 非法（必须为 "lproof/1"）。`,
+        };
+      }
+
+      const lpCtx = parsedLproof.context;
+      if (!lpCtx || typeof lpCtx !== 'object' || Array.isArray(lpCtx)) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: '报告内嵌 lproofJson 缺失必需的 context 契约对象，拒绝跳过核验。',
+        };
+      }
+      const ctxObj = lpCtx as Record<string, unknown>;
+      const lpAttacker = decodeColor(ctxObj.rootAttacker);
+      const lpGoal = ctxObj.attackerGoal;
+      const lpOp = ctxObj.crucialStoneOp;
+      const lpKoRule = ctxObj.koRule;
+      const lpAttKo = ctxObj.attackerAllowKo;
+      const lpDefKo = ctxObj.defenderAllowKo;
+      const lpTokens = Array.isArray(ctxObj.initialTokens)
+        ? (ctxObj.initialTokens as unknown[])
+        : null;
+      if (
+        lpAttacker === null ||
+        typeof lpGoal !== 'string' ||
+        typeof lpOp !== 'string' ||
+        typeof lpKoRule !== 'string' ||
+        typeof lpAttKo !== 'boolean' ||
+        typeof lpDefKo !== 'boolean' ||
+        lpTokens === null
+      ) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: '报告内嵌 lproofJson.context 缺少必需字段或字段类型非法。',
+        };
+      }
+      for (let i = 0; i < lpTokens.length; i++) {
+        const tok = lpTokens[i];
+        if (!tok || typeof tok !== 'object' || Array.isArray(tok)) {
+          return {
+            ok: false,
+            code: 'LP-J02',
+            detail: '报告内嵌 lproofJson.context.initialTokens 包含非法元素。',
+          };
+        }
+        const to = tok as Record<string, unknown>;
+        if (
+          typeof to.initialCoord !== 'number' ||
+          !Number.isInteger(to.initialCoord) ||
+          decodeColor(to.stoneColor) === null ||
+          typeof to.groupIndex !== 'number' ||
+          !Number.isInteger(to.groupIndex)
+        ) {
+          return {
+            ok: false,
+            code: 'LP-J02',
+            detail: '报告内嵌 lproofJson.context.initialTokens 元素字段非法。',
+          };
+        }
+      }
+      const tokensEqual =
+        lpTokens.length === context.initialTokens.length &&
+        lpTokens.every((t, idx) => {
+          const to = t as Record<string, unknown>;
+          const c = decodeColor(to.stoneColor);
+          return (
+            to.initialCoord === context.initialTokens[idx].initialCoord &&
+            c === context.initialTokens[idx].stoneColor &&
+            to.groupIndex === context.initialTokens[idx].groupIndex
+          );
+        });
+      if (
+        lpAttacker !== context.rootAttacker ||
+        lpGoal !== context.attackerGoal ||
+        lpOp !== context.crucialStoneOp ||
+        lpKoRule !== context.koRule ||
+        lpAttKo !== context.attackerAllowKo ||
+        lpDefKo !== context.defenderAllowKo ||
+        !tokensEqual
+      ) {
+        return {
+          ok: false,
+          code: 'LP-P01',
+          detail: '报告已绑定的 lproof/1 契约上下文（攻防目标/关键子/劫规则/劫权）与当前待验命题及运行配置不一致。',
+        };
+      }
+
+      const lpSetupRaw = parsedLproof.problemSetup;
+      if (
+        !lpSetupRaw ||
+        typeof lpSetupRaw !== 'object' ||
+        Array.isArray(lpSetupRaw)
+      ) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: '报告内嵌 lproofJson 缺失必需的 problemSetup 对象，拒绝跳过核验。',
+        };
+      }
+      const lpSetup = lpSetupRaw as Record<string, unknown>;
+
+      if (
+        typeof lpSetup.boardSize !== 'number' ||
+        !Number.isInteger(lpSetup.boardSize) ||
+        !isIntegerArray(lpSetup.immortalWallCoords) ||
+        !isIntegerArray(lpSetup.regionCoords) ||
+        (lpSetup.hasRegionHint !== undefined &&
+          typeof lpSetup.hasRegionHint !== 'boolean')
+      ) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: '报告内嵌 lproofJson.problemSetup 的棋盘尺寸/围墙/区域字段缺失或类型非法。',
+        };
+      }
+      if (lpSetup.hasRegionHint === false && lpSetup.regionCoords.length > 0) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: '报告内嵌 lproofJson.problemSetup 存在矛盾区域声明：hasRegionHint=false 且 regionCoords 非空。',
+        };
+      }
+      const lpWall = sortedUniqueNumbers(lpSetup.immortalWallCoords);
+      const lpHasRegion =
+        lpSetup.hasRegionHint !== undefined
+          ? lpSetup.hasRegionHint
+          : lpSetup.regionCoords.length > 0;
+      const lpRegion = lpHasRegion
+        ? sortedUniqueNumbers(lpSetup.regionCoords)
+        : [];
+      if (
+        lpSetup.boardSize !== problem.boardSize ||
+        !numberArraysEqual(lpWall, expWall) ||
+        lpHasRegion !== hasRegionHint ||
+        !numberArraysEqual(lpRegion, expRegion)
+      ) {
+        return {
+          ok: false,
+          code: 'LP-P01',
+          detail: `报告内嵌 lproofJson.problemSetup 的棋盘尺寸/围墙/区域声明与原题 "${problem.id}" 不一致。`,
+        };
+      }
+
+      const lpFirst = decodeColor(lpSetup.firstToPlay);
+      if (
+        lpFirst === null ||
+        !isIntegerArray(lpSetup.blackInitialCoords) ||
+        !isIntegerArray(lpSetup.whiteInitialCoords) ||
+        typeof lpSetup.inputHash !== 'string'
+      ) {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: '报告内嵌 lproofJson.problemSetup 缺少起始棋面/先手/inputHash。',
+        };
+      }
+      if (
+        lpFirst !== candReport.firstToPlay ||
+        !numberArraysEqual(
+          sortedUniqueNumbers(lpSetup.blackInitialCoords),
+          candStartBlack
+        ) ||
+        !numberArraysEqual(
+          sortedUniqueNumbers(lpSetup.whiteInitialCoords),
+          candStartWhite
+        ) ||
+        lpSetup.inputHash !== candReport.inputHash ||
+        parsedLproof.rootOutcome !== candReport.rootStatus ||
+        parsedLproof.rootNode !== candReport.rootDagNodeId
+      ) {
+        return {
+          ok: false,
+          code: 'LP-P01',
+          detail: '内存报告与内嵌 lproofJson 的起始局面、inputHash、rootOutcome 或 rootNode 不一致（疑似串用异次运行证书）。',
+        };
+      }
+
+      const rootKind = lpSetup.rootKind;
+      if (rootKind === 'traced_subposition') {
+        const originTurn = decodeColor(lpSetup.originFirstToPlay);
+        if (
+          originTurn === null ||
+          !isIntegerArray(lpSetup.originBlackCoords) ||
+          !isIntegerArray(lpSetup.originWhiteCoords) ||
+          !isIntegerArray(lpSetup.initialTraceMoves) ||
+          lpSetup.initialTraceMoves.length === 0
+        ) {
+          return {
+            ok: false,
+            code: 'LP-J02',
+            detail: '独立子局面产物缺少合法的 originBlackCoords / originWhiteCoords / originFirstToPlay / initialTraceMoves。',
+          };
+        }
+        if (
+          originTurn !== expOrigTurn ||
+          !numberArraysEqual(
+            sortedUniqueNumbers(lpSetup.originBlackCoords),
+            expOrigBlack
+          ) ||
+          !numberArraysEqual(
+            sortedUniqueNumbers(lpSetup.originWhiteCoords),
+            expOrigWhite
+          )
+        ) {
+          return {
+            ok: false,
+            code: 'LP-P01',
+            detail: `独立子局面产物的原根起点与待验原题 "${problem.id}" 不一致。`,
+          };
+        }
+        candStartMoves = lpSetup.initialTraceMoves.slice();
+        candRunSource = 'standalone_subposition';
+      } else if (rootKind === 'initial') {
+        if (
+          lpSetup.initialTraceMoves !== undefined &&
+          (!isIntegerArray(lpSetup.initialTraceMoves) ||
+            lpSetup.initialTraceMoves.length > 0)
+        ) {
+          return {
+            ok: false,
+            code: 'LP-P02',
+            detail: '产物声称 rootKind="initial" 却携带非空 initialTraceMoves。',
+          };
+        }
+        if (
+          lpFirst !== expOrigTurn ||
+          !numberArraysEqual(
+            sortedUniqueNumbers(lpSetup.blackInitialCoords),
+            expOrigBlack
+          ) ||
+          !numberArraysEqual(
+            sortedUniqueNumbers(lpSetup.whiteInitialCoords),
+            expOrigWhite
+          )
+        ) {
+          return {
+            ok: false,
+            code: 'LP-P01',
+            detail: `产物初始局面与待验原题 "${problem.id}" 不一致。`,
+          };
+        }
+        candStartMoves = [];
+        candRunSource = 'original_root';
+      } else {
+        return {
+          ok: false,
+          code: 'LP-J02',
+          detail: `报告内嵌 lproofJson.problemSetup.rootKind="${String(
+            rootKind
+          )}" 非法。`,
+        };
+      }
+
+      if (hasStructuredRunContract) {
+        if (
+          rcRootKind !== rootKind ||
+          !numberArraysEqual(rcInitialTraceMoves, candStartMoves)
+        ) {
+          return {
+            ok: false,
+            code: 'LP-P01',
+            detail: '内存报告 runContract 的 rootKind / initialTraceMoves 与内嵌 lproofJson 不一致。',
+          };
+        }
+      }
+    } else if (hasStructuredRunContract) {
+      if (rcRootKind === 'traced_subposition') {
+        candStartMoves = rcInitialTraceMoves.slice();
+        candRunSource = 'standalone_subposition';
+      } else {
+        // rcRootKind === 'initial' with empty rcInitialTraceMoves (already validated above)
+        const matchesOrigRoot =
+          candReport.firstToPlay === expOrigTurn &&
+          numberArraysEqual(candStartBlack, expOrigBlack) &&
+          numberArraysEqual(candStartWhite, expOrigWhite) &&
+          candReport.inputHash === expOrigHash &&
+          candReport.branchCoverageSnapshots?.[0]?.runSource !==
+            'standalone_subposition';
+        if (!matchesOrigRoot) {
+          return {
+            ok: false,
+            code: 'LP-P01',
+            detail: '报告 runContract 声明 rootKind="initial"，但起始棋面/先手/inputHash 与原题初始局面不一致。',
+          };
+        }
+        candStartMoves = [];
+        candRunSource = 'original_root';
+      }
+    } else {
+      // Neither lproofJson nor runContract: can only match start board to original root
+      const matchesOrigRoot =
+        candReport.firstToPlay === expOrigTurn &&
+        numberArraysEqual(candStartBlack, expOrigBlack) &&
+        numberArraysEqual(candStartWhite, expOrigWhite) &&
+        candReport.inputHash === expOrigHash &&
+        candReport.branchCoverageSnapshots?.[0]?.runSource !==
+          'standalone_subposition';
+      if (!matchesOrigRoot) {
+        return {
+          ok: false,
+          code: 'LP-P01',
+          detail: '报告起点与原题初始局面不一致，且缺少可核验的 lproofJson / runContract 到达轨迹。',
+        };
+      }
+      candStartMoves = [];
+      candRunSource = 'original_root';
+    }
+
+    // Independently replay arrival trace and verify starting position parity
+    const startPos = origPos.clone();
+    for (let i = 0; i < candStartMoves.length; i++) {
+      const mv = candStartMoves[i];
+      const playRes = startPos.playMove(mv);
+      if (!playRes.legal) {
+        return {
+          ok: false,
+          code: 'LP-S09',
+          detail: `运行起点轨迹第 ${i + 1} 手 ${coordToSgf(
+            mv,
+            problem.boardSize
+          )} 非法`,
+        };
+      }
+    }
+
+    if (
+      candReport.firstToPlay !== startPos.toPlay ||
+      !numberArraysEqual(candStartBlack, startPos.getBlackCoords()) ||
+      !numberArraysEqual(candStartWhite, startPos.getWhiteCoords()) ||
+      candReport.inputHash !== startPos.computeZobristHex()
+    ) {
+      return {
+        ok: false,
+        code: 'LP-S02',
+        detail: '运行起点重放盘面与报告声明的起始棋面/先手/inputHash 不一致。',
+      };
+    }
+
+    if (parsedLproof) {
+      const lpSetup = parsedLproof.problemSetup as Record<string, unknown>;
+      if (
+        lpSetup.zobristHex !== startPos.computeZobristHex() ||
+        lpSetup.koPoint !== startPos.koPoint ||
+        lpSetup.consecutivePasses !== startPos.consecutivePasses ||
+        lpSetup.survivingTokensMask !== startPos.survivingTargetTokensMask
+      ) {
+        return {
+          ok: false,
+          code: 'LP-S02',
+          detail: '内嵌 lproofJson.problemSetup 的 zobristHex/koPoint/consecutivePasses/survivingTokensMask 与重放起点不一致。',
+        };
+      }
+    }
+
+    return {
+      ok: true,
+      derivedRunSource: candRunSource,
+      runStartMoves: candStartMoves,
+      runStartPos: startPos,
+      hasEmbeddedLproof: parsedLproof !== null,
+      hasStructuredRunContract,
+      hasFullPropositionContract:
+        parsedLproof !== null || hasStructuredRunContract,
+    };
+  }
+
+  private resolveOriginalRootWithReceiptReuse(
+    candReport: SolveReport,
+    problem: TsumegoProblemSpec,
+    env: {
+      context: ProofContext;
+      hasRegionHint: boolean;
+      allowedRegionSet: Set<number> | null;
+      expWall: number[];
+      expRegion: number[];
+      origPos: GoPosition;
+      expOrigBlack: number[];
+      expOrigWhite: number[];
+      expOrigTurn: Color;
+      expOrigHash: string;
+      contractDigest: string;
+    },
+    suppliedReceipt?: VerifiedOriginalRootReceipt,
+    preValidated?: {
+      ok: true;
+      derivedRunSource: 'original_root' | 'standalone_subposition';
+      runStartMoves: number[];
+      runStartPos: GoPosition;
+      hasEmbeddedLproof: boolean;
+      hasStructuredRunContract: boolean;
+      hasFullPropositionContract: boolean;
+    }
+  ): {
+    outcome: ProofOutcome | null;
+    nodes: number | null;
+    note?: string;
+    verificationSource: 'verified_now' | 'reused_receipt';
+    receipt: VerifiedOriginalRootReceipt;
+  } {
+    const liveFingerprint = computeLiveReportFingerprint(candReport);
+    const liveLproofStr =
+      typeof candReport?.lproofJson === 'string' ? candReport.lproofJson : '';
+
+    // 1. Check explicitly supplied unforgeable receipt (valid ONLY when scope, external contractDigest,
+    //    live 128-bit content fingerprint, AND exact immutable lproofJson string ALL match!)
+    if (suppliedReceipt !== undefined) {
+      const reg = VERIFIED_ORIGINAL_ROOT_RECEIPT_REGISTRY.get(suppliedReceipt);
+      if (
+        reg &&
+        reg.scope === 'original_root' &&
+        reg.contractDigest === env.contractDigest &&
+        reg.reportContentFingerprint === liveFingerprint &&
+        reg.lproofJson === liveLproofStr
+      ) {
+        return {
+          outcome: reg.originalRootOutcome,
+          nodes: reg.originalRootNodes,
+          note: reg.originalRootBindingNote,
+          verificationSource: 'reused_receipt',
+          receipt: suppliedReceipt,
+        };
+      }
+    }
+
+    // 2. Check per-instance content-bound cache (keyed by external contractDigest + live 128-bit fingerprint + exact lproofJson)
+    const cacheKey = `${env.contractDigest}|${liveFingerprint}`;
+    const cached = this.verifiedOriginalRootCache.get(cacheKey);
+    if (
+      cached &&
+      cached.scope === 'original_root' &&
+      cached.lproofJson === liveLproofStr
+    ) {
+      const receiptObj: VerifiedOriginalRootReceipt = Object.freeze({
+        scope: 'original_root',
+        contractDigest: cached.contractDigest,
+        reportContentFingerprint: cached.reportContentFingerprint,
+        originalRootOutcome: cached.originalRootOutcome,
+        originalRootNodes: cached.originalRootNodes,
+        ...(cached.originalRootBindingNote !== undefined
+          ? { originalRootBindingNote: cached.originalRootBindingNote }
+          : {}),
+      });
+      VERIFIED_ORIGINAL_ROOT_RECEIPT_REGISTRY.set(receiptObj, cached);
+      return {
+        outcome: cached.originalRootOutcome,
+        nodes: cached.originalRootNodes,
+        note: cached.originalRootBindingNote,
+        verificationSource: 'reused_receipt',
+        receipt: receiptObj,
+      };
+    }
+
+    // 3. Perform fresh, zero-trust verification
+    const finish = (
+      outcome: ProofOutcome | null,
+      nodes: number | null,
+      note?: string
+    ) => {
+      const record: InternalOriginalRootReceiptRecord = {
+        scope: 'original_root',
+        contractDigest: env.contractDigest,
+        reportContentFingerprint: liveFingerprint,
+        lproofJson: liveLproofStr,
+        originalRootOutcome: outcome,
+        originalRootNodes: nodes,
+        originalRootBindingNote: note,
+      };
+      if (this.verifiedOriginalRootCache.size >= 32) {
+        const oldestKey = this.verifiedOriginalRootCache.keys().next().value;
+        if (oldestKey !== undefined) {
+          this.verifiedOriginalRootCache.delete(oldestKey);
+        }
+      }
+      this.verifiedOriginalRootCache.set(cacheKey, record);
+      const receiptObj: VerifiedOriginalRootReceipt = Object.freeze({
+        scope: 'original_root',
+        contractDigest: record.contractDigest,
+        reportContentFingerprint: record.reportContentFingerprint,
+        originalRootOutcome: record.originalRootOutcome,
+        originalRootNodes: record.originalRootNodes,
+        ...(record.originalRootBindingNote !== undefined
+          ? { originalRootBindingNote: record.originalRootBindingNote }
+          : {}),
+      });
+      VERIFIED_ORIGINAL_ROOT_RECEIPT_REGISTRY.set(receiptObj, record);
+      return {
+        outcome,
+        nodes,
+        note,
+        verificationSource: 'verified_now' as const,
+        receipt: receiptObj,
+      };
+    };
+
+    const contractRes =
+      preValidated ?? this.validateSingleReportContract(candReport, problem, env);
+    if (!contractRes.ok) {
+      return finish(
+        null,
+        null,
+        `原根报告未通过契约绑定 (${contractRes.code})：${contractRes.detail}`
+      );
+    }
+    if (contractRes.derivedRunSource !== 'original_root') {
+      return finish(
+        null,
+        null,
+        '原根报告来自独立子局面 (traced_subposition)，不能代表原题根部结论 (LP-P02)。'
+      );
+    }
+    if (!isValidNonNegativeNodeCount(candReport.numNodes)) {
+      return finish(
+        null,
+        null,
+        `原根报告的已耗搜索节点数 numNodes=${String(
+          candReport.numNodes
+        )} 非法（必须为非负安全整数，LP-J02）。`
+      );
+    }
+
+    if (candReport.rootStatus === ProofOutcome.Unknown) {
+      // R14 §2: UNKNOWN without lproofJson is ONLY attributed when full proposition contract
+      // (goal, role, crucial tokens, ko rules, region, and valid initial rootKind) is bound!
+      if (!contractRes.hasFullPropositionContract) {
+        return finish(
+          null,
+          null,
+          '原根报告既缺少内嵌 lproof/1 文件证书，也缺少结构化 runContract（仅有配置指纹，无法核验攻防目标与关键子归属），无法确认原根结论。'
+        );
+      }
+      return finish(ProofOutcome.Unknown, candReport.numNodes);
+    }
+
+    if (
+      candReport.rootStatus !== ProofOutcome.ProvenWin &&
+      candReport.rootStatus !== ProofOutcome.ProvenLoss
+    ) {
+      return finish(
+        null,
+        null,
+        `原根报告 rootStatus="${String(candReport.rootStatus)}" 非法 (LP-J02)。`
+      );
+    }
+
+    // R14 §2: Proven original-root verdicts require dual (file + memory) independent verification;
+    // when lproofJson is absent, preserve valid fragment receipts while leaving originalRootOutcome null!
+    if (!contractRes.hasEmbeddedLproof) {
+      return finish(
+        null,
+        null,
+        `原根声称 ${candReport.rootStatus}，但缺少内嵌 lproof/1 文件证书，无法完成文件+内存双重复核（仅保留当前片段独立校验回执）。`
+      );
+    }
+
+    // Execute full dual verification (tracked for R14 §4 acceptance tests)
+    this.wholeRootVerificationCount++;
+    const fileVr = this.verifySerializedLProofJson(candReport.lproofJson, {
+      problem,
+      context: env.context,
+      scope: 'original_root',
+    });
+    if (!fileVr.passed) {
+      return finish(
+        null,
+        null,
+        `原根声称 ${candReport.rootStatus}，但 lproof/1 证书未通过 original_root 独立校验 (${fileVr.errorCode})：${fileVr.message}`
+      );
+    }
+    const memIsCompact =
+      !Array.isArray(candReport.stateTable) ||
+      candReport.stateTable.length === 0;
+    const memVr = this.verifyProofDag(env.origPos, env.context, candReport, {
+      skipChecksumRecompute: true,
+      isCompactDag: memIsCompact,
+      encodingMode: memIsCompact ? 'compact_dag' : 'full_state_table',
+      verifiedScope: 'original_root',
+      verifiedRootKind: 'initial',
+    });
+    if (!memVr.passed) {
+      return finish(
+        null,
+        null,
+        `原根声称 ${candReport.rootStatus}，但内存证明 DAG 未通过 original_root 独立校验 (${memVr.errorCode})：${memVr.message}`
+      );
+    }
+    return finish(candReport.rootStatus, candReport.numNodes);
+  }
+
+  /**
+   * R14 §4: Independently verify and issue a reusable, unforgeable, contract-and-content-bound
+   * original-root verification receipt for a SolveReport. Can be passed into repeated
+   * `verifySubproofFragment` calls on the same immutable report + external contract + scope
+   * to avoid re-verifying the entire original-root proof DAG on every leaf/sentinel click.
+   */
+  public verifyOriginalRootReceipt(params: {
+    problem: TsumegoProblemSpec;
+    context?: ProofContext;
+    report: SolveReport;
+    scope?: 'original_root';
+  }): VerifiedOriginalRootReceipt {
+    const env = this.validateExternalProblemAndContext(
+      params.problem,
+      params.context
+    );
+    if (!env.ok) {
+      return Object.freeze({
+        scope: 'original_root',
+        contractDigest: '',
+        reportContentFingerprint: computeLiveReportFingerprint(params.report),
+        originalRootOutcome: null,
+        originalRootNodes: null,
+        originalRootBindingNote: `外部原题或上下文契约非法 (${env.code})：${env.detail}`,
+      });
+    }
+    const resolved = this.resolveOriginalRootWithReceiptReuse(
+      params.report,
+      params.problem,
+      env
+    );
+    return resolved.receipt;
+  }
+
+  /**
+   * R11/R12/R13/R14: Independent sub-proof fragment verifier for a specific DAG node captured
+   * inside a SolveReport (including UNKNOWN original-root runs and standalone subposition runs).
+   *
+   * Enforces:
+   * 1. Problem-intrinsic contract binding (goal, attacker/defender role, crucial stones/op, board,
+   *    walls, 3-state region) plus runtime config parity across SolveReport, runContract,
+   *    configFingerprint, and mandatory lproof/1 fields — zero-throw on malformed inputs.
+   * 2. Strict evidence discipline for original-root attribution: proven verdicts require dual
+   *    (lproof/1 file + memory DAG) original_root verification; no-file UNKNOWN requires full
+   *    proposition contract binding (`runContract`) and valid non-negative searched node count.
+   * 3. Content-and-contract-bound `VerifiedOriginalRootReceipt` reuse so repeated leaf/sentinel
+   *    audits on an unchanged report + external contract do not re-verify the whole root proof,
+   *    while any contract change or in-place report mutation immediately invalidates reuse.
+   * 4. Entry-point-invariant `full_state_table` verification across fragment ancestor chains and
+   *    full RZ/TT source proof subgraphs.
+   */
   public verifySubproofFragment(params: {
     problem: TsumegoProblemSpec;
     context?: ProofContext;
@@ -3308,6 +4831,7 @@ export class ProofArtifactManager {
     queryPathMoves?: number[];
     runSource?: 'original_root' | 'standalone_subposition';
     originalRootReport?: SolveReport;
+    verifiedOriginalRootReceipt?: VerifiedOriginalRootReceipt;
   }): SubproofFragmentVerificationResult {
     const {
       problem,
@@ -3317,27 +4841,35 @@ export class ProofArtifactManager {
       queryPathMoves,
     } = params;
     const hasFullTables =
-      Array.isArray(report.stateTable) && report.stateTable.length > 0;
+      Boolean(report && typeof report === 'object') &&
+      Array.isArray(report.stateTable) &&
+      report.stateTable.length > 0;
     const verificationMode: LProofEncodingMode = hasFullTables
       ? 'full_state_table'
       : 'compact_dag';
 
-    const targetPathSgf = targetPathMoves.map((mv) =>
-      coordToSgf(mv, problem.boardSize)
-    );
-    const queryPathSgf = (queryPathMoves ?? []).map((mv) =>
-      coordToSgf(mv, problem.boardSize)
-    );
+    const boardSizeSafe =
+      problem && typeof problem.boardSize === 'number' ? problem.boardSize : 19;
+    const targetPathSgf = Array.isArray(targetPathMoves)
+      ? targetPathMoves.map((mv) => coordToSgf(mv, boardSizeSafe))
+      : [];
+    const queryPathSgf = Array.isArray(queryPathMoves)
+      ? queryPathMoves.map((mv) => coordToSgf(mv, boardSizeSafe))
+      : [];
 
     let derivedRunSource: 'original_root' | 'standalone_subposition' =
       params.runSource ??
-      report.branchCoverageSnapshots?.[0]?.runSource ??
+      report?.branchCoverageSnapshots?.[0]?.runSource ??
       'standalone_subposition';
     let runStartMoves: number[] = [];
     let runStartPathSgf: string[] = [];
     let originalRootOutcome: ProofOutcome | null = null;
     let originalRootNodes: number | null = null;
     let originalRootBindingNote: string | undefined = undefined;
+    let originalRootVerificationSource:
+      | 'verified_now'
+      | 'reused_receipt'
+      | 'not_applicable' = 'not_applicable';
 
     const notRequestedQuery: SubproofQueryReplayReceipt = {
       status: 'NOT_REQUESTED',
@@ -3358,12 +4890,13 @@ export class ProofArtifactManager {
     ): SubproofFragmentVerificationResult => ({
       runSource: derivedRunSource,
       runStartPathSgf,
-      runRootOutcome: report.rootStatus,
+      runRootOutcome: report?.rootStatus ?? ProofOutcome.Unknown,
       originalRootOutcome,
       originalRootNodes,
       ...(originalRootBindingNote !== undefined
         ? { originalRootBindingNote }
         : {}),
+      originalRootVerificationSource,
       sourceReceipt: {
         status,
         passed: false,
@@ -3394,97 +4927,23 @@ export class ProofArtifactManager {
         : notRequestedQuery,
     });
 
-    // 1. Validate region contract consistency first (R8 §3)
-    if (
-      problem.hasRegionHint !== undefined &&
-      typeof problem.hasRegionHint !== 'boolean'
-    ) {
-      return makeSourceFail(
-        'VERIFICATION_FAILED',
-        'LP-J02',
-        '原题 hasRegionHint 类型非法。'
-      );
+    // 1. Validate external problem & context safely (zero-throw)
+    const env = this.validateExternalProblemAndContext(problem, params.context);
+    if (!env.ok) {
+      return makeSourceFail('VERIFICATION_FAILED', env.code, env.detail);
     }
-    if (problem.hasRegionHint === false && problem.regionCoords.length > 0) {
-      return makeSourceFail(
-        'VERIFICATION_FAILED',
-        'LP-J02',
-        '原题存在矛盾区域声明：hasRegionHint=false 且 regionCoords 非空。'
-      );
-    }
-
-    const hasRegionHint =
-      problem.hasRegionHint !== undefined
-        ? problem.hasRegionHint
-        : problem.regionCoords.length > 0;
-    const effectiveRegionMask: number[] | null = hasRegionHint
-      ? problem.regionCoords.slice()
-      : null;
-    const allowedRegionSet: Set<number> | null = hasRegionHint
-      ? new Set<number>(problem.regionCoords)
-      : null;
-
-    // 2. R12 §2: Derive problem-intrinsic context independently and reject goal/role/token conflicts
-    const canonicalProbCtx = deriveDefaultProofContextFromProblem(
-      problem,
-      params.context?.koRule ?? KoRule.SituationalSuperko
-    );
-    const sameTokens = (
-      a: ProofContext['initialTokens'],
-      b: ProofContext['initialTokens']
-    ): boolean =>
-      a.length === b.length &&
-      a.every(
-        (t, idx) =>
-          t.initialCoord === b[idx].initialCoord &&
-          t.stoneColor === b[idx].stoneColor &&
-          t.groupIndex === b[idx].groupIndex
-      );
-
-    if (params.context) {
-      const pc = params.context;
-      if (
-        pc.rootAttacker !== canonicalProbCtx.rootAttacker ||
-        pc.attackerGoal !== canonicalProbCtx.attackerGoal ||
-        pc.crucialStoneOp !== canonicalProbCtx.crucialStoneOp ||
-        !sameTokens(pc.initialTokens, canonicalProbCtx.initialTokens)
-      ) {
-        return makeSourceFail(
-          'VERIFICATION_FAILED',
-          'LP-P01',
-          `传入上下文与原题 "${problem.id}" 的攻防角色/目标 (${canonicalProbCtx.attackerGoal}) 或关键子令牌契约冲突。`
-        );
-      }
-    }
-    const context: ProofContext = params.context ?? canonicalProbCtx;
-
-    // 3. R13 §3: Unified run-contract validator across SolveReport, runContract, configFingerprint, and lproofJson
-    const expWall = sortedUniqueNumbers(problem.immortalWallCoords);
-    const expRegion = hasRegionHint
-      ? sortedUniqueNumbers(problem.regionCoords)
-      : [];
-
-    const buildOriginalRootPos = (): GoPosition => {
-      const pos = new GoPosition(
-        context,
-        problem.boardSize,
-        problem.immortalWallCoords
-      );
-      const firstToPlay =
-        problem.turnColor === 'W' ? Color.White : Color.Black;
-      pos.setupInitialStones(
-        problem.blackInitialCoords,
-        problem.whiteInitialCoords,
-        firstToPlay
-      );
-      return pos;
-    };
+    const {
+      context,
+      effectiveRegionMask,
+      allowedRegionSet,
+      origPos,
+    } = env;
 
     const replayPathFromOriginalRoot = (
       moves: number[],
       enforceRegionAndKo = true
     ): { ok: true; pos: GoPosition } | { ok: false; code: string; detail: string } => {
-      const pos = buildOriginalRootPos();
+      const pos = origPos.clone();
       for (let i = 0; i < moves.length; i++) {
         const mv = moves[i];
         const restrictedSide =
@@ -3521,530 +4980,8 @@ export class ProofArtifactManager {
       return { ok: true, pos };
     };
 
-    const origPos = buildOriginalRootPos();
-    const expOrigBlack = origPos.getBlackCoords();
-    const expOrigWhite = origPos.getWhiteCoords();
-    const expOrigTurn = origPos.toPlay;
-    const expOrigHash = origPos.computeZobristHex();
-
-    type ValidatedReportContract =
-      | {
-          ok: true;
-          derivedRunSource: 'original_root' | 'standalone_subposition';
-          runStartMoves: number[];
-          runStartPos: GoPosition;
-          hasEmbeddedLproof: boolean;
-        }
-      | { ok: false; code: string; detail: string };
-
-    const validateRunReportContract = (
-      candReport: SolveReport
-    ): ValidatedReportContract => {
-      // (a) Outer SolveReport board / wall / 3-state region
-      if (
-        candReport.hasRegionHint !== undefined &&
-        typeof candReport.hasRegionHint !== 'boolean'
-      ) {
-        return {
-          ok: false,
-          code: 'LP-J02',
-          detail: '报告 hasRegionHint 类型非法（必须为布尔值或省略）。',
-        };
-      }
-      if (
-        candReport.hasRegionHint === false &&
-        (candReport.regionCoords?.length ?? 0) > 0
-      ) {
-        return {
-          ok: false,
-          code: 'LP-J02',
-          detail: '报告存在矛盾区域声明：hasRegionHint=false 且 regionCoords 非空。',
-        };
-      }
-      const candWall = sortedUniqueNumbers(candReport.immortalWallCoords ?? []);
-      const candHasRegion =
-        candReport.hasRegionHint !== undefined
-          ? candReport.hasRegionHint
-          : (candReport.regionCoords?.length ?? 0) > 0;
-      const candRegion = candHasRegion
-        ? sortedUniqueNumbers(candReport.regionCoords ?? [])
-        : [];
-
-      if (
-        candReport.boardSize !== problem.boardSize ||
-        !numberArraysEqual(candWall, expWall) ||
-        candHasRegion !== hasRegionHint ||
-        !numberArraysEqual(candRegion, expRegion)
-      ) {
-        return {
-          ok: false,
-          code: 'LP-P01',
-          detail: `报告产物的棋盘尺寸/围墙/区域声明与原题 "${problem.id}" 不一致。`,
-        };
-      }
-
-      // (b) Structured runContract metadata (persisted on in-memory SolveReport)
-      if (candReport.runContract !== undefined) {
-        const rc = candReport.runContract;
-        if (!rc || typeof rc !== 'object' || typeof rc.hasRegionHint !== 'boolean') {
-          return {
-            ok: false,
-            code: 'LP-J02',
-            detail: '报告 runContract 字段结构非法。',
-          };
-        }
-        if (rc.hasRegionHint === false && rc.regionCoords.length > 0) {
-          return {
-            ok: false,
-            code: 'LP-J02',
-            detail: '报告 runContract 存在矛盾区域声明。',
-          };
-        }
-        const rcWall = sortedUniqueNumbers(rc.immortalWallCoords ?? []);
-        const rcRegion = rc.hasRegionHint
-          ? sortedUniqueNumbers(rc.regionCoords ?? [])
-          : [];
-        if (
-          rc.boardSize !== problem.boardSize ||
-          !numberArraysEqual(rcWall, expWall) ||
-          rc.hasRegionHint !== hasRegionHint ||
-          !numberArraysEqual(rcRegion, expRegion) ||
-          rc.rootAttacker !== context.rootAttacker ||
-          rc.attackerGoal !== context.attackerGoal ||
-          rc.crucialStoneOp !== context.crucialStoneOp ||
-          rc.koRule !== context.koRule ||
-          rc.attackerAllowKo !== context.attackerAllowKo ||
-          rc.defenderAllowKo !== context.defenderAllowKo ||
-          !sameTokens(rc.initialTokens ?? [], context.initialTokens)
-        ) {
-          return {
-            ok: false,
-            code: 'LP-P01',
-            detail: '报告 runContract（棋盘/围墙/区域/攻防目标/关键子/劫规则/劫权）与当前待验原题或运行上下文不一致。',
-          };
-        }
-      }
-
-      // (c) Defense-in-depth configFingerprint parity (covers stripped-lproofJson / legacy reports)
-      if (
-        typeof candReport.configFingerprint === 'string' &&
-        candReport.configFingerprint.length > 0
-      ) {
-        const koMatch = candReport.configFingerprint.match(
-          /:(SSK|PSK|SIMPLE):/
-        );
-        if (koMatch && koMatch[1] !== context.koRule) {
-          return {
-            ok: false,
-            code: 'LP-P01',
-            detail: `报告 configFingerprint 的劫规则 (${koMatch[1]}) 与待验上下文 (${context.koRule}) 不一致。`,
-          };
-        }
-        const akoDkoMatch = candReport.configFingerprint.match(
-          /:ako=(true|false):dko=(true|false)(?::|$)/
-        );
-        if (akoDkoMatch) {
-          const fpAko = akoDkoMatch[1] === 'true';
-          const fpDko = akoDkoMatch[2] === 'true';
-          if (
-            fpAko !== context.attackerAllowKo ||
-            fpDko !== context.defenderAllowKo
-          ) {
-            return {
-              ok: false,
-              code: 'LP-P01',
-              detail: `报告 configFingerprint 的劫权 (ako=${fpAko}, dko=${fpDko}) 与待验上下文 (ako=${context.attackerAllowKo}, dko=${context.defenderAllowKo}) 不一致。`,
-            };
-          }
-        }
-      }
-
-      const candStartBlack = sortedUniqueNumbers(
-        candReport.blackInitialCoords ?? []
-      );
-      const candStartWhite = sortedUniqueNumbers(
-        candReport.whiteInitialCoords ?? []
-      );
-
-      let parsedLproof: Record<string, unknown> | null = null;
-      if (
-        candReport.lproofJson !== undefined &&
-        candReport.lproofJson !== null &&
-        typeof candReport.lproofJson !== 'string'
-      ) {
-        return {
-          ok: false,
-          code: 'LP-J01',
-          detail: '报告内嵌的 lproofJson 类型非法（非字符串）。',
-        };
-      }
-      if (
-        typeof candReport.lproofJson === 'string' &&
-        candReport.lproofJson.trim().length > 0
-      ) {
-        try {
-          const obj = JSON.parse(candReport.lproofJson);
-          if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
-            return {
-              ok: false,
-              code: 'LP-J01',
-              detail: '报告内嵌的 lproofJson 顶层不是合法 JSON 对象。',
-            };
-          }
-          parsedLproof = obj as Record<string, unknown>;
-        } catch {
-          return {
-            ok: false,
-            code: 'LP-J01',
-            detail: '报告内嵌的 lproofJson 无法解析为合法 JSON。',
-          };
-        }
-      }
-
-      let candRunSource: 'original_root' | 'standalone_subposition' =
-        'original_root';
-      let candStartMoves: number[] = [];
-
-      if (parsedLproof) {
-        // (d) Mandatory lproof/1 contract & cross-binding with outer SolveReport (R13 §3)
-        if (parsedLproof.magic !== 'lproof/1') {
-          return {
-            ok: false,
-            code: 'LP-J02',
-            detail: `报告内嵌 lproofJson 的 magic="${String(
-              parsedLproof.magic
-            )}" 非法（必须为 "lproof/1"）。`,
-          };
-        }
-
-        const lpCtx = parsedLproof.context;
-        if (!lpCtx || typeof lpCtx !== 'object' || Array.isArray(lpCtx)) {
-          return {
-            ok: false,
-            code: 'LP-J02',
-            detail: '报告内嵌 lproofJson 缺失必需的 context 契约对象，拒绝跳过核验。',
-          };
-        }
-        const ctxObj = lpCtx as Record<string, unknown>;
-        const lpAttacker = decodeColor(ctxObj.rootAttacker);
-        const lpGoal = ctxObj.attackerGoal;
-        const lpOp = ctxObj.crucialStoneOp;
-        const lpKoRule = ctxObj.koRule;
-        const lpAttKo = ctxObj.attackerAllowKo;
-        const lpDefKo = ctxObj.defenderAllowKo;
-        const lpTokens = Array.isArray(ctxObj.initialTokens)
-          ? (ctxObj.initialTokens as Record<string, unknown>[])
-          : null;
-        if (
-          lpAttacker === null ||
-          typeof lpGoal !== 'string' ||
-          typeof lpOp !== 'string' ||
-          typeof lpKoRule !== 'string' ||
-          typeof lpAttKo !== 'boolean' ||
-          typeof lpDefKo !== 'boolean' ||
-          lpTokens === null
-        ) {
-          return {
-            ok: false,
-            code: 'LP-J02',
-            detail: '报告内嵌 lproofJson.context 缺少必需字段或字段类型非法。',
-          };
-        }
-        const tokensEqual =
-          lpTokens.length === context.initialTokens.length &&
-          lpTokens.every((t, idx) => {
-            if (!t || typeof t !== 'object') return false;
-            const c = decodeColor(t.stoneColor);
-            return (
-              t.initialCoord === context.initialTokens[idx].initialCoord &&
-              c === context.initialTokens[idx].stoneColor &&
-              t.groupIndex === context.initialTokens[idx].groupIndex
-            );
-          });
-        if (
-          lpAttacker !== context.rootAttacker ||
-          lpGoal !== context.attackerGoal ||
-          lpOp !== context.crucialStoneOp ||
-          lpKoRule !== context.koRule ||
-          lpAttKo !== context.attackerAllowKo ||
-          lpDefKo !== context.defenderAllowKo ||
-          !tokensEqual
-        ) {
-          return {
-            ok: false,
-            code: 'LP-P01',
-            detail: '报告已绑定的 lproof/1 契约上下文（攻防目标/关键子/劫规则/劫权）与当前待验命题及运行配置不一致。',
-          };
-        }
-
-        const lpSetupRaw = parsedLproof.problemSetup;
-        if (
-          !lpSetupRaw ||
-          typeof lpSetupRaw !== 'object' ||
-          Array.isArray(lpSetupRaw)
-        ) {
-          return {
-            ok: false,
-            code: 'LP-J02',
-            detail: '报告内嵌 lproofJson 缺失必需的 problemSetup 对象，拒绝跳过核验。',
-          };
-        }
-        const lpSetup = lpSetupRaw as Record<string, unknown>;
-
-        // Mandatory boardSize, walls, and 3-state region binding on lproof.problemSetup
-        if (
-          typeof lpSetup.boardSize !== 'number' ||
-          !Number.isInteger(lpSetup.boardSize) ||
-          !isIntegerArray(lpSetup.immortalWallCoords) ||
-          !isIntegerArray(lpSetup.regionCoords) ||
-          (lpSetup.hasRegionHint !== undefined &&
-            typeof lpSetup.hasRegionHint !== 'boolean')
-        ) {
-          return {
-            ok: false,
-            code: 'LP-J02',
-            detail: '报告内嵌 lproofJson.problemSetup 的棋盘尺寸/围墙/区域字段缺失或类型非法。',
-          };
-        }
-        if (lpSetup.hasRegionHint === false && lpSetup.regionCoords.length > 0) {
-          return {
-            ok: false,
-            code: 'LP-J02',
-            detail: '报告内嵌 lproofJson.problemSetup 存在矛盾区域声明：hasRegionHint=false 且 regionCoords 非空。',
-          };
-        }
-        const lpWall = sortedUniqueNumbers(lpSetup.immortalWallCoords);
-        const lpHasRegion =
-          lpSetup.hasRegionHint !== undefined
-            ? lpSetup.hasRegionHint
-            : lpSetup.regionCoords.length > 0;
-        const lpRegion = lpHasRegion
-          ? sortedUniqueNumbers(lpSetup.regionCoords)
-          : [];
-        if (
-          lpSetup.boardSize !== problem.boardSize ||
-          !numberArraysEqual(lpWall, expWall) ||
-          lpHasRegion !== hasRegionHint ||
-          !numberArraysEqual(lpRegion, expRegion)
-        ) {
-          return {
-            ok: false,
-            code: 'LP-P01',
-            detail: `报告内嵌 lproofJson.problemSetup 的棋盘尺寸/围墙/区域声明与原题 "${problem.id}" 不一致。`,
-          };
-        }
-
-        // Cross-bind lproofJson start board, inputHash, rootOutcome, and rootNode to outer SolveReport
-        const lpFirst = decodeColor(lpSetup.firstToPlay);
-        if (
-          lpFirst === null ||
-          !isIntegerArray(lpSetup.blackInitialCoords) ||
-          !isIntegerArray(lpSetup.whiteInitialCoords) ||
-          typeof lpSetup.inputHash !== 'string'
-        ) {
-          return {
-            ok: false,
-            code: 'LP-J02',
-            detail: '报告内嵌 lproofJson.problemSetup 缺少起始棋面/先手/inputHash。',
-          };
-        }
-        if (
-          lpFirst !== candReport.firstToPlay ||
-          !numberArraysEqual(
-            sortedUniqueNumbers(lpSetup.blackInitialCoords),
-            candStartBlack
-          ) ||
-          !numberArraysEqual(
-            sortedUniqueNumbers(lpSetup.whiteInitialCoords),
-            candStartWhite
-          ) ||
-          lpSetup.inputHash !== candReport.inputHash ||
-          parsedLproof.rootOutcome !== candReport.rootStatus ||
-          parsedLproof.rootNode !== candReport.rootDagNodeId
-        ) {
-          return {
-            ok: false,
-            code: 'LP-P01',
-            detail: '内存报告与内嵌 lproofJson 的起始局面、inputHash、rootOutcome 或 rootNode 不一致（疑似串用异次运行证书）。',
-          };
-        }
-
-        const rootKind = lpSetup.rootKind;
-        if (rootKind === 'traced_subposition') {
-          const originTurn = decodeColor(lpSetup.originFirstToPlay);
-          if (
-            originTurn === null ||
-            !isIntegerArray(lpSetup.originBlackCoords) ||
-            !isIntegerArray(lpSetup.originWhiteCoords) ||
-            !isIntegerArray(lpSetup.initialTraceMoves) ||
-            lpSetup.initialTraceMoves.length === 0
-          ) {
-            return {
-              ok: false,
-              code: 'LP-J02',
-              detail: '独立子局面产物缺少合法的 originBlackCoords / originWhiteCoords / originFirstToPlay / initialTraceMoves。',
-            };
-          }
-          if (
-            originTurn !== expOrigTurn ||
-            !numberArraysEqual(
-              sortedUniqueNumbers(lpSetup.originBlackCoords),
-              expOrigBlack
-            ) ||
-            !numberArraysEqual(
-              sortedUniqueNumbers(lpSetup.originWhiteCoords),
-              expOrigWhite
-            )
-          ) {
-            return {
-              ok: false,
-              code: 'LP-P01',
-              detail: `独立子局面产物的原根起点与待验原题 "${problem.id}" 不一致。`,
-            };
-          }
-          candStartMoves = lpSetup.initialTraceMoves.slice();
-          candRunSource = 'standalone_subposition';
-        } else if (rootKind === 'initial') {
-          if (
-            lpSetup.initialTraceMoves !== undefined &&
-            (!isIntegerArray(lpSetup.initialTraceMoves) ||
-              lpSetup.initialTraceMoves.length > 0)
-          ) {
-            return {
-              ok: false,
-              code: 'LP-P02',
-              detail: '产物声称 rootKind="initial" 却携带非空 initialTraceMoves。',
-            };
-          }
-          if (
-            lpFirst !== expOrigTurn ||
-            !numberArraysEqual(
-              sortedUniqueNumbers(lpSetup.blackInitialCoords),
-              expOrigBlack
-            ) ||
-            !numberArraysEqual(
-              sortedUniqueNumbers(lpSetup.whiteInitialCoords),
-              expOrigWhite
-            )
-          ) {
-            return {
-              ok: false,
-              code: 'LP-P01',
-              detail: `产物初始局面与待验原题 "${problem.id}" 不一致。`,
-            };
-          }
-          candStartMoves = [];
-          candRunSource = 'original_root';
-        } else {
-          return {
-            ok: false,
-            code: 'LP-J02',
-            detail: `报告内嵌 lproofJson.problemSetup.rootKind="${String(
-              rootKind
-            )}" 非法。`,
-          };
-        }
-
-        if (candReport.runContract !== undefined) {
-          if (
-            candReport.runContract.rootKind !== rootKind ||
-            !numberArraysEqual(
-              candReport.runContract.initialTraceMoves ?? [],
-              candStartMoves
-            )
-          ) {
-            return {
-              ok: false,
-              code: 'LP-P01',
-              detail: '内存报告 runContract 的 rootKind / initialTraceMoves 与内嵌 lproofJson 不一致。',
-            };
-          }
-        }
-      } else if (
-        candReport.runContract !== undefined &&
-        candReport.runContract.rootKind === 'traced_subposition'
-      ) {
-        if (
-          !isIntegerArray(candReport.runContract.initialTraceMoves) ||
-          candReport.runContract.initialTraceMoves.length === 0
-        ) {
-          return {
-            ok: false,
-            code: 'LP-J02',
-            detail: '无 lproofJson 的独立子局面报告缺失合法的 runContract.initialTraceMoves。',
-          };
-        }
-        candStartMoves = candReport.runContract.initialTraceMoves.slice();
-        candRunSource = 'standalone_subposition';
-      } else {
-        // No embedded lproofJson: derive strictly by comparing report's starting position to problem root
-        const matchesOrigRoot =
-          candReport.firstToPlay === expOrigTurn &&
-          numberArraysEqual(candStartBlack, expOrigBlack) &&
-          numberArraysEqual(candStartWhite, expOrigWhite) &&
-          candReport.inputHash === expOrigHash &&
-          candReport.branchCoverageSnapshots?.[0]?.runSource !==
-            'standalone_subposition';
-        if (!matchesOrigRoot) {
-          return {
-            ok: false,
-            code: 'LP-P01',
-            detail: '报告起点与原题初始局面不一致，且缺少可核验的 lproofJson / runContract 到达轨迹。',
-          };
-        }
-        candStartMoves = [];
-        candRunSource = 'original_root';
-      }
-
-      // Independently replay arrival trace and verify starting position parity
-      const startReplay = replayPathFromOriginalRoot(candStartMoves, false);
-      if (!startReplay.ok) {
-        return {
-          ok: false,
-          code: startReplay.code,
-          detail: `运行起点轨迹独立重放失败：${startReplay.detail}`,
-        };
-      }
-      const startPos = startReplay.pos;
-      if (
-        candReport.firstToPlay !== startPos.toPlay ||
-        !numberArraysEqual(candStartBlack, startPos.getBlackCoords()) ||
-        !numberArraysEqual(candStartWhite, startPos.getWhiteCoords()) ||
-        candReport.inputHash !== startPos.computeZobristHex()
-      ) {
-        return {
-          ok: false,
-          code: 'LP-S02',
-          detail: '运行起点重放盘面与报告声明的起始棋面/先手/inputHash 不一致。',
-        };
-      }
-
-      if (parsedLproof) {
-        const lpSetup = parsedLproof.problemSetup as Record<string, unknown>;
-        if (
-          lpSetup.zobristHex !== startPos.computeZobristHex() ||
-          lpSetup.koPoint !== startPos.koPoint ||
-          lpSetup.consecutivePasses !== startPos.consecutivePasses ||
-          lpSetup.survivingTokensMask !== startPos.survivingTargetTokensMask
-        ) {
-          return {
-            ok: false,
-            code: 'LP-S02',
-            detail: '内嵌 lproofJson.problemSetup 的 zobristHex/koPoint/consecutivePasses/survivingTokensMask 与重放起点不一致。',
-          };
-        }
-      }
-
-      return {
-        ok: true,
-        derivedRunSource: candRunSource,
-        runStartMoves: candStartMoves,
-        runStartPos: startPos,
-        hasEmbeddedLproof: parsedLproof !== null,
-      };
-    };
-
-    const mainContract = validateRunReportContract(report);
+    // 2. Validate main report contract (R13 §3 + R14 §2/§3)
+    const mainContract = this.validateSingleReportContract(report, problem, env);
     if (!mainContract.ok) {
       return makeSourceFail(
         'VERIFICATION_FAILED',
@@ -4060,91 +4997,7 @@ export class ProofArtifactManager {
     );
     const runStartPos = mainContract.runStartPos;
 
-    // 4. R13 §1: Verify authentic originalRootOutcome (NEVER copy unverified rootStatus or cross-contract reports!)
-    const resolveVerifiedOriginalRoot = (
-      candReport: SolveReport,
-      preValidated?: Extract<ValidatedReportContract, { ok: true }>
-    ): {
-      outcome: ProofOutcome | null;
-      nodes: number | null;
-      note?: string;
-    } => {
-      const contractRes = preValidated ?? validateRunReportContract(candReport);
-      if (!contractRes.ok) {
-        return {
-          outcome: null,
-          nodes: null,
-          note: `原根报告未通过契约绑定 (${contractRes.code})：${contractRes.detail}`,
-        };
-      }
-      if (contractRes.derivedRunSource !== 'original_root') {
-        return {
-          outcome: null,
-          nodes: null,
-          note: '原根报告来自独立子局面 (traced_subposition)，不能代表原题根部结论 (LP-P02)。',
-        };
-      }
-      if (candReport.rootStatus === ProofOutcome.Unknown) {
-        return {
-          outcome: ProofOutcome.Unknown,
-          nodes: candReport.numNodes,
-        };
-      }
-
-      // Claimed PROVEN_WIN / PROVEN_LOSS MUST pass independent original_root proof verification
-      if (contractRes.hasEmbeddedLproof) {
-        const fileVr = this.verifySerializedLProofJson(candReport.lproofJson, {
-          problem,
-          context,
-          scope: 'original_root',
-        });
-        if (!fileVr.passed) {
-          return {
-            outcome: null,
-            nodes: candReport.numNodes,
-            note: `原根声称 ${candReport.rootStatus}，但 lproof/1 证书未通过 original_root 独立校验 (${fileVr.errorCode})：${fileVr.message}`,
-          };
-        }
-      }
-      const memIsCompact =
-        !Array.isArray(candReport.stateTable) ||
-        candReport.stateTable.length === 0;
-      const memVr = this.verifyProofDag(origPos, context, candReport, {
-        skipChecksumRecompute: true,
-        isCompactDag: memIsCompact,
-        encodingMode: memIsCompact ? 'compact_dag' : 'full_state_table',
-        verifiedScope: 'original_root',
-        verifiedRootKind: 'initial',
-      });
-      if (!memVr.passed) {
-        return {
-          outcome: null,
-          nodes: candReport.numNodes,
-          note: `原根声称 ${candReport.rootStatus}，但内存证明 DAG 未通过 original_root 独立校验 (${memVr.errorCode})：${memVr.message}`,
-        };
-      }
-      return {
-        outcome: candReport.rootStatus,
-        nodes: candReport.numNodes,
-      };
-    };
-
-    if (derivedRunSource === 'original_root') {
-      const origRes = resolveVerifiedOriginalRoot(report, mainContract);
-      originalRootOutcome = origRes.outcome;
-      originalRootNodes = origRes.nodes;
-      originalRootBindingNote = origRes.note;
-    } else if (params.originalRootReport) {
-      const origRes = resolveVerifiedOriginalRoot(params.originalRootReport);
-      originalRootOutcome = origRes.outcome;
-      originalRootNodes = origRes.nodes;
-      originalRootBindingNote = origRes.note;
-    } else {
-      originalRootOutcome = null;
-      originalRootNodes = null;
-    }
-
-    // Reject contradictory caller-supplied runSource (R12 §4)
+    // 3. Reject contradictory caller-supplied runSource & targetPathMoves BEFORE resolving original root
     if (
       params.runSource !== undefined &&
       params.runSource !== derivedRunSource
@@ -4156,7 +5009,6 @@ export class ProofArtifactManager {
       );
     }
 
-    // Verify targetPathMoves belongs to this run's starting trajectory (R12 §4)
     if (derivedRunSource === 'standalone_subposition') {
       const prefixOk =
         targetPathMoves.length >= runStartMoves.length &&
@@ -4168,6 +5020,36 @@ export class ProofArtifactManager {
           `目标路径 [${targetPathSgf.join('/') || 'root'}] 不以当前独立子局面运行起点 [${runStartPathSgf.join('/')}] 为前缀。`
         );
       }
+    }
+
+    // 4. R13 §1 + R14 §2/§3/§4: Resolve authentic originalRootOutcome via contract+content-bound receipt reuse
+    if (derivedRunSource === 'original_root') {
+      const origRes = this.resolveOriginalRootWithReceiptReuse(
+        report,
+        problem,
+        env,
+        params.verifiedOriginalRootReceipt,
+        mainContract
+      );
+      originalRootOutcome = origRes.outcome;
+      originalRootNodes = origRes.nodes;
+      originalRootBindingNote = origRes.note;
+      originalRootVerificationSource = origRes.verificationSource;
+    } else if (params.originalRootReport !== undefined) {
+      const origRes = this.resolveOriginalRootWithReceiptReuse(
+        params.originalRootReport,
+        problem,
+        env,
+        params.verifiedOriginalRootReceipt
+      );
+      originalRootOutcome = origRes.outcome;
+      originalRootNodes = origRes.nodes;
+      originalRootBindingNote = origRes.note;
+      originalRootVerificationSource = origRes.verificationSource;
+    } else {
+      originalRootOutcome = null;
+      originalRootNodes = null;
+      originalRootVerificationSource = 'not_applicable';
     }
 
     // 5. R12 §3: Distinguish unclosed sentinel (-1) from corrupted out-of-bounds positive/invalid DAG node IDs
@@ -4849,6 +5731,7 @@ export class ProofArtifactManager {
       ...(originalRootBindingNote !== undefined
         ? { originalRootBindingNote }
         : {}),
+      originalRootVerificationSource,
       sourceReceipt,
       queryReplayReceipt,
     };

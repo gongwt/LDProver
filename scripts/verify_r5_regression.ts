@@ -2208,6 +2208,522 @@ runSection('Section 11: R13 Original-Root Binding, Entry-Point-Invariant Full-Ta
   );
 });
 
+runSection('Section 12: R14 No-File Original-Root Evidence Discipline, Defensive Isolation & Reusable Original-Root Receipt', () => {
+  const cfgRz: SolverConfig = {
+    ...defaultConfig(3500),
+    maxDepth: 48,
+    memoryBudgetMb: 512,
+    enableRzPruning: true,
+    useProblemDefaultKo: true,
+  };
+  const cloneReport = <T,>(r: T): T => JSON.parse(JSON.stringify(r));
+
+  const p001 = getSpec('p001');
+  const ctx001 = DfpnSolver.buildProofContext(p001, cfgRz);
+  const rep001 = new DfpnSolver(cfgRz).solveProblem(p001);
+  const baMove = sgfToCoord('ba', 19);
+
+  // 12.1 R14 §2 (P1): Missing lproofJson on proven p001 preserves valid ba sourceReceipt
+  //      while leaving originalRootOutcome=null, originalRootNodes=null, with missing-file note!
+  const frag001Full = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    frag001Full.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+      frag001Full.sourceReceipt.passed &&
+      frag001Full.originalRootOutcome === ProofOutcome.ProvenWin &&
+      frag001Full.originalRootNodes === rep001.numNodes &&
+      frag001Full.originalRootBindingNote === undefined,
+    'R14 §2 positive control: intact p001 with lproofJson populates originalRootOutcome=PROVEN_WIN + originalRootNodes without note',
+    `src=${frag001Full.sourceReceipt.status}, orig=${String(frag001Full.originalRootOutcome)}, nodes=${String(frag001Full.originalRootNodes)}, note=${String(frag001Full.originalRootBindingNote)}`
+  );
+
+  const rep001NoFile = cloneReport(rep001);
+  rep001NoFile.lproofJson = '';
+  const frag001NoFile = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001NoFile,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    frag001NoFile.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+      frag001NoFile.sourceReceipt.passed &&
+      frag001NoFile.sourceReceipt.errorCode === 'PASS' &&
+      frag001NoFile.originalRootOutcome === null &&
+      frag001NoFile.originalRootNodes === null &&
+      Boolean(frag001NoFile.originalRootBindingNote?.includes('lproof/1')),
+    'R14 §2 P1: no-file proven p001 keeps valid ba sourceReceipt (PASS) while leaving originalRootOutcome=null & originalRootNodes=null with missing-lproof note',
+    `src=${frag001NoFile.sourceReceipt.status}/${frag001NoFile.sourceReceipt.errorCode}, orig=${String(frag001NoFile.originalRootOutcome)}, nodes=${String(frag001NoFile.originalRootNodes)}, note=${String(frag001NoFile.originalRootBindingNote)}`
+  );
+
+  // 12.2 R14 §2 (P1): Unconditional runContract.rootKind enum & trace check even when lproofJson is empty
+  const rep001InitialWithTrace = cloneReport(rep001NoFile);
+  rep001InitialWithTrace.runContract!.rootKind = 'initial';
+  rep001InitialWithTrace.runContract!.initialTraceMoves = [baMove];
+  const frag001InitTrace = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001InitialWithTrace,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    frag001InitTrace.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      frag001InitTrace.sourceReceipt.errorCode === 'LP-P02' &&
+      frag001InitTrace.originalRootOutcome === null &&
+      frag001InitTrace.originalRootNodes === null,
+    'R14 §2 P1: no-file report with runContract rootKind="initial" + non-empty initialTraceMoves rejects with LP-P02',
+    `src=${frag001InitTrace.sourceReceipt.status}/${frag001InitTrace.sourceReceipt.errorCode}, orig=${String(frag001InitTrace.originalRootOutcome)}, nodes=${String(frag001InitTrace.originalRootNodes)}`
+  );
+
+  const rep001UnknownKind = cloneReport(rep001NoFile);
+  (rep001UnknownKind.runContract as unknown as Record<string, unknown>).rootKind =
+    'unknown_kind';
+  const frag001UnknownKind = checker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001UnknownKind,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+  });
+  check(
+    frag001UnknownKind.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      frag001UnknownKind.sourceReceipt.errorCode === 'LP-J02' &&
+      frag001UnknownKind.originalRootOutcome === null &&
+      frag001UnknownKind.originalRootNodes === null,
+    'R14 §2 P1: no-file report with unknown runContract.rootKind string rejects with LP-J02',
+    `src=${frag001UnknownKind.sourceReceipt.status}/${frag001UnknownKind.sourceReceipt.errorCode}, orig=${String(frag001UnknownKind.originalRootOutcome)}, nodes=${String(frag001UnknownKind.originalRootNodes)}`
+  );
+
+  // 12.3 R14 §2 (P1): Legacy p162 ToKill 1-node UNKNOWN (without runContract) attached to official ToLive sr/pass
+  const p162 = getSpec('chao_vol2_p162');
+  const ctx162 = DfpnSolver.buildProofContext(p162, cfgRz);
+  const rep162Orig = new DfpnSolver(cfgRz).solveProblem(p162);
+  const srMove = sgfToCoord('sr', 19);
+  const subPos162 = DfpnSolver.buildInitialPosition(p162, ctx162);
+  subPos162.playMove(srMove);
+  subPos162.playMove(PASS_MOVE);
+  const rep162Sub = new DfpnSolver(cfgRz).solveFromPosition(
+    p162,
+    subPos162,
+    ctx162
+  );
+
+  // Build legacy-style ToKill 1-node UNKNOWN report (same board & configFingerprint, no runContract)
+  const p162ToKill: TsumegoProblemSpec = {
+    ...p162,
+    blackSearchGoal: SearchGoal.ToKill,
+  };
+  const cfg1Node: SolverConfig = { ...cfgRz, maxNodes: 1 };
+  const rep162LegacyToKillWithFile = new DfpnSolver(cfg1Node).solveProblem(
+    p162ToKill
+  );
+  delete rep162LegacyToKillWithFile.runContract;
+
+  const frag162LegacyWithFile = checker.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162LegacyToKillWithFile,
+  });
+  check(
+    frag162LegacyWithFile.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+      frag162LegacyWithFile.sourceReceipt.passed &&
+      frag162LegacyWithFile.originalRootOutcome === null &&
+      frag162LegacyWithFile.originalRootNodes === null &&
+      Boolean(frag162LegacyWithFile.originalRootBindingNote?.includes('LP-P01')),
+    'R14 §2 P1: legacy p162 ToKill 1-node UNKNOWN report WITH lproofJson rejects original-root attribution (LP-P01) while keeping sr/pass verified',
+    `src=${frag162LegacyWithFile.sourceReceipt.status}, orig=${String(frag162LegacyWithFile.originalRootOutcome)}, nodes=${String(frag162LegacyWithFile.originalRootNodes)}, note=${String(frag162LegacyWithFile.originalRootBindingNote)}`
+  );
+
+  // Strip lproofJson from the legacy ToKill 1-node UNKNOWN report (only configFingerprint remains!)
+  const rep162LegacyToKillNoFile = cloneReport(rep162LegacyToKillWithFile);
+  rep162LegacyToKillNoFile.lproofJson = '';
+  const frag162LegacyNoFile = checker.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162LegacyToKillNoFile,
+  });
+  check(
+    frag162LegacyNoFile.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+      frag162LegacyNoFile.sourceReceipt.passed &&
+      frag162LegacyNoFile.originalRootOutcome === null &&
+      frag162LegacyNoFile.originalRootNodes === null &&
+      Boolean(frag162LegacyNoFile.originalRootBindingNote?.includes('配置指纹')),
+    'R14 §2 P1: legacy p162 ToKill 1-node UNKNOWN report WITHOUT lproofJson or runContract refuses attribution (originalRootOutcome=null, originalRootNodes=null, explains fingerprint-only insufficiency)',
+    `src=${frag162LegacyNoFile.sourceReceipt.status}, orig=${String(frag162LegacyNoFile.originalRootOutcome)}, nodes=${String(frag162LegacyNoFile.originalRootNodes)}, note=${String(frag162LegacyNoFile.originalRootBindingNote)}`
+  );
+
+  // Positive controls: (a) official ToLive 3500-node UNKNOWN with intact runContract (even without lproofJson),
+  // and (b) legacy ToLive 3500-node UNKNOWN without runContract but WITH intact lproofJson both bind cleanly!
+  const rep162OrigNoFileWithRc = cloneReport(rep162Orig);
+  rep162OrigNoFileWithRc.lproofJson = '';
+  const frag162NoFileWithRc = checker.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162OrigNoFileWithRc,
+  });
+  const rep162OrigLegacyWithFile = cloneReport(rep162Orig);
+  delete rep162OrigLegacyWithFile.runContract;
+  const frag162LegacyToLiveWithFile = checker.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162OrigLegacyWithFile,
+  });
+  check(
+    frag162NoFileWithRc.sourceReceipt.passed &&
+      frag162NoFileWithRc.originalRootOutcome === ProofOutcome.Unknown &&
+      frag162NoFileWithRc.originalRootNodes === 3500 &&
+      frag162NoFileWithRc.originalRootBindingNote === undefined &&
+      frag162LegacyToLiveWithFile.sourceReceipt.passed &&
+      frag162LegacyToLiveWithFile.originalRootOutcome === ProofOutcome.Unknown &&
+      frag162LegacyToLiveWithFile.originalRootNodes === 3500 &&
+      frag162LegacyToLiveWithFile.originalRootBindingNote === undefined,
+    'R14 §2 positive controls: official ToLive 3500-node UNKNOWN binds cleanly both with runContract-only and with legacy lproofJson-only',
+    `rcOnly=${String(frag162NoFileWithRc.originalRootOutcome)}/${String(frag162NoFileWithRc.originalRootNodes)}, legacyFile=${String(frag162LegacyToLiveWithFile.originalRootOutcome)}/${String(frag162LegacyToLiveWithFile.originalRootNodes)}`
+  );
+
+  // 12.4 R14 §3 (P2): Damaged reports (null token / negative numNodes) NEVER throw and isolate companion errors
+  const rep162NullToken = cloneReport(rep162Orig);
+  (rep162NullToken.runContract!.initialTokens as unknown[])[0] = null;
+  let threwOnCompanionNullToken = false;
+  let frag162CompanionNull: ReturnType<typeof checker.verifySubproofFragment> | null = null;
+  try {
+    frag162CompanionNull = checker.verifySubproofFragment({
+      problem: p162,
+      context: ctx162,
+      report: rep162Sub,
+      targetPathMoves: [srMove, PASS_MOVE],
+      targetDagNodeId: rep162Sub.rootDagNodeId,
+      originalRootReport: rep162NullToken,
+    });
+  } catch {
+    threwOnCompanionNullToken = true;
+  }
+  check(
+    !threwOnCompanionNullToken &&
+      frag162CompanionNull !== null &&
+      frag162CompanionNull.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+      frag162CompanionNull.sourceReceipt.passed &&
+      frag162CompanionNull.originalRootOutcome === null &&
+      frag162CompanionNull.originalRootNodes === null &&
+      Boolean(frag162CompanionNull.originalRootBindingNote?.includes('LP-J02')),
+    'R14 §3 P2: companion originalRootReport with null initialTokens element never throws, preserves sr/pass SOURCE_VERIFIED, and clears originalRoot with LP-J02 note',
+    `threw=${threwOnCompanionNullToken}, src=${frag162CompanionNull?.sourceReceipt.status}, orig=${String(frag162CompanionNull?.originalRootOutcome)}, nodes=${String(frag162CompanionNull?.originalRootNodes)}`
+  );
+
+  const rep001NullToken = cloneReport(rep001);
+  (rep001NullToken.runContract!.initialTokens as unknown[])[0] = null;
+  let threwOnMainNullToken = false;
+  let frag001MainNull: ReturnType<typeof checker.verifySubproofFragment> | null = null;
+  try {
+    frag001MainNull = checker.verifySubproofFragment({
+      problem: p001,
+      context: ctx001,
+      report: rep001NullToken,
+      targetPathMoves: [baMove],
+      targetDagNodeId: 0,
+    });
+  } catch {
+    threwOnMainNullToken = true;
+  }
+  check(
+    !threwOnMainNullToken &&
+      frag001MainNull !== null &&
+      frag001MainNull.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      frag001MainNull.sourceReceipt.errorCode === 'LP-J02' &&
+      frag001MainNull.originalRootOutcome === null &&
+      frag001MainNull.originalRootNodes === null,
+    'R14 §3 P2: main report with null initialTokens element never throws and returns structured VERIFICATION_FAILED / LP-J02',
+    `threw=${threwOnMainNullToken}, src=${frag001MainNull?.sourceReceipt.status}/${frag001MainNull?.sourceReceipt.errorCode}`
+  );
+
+  const rep162NegNodes = cloneReport(rep162OrigNoFileWithRc);
+  rep162NegNodes.numNodes = -7;
+  const frag162NegNodes = checker.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Sub,
+    targetPathMoves: [srMove, PASS_MOVE],
+    targetDagNodeId: rep162Sub.rootDagNodeId,
+    originalRootReport: rep162NegNodes,
+  });
+  check(
+    frag162NegNodes.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+      frag162NegNodes.sourceReceipt.passed &&
+      frag162NegNodes.originalRootOutcome === null &&
+      frag162NegNodes.originalRootNodes === null &&
+      Boolean(frag162NegNodes.originalRootBindingNote?.includes('LP-J02')),
+    'R14 §3 P2: negative numNodes=-7 on no-file UNKNOWN originalRootReport is rejected (never echoed as -7)',
+    `src=${frag162NegNodes.sourceReceipt.status}, orig=${String(frag162NegNodes.originalRootOutcome)}, nodes=${String(frag162NegNodes.originalRootNodes)}, note=${String(frag162NegNodes.originalRootBindingNote)}`
+  );
+
+  // 12.5 R14 §4 (P2): Contract+content-bound VerifiedOriginalRootReceipt reuse, call-count tracking, invalidation & latency
+  const reconstructPathToNode = (rep: typeof rep001, dagId: number): number[] => {
+    const moves: number[] = [];
+    let cur = rep.proofDagNodes[dagId].stateId;
+    while (cur > 0) {
+      const row = rep.stateTable[cur];
+      moves.push(row.moveFromParent);
+      cur = row.parentStateId;
+    }
+    return moves.reverse();
+  };
+
+  const p042 = getSpec('chao_vol1_p042');
+  const ctx42 = DfpnSolver.buildProofContext(p042, cfgRz);
+  const rep42 = new DfpnSolver(cfgRz).solveProblem(p042);
+  const p042Leaf0Path = reconstructPathToNode(rep42, 0);
+
+  const p031 = getSpec('chao_vol1_p031');
+  const ctx31 = DfpnSolver.buildProofContext(p031, cfgRz);
+  const rep31 = new DfpnSolver(cfgRz).solveProblem(p031);
+  const p031Leaf0Path = reconstructPathToNode(rep31, 0);
+
+  const meteredChecker = new ProofArtifactManager();
+  const receipt42 = meteredChecker.verifyOriginalRootReceipt({
+    problem: p042,
+    context: ctx42,
+    report: rep42,
+  });
+  const countAfterInit42 = meteredChecker.getWholeRootVerificationCount();
+
+  // Repeated leaf #0 and sentinel -1 queries on p042 MUST reuse receipt (0 extra whole-root verifications!)
+  const p042LeafTimes: number[] = [];
+  let lastLeaf42Res: ReturnType<typeof meteredChecker.verifySubproofFragment> | null = null;
+  for (let i = 0; i < 3; i++) {
+    const t0 = performance.now();
+    lastLeaf42Res = meteredChecker.verifySubproofFragment({
+      problem: p042,
+      context: ctx42,
+      report: rep42,
+      targetPathMoves: p042Leaf0Path,
+      targetDagNodeId: 0,
+      verifiedOriginalRootReceipt: receipt42,
+    });
+    p042LeafTimes.push(performance.now() - t0);
+  }
+  const p042SentinelTimes: number[] = [];
+  let lastSentinel42Res: ReturnType<typeof meteredChecker.verifySubproofFragment> | null = null;
+  for (let i = 0; i < 3; i++) {
+    const t0 = performance.now();
+    lastSentinel42Res = meteredChecker.verifySubproofFragment({
+      problem: p042,
+      context: ctx42,
+      report: rep42,
+      targetPathMoves: p042Leaf0Path,
+      targetDagNodeId: -1,
+      verifiedOriginalRootReceipt: receipt42,
+    });
+    p042SentinelTimes.push(performance.now() - t0);
+  }
+  const countAfterQueries42 = meteredChecker.getWholeRootVerificationCount();
+
+  // Also test on p031 leaf #0 and sentinel -1 (even on a DIFFERENT checker instance passing receipt31!)
+  const receipt31 = meteredChecker.verifyOriginalRootReceipt({
+    problem: p031,
+    context: ctx31,
+    report: rep31,
+  });
+  const freshCheckerFor31 = new ProofArtifactManager();
+  const p031LeafTimes: number[] = [];
+  let lastLeaf31Res: ReturnType<typeof freshCheckerFor31.verifySubproofFragment> | null = null;
+  for (let i = 0; i < 3; i++) {
+    const t0 = performance.now();
+    lastLeaf31Res = freshCheckerFor31.verifySubproofFragment({
+      problem: p031,
+      context: ctx31,
+      report: rep31,
+      targetPathMoves: p031Leaf0Path,
+      targetDagNodeId: 0,
+      verifiedOriginalRootReceipt: receipt31,
+    });
+    p031LeafTimes.push(performance.now() - t0);
+  }
+  const p031SentinelTimes: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    const t0 = performance.now();
+    freshCheckerFor31.verifySubproofFragment({
+      problem: p031,
+      context: ctx31,
+      report: rep31,
+      targetPathMoves: p031Leaf0Path,
+      targetDagNodeId: -1,
+      verifiedOriginalRootReceipt: receipt31,
+    });
+    p031SentinelTimes.push(performance.now() - t0);
+  }
+
+  // Also test R14 §4 exact call pattern: repeated verifySubproofFragment on SAME checker instance WITHOUT passing receipt
+  const implicitChecker = new ProofArtifactManager();
+  implicitChecker.verifySubproofFragment({
+    problem: p031,
+    context: ctx31,
+    report: rep31,
+    targetPathMoves: p031Leaf0Path,
+    targetDagNodeId: 0,
+  });
+  const implicitCountAfterWarmup = implicitChecker.getWholeRootVerificationCount();
+  const implicit31LeafTimes: number[] = [];
+  let lastImplicit31: ReturnType<typeof implicitChecker.verifySubproofFragment> | null = null;
+  for (let i = 0; i < 3; i++) {
+    const t0 = performance.now();
+    lastImplicit31 = implicitChecker.verifySubproofFragment({
+      problem: p031,
+      context: ctx31,
+      report: rep31,
+      targetPathMoves: p031Leaf0Path,
+      targetDagNodeId: 0,
+    });
+    implicit31LeafTimes.push(performance.now() - t0);
+  }
+  const implicitCountAfter3 = implicitChecker.getWholeRootVerificationCount();
+
+  const median = (xs: number[]): number => {
+    const s = xs.slice().sort((a, b) => a - b);
+    return s[Math.floor(s.length / 2)];
+  };
+  const med42Leaf = median(p042LeafTimes);
+  const med42Sent = median(p042SentinelTimes);
+  const med31Leaf = median(p031LeafTimes);
+  const med31Sent = median(p031SentinelTimes);
+  const med31Implicit = median(implicit31LeafTimes);
+  console.log(
+    `  [INFO] R14 §4 receipt-reused medians: p042 leaf=${med42Leaf.toFixed(1)}ms, sentinel=${med42Sent.toFixed(1)}ms | p031 leaf=${med31Leaf.toFixed(1)}ms, sentinel=${med31Sent.toFixed(1)}ms, implicitCache=${med31Implicit.toFixed(1)}ms`
+  );
+
+  check(
+    countAfterInit42 === 1 &&
+      countAfterQueries42 === 1 &&
+      freshCheckerFor31.getWholeRootVerificationCount() === 0 &&
+      implicitCountAfterWarmup === 1 &&
+      implicitCountAfter3 === 1 &&
+      lastImplicit31?.originalRootVerificationSource === 'reused_receipt' &&
+      lastLeaf42Res?.sourceReceipt.passed === true &&
+      lastLeaf42Res?.originalRootOutcome === ProofOutcome.ProvenWin &&
+      lastLeaf42Res?.originalRootVerificationSource === 'reused_receipt' &&
+      lastSentinel42Res?.sourceReceipt.status === 'UNCLOSED' &&
+      lastSentinel42Res?.sourceReceipt.errorCode === 'LP-U01' &&
+      lastSentinel42Res?.originalRootOutcome === ProofOutcome.ProvenWin &&
+      lastSentinel42Res?.originalRootVerificationSource === 'reused_receipt' &&
+      lastLeaf31Res?.sourceReceipt.passed === true &&
+      lastLeaf31Res?.originalRootOutcome === ProofOutcome.ProvenWin &&
+      lastLeaf31Res?.originalRootVerificationSource === 'reused_receipt' &&
+      med42Leaf < 40 &&
+      med42Sent < 40 &&
+      med31Leaf < 60 &&
+      med31Sent < 60 &&
+      med31Implicit < 60,
+    'R14 §4 P2: VerifiedOriginalRootReceipt & per-instance content-bound cache eliminate redundant whole-root re-verification across p042 & p031 leaf/sentinel queries (0 extra whole-root runs)',
+    `c42=${countAfterInit42}->${countAfterQueries42}, c31Fresh=${freshCheckerFor31.getWholeRootVerificationCount()}, c31Impl=${implicitCountAfterWarmup}->${implicitCountAfter3}, med42=${med42Leaf.toFixed(1)}/${med42Sent.toFixed(1)}ms, med31=${med31Leaf.toFixed(1)}/${med31Sent.toFixed(1)}/${med31Implicit.toFixed(1)}ms`
+  );
+
+  // Invalidation Case A: Same board, changed external contract (empty-region p042) MUST NOT reuse receipt42!
+  const p042EmptyRegion: TsumegoProblemSpec = {
+    ...p042,
+    hasRegionHint: true,
+    regionCoords: [],
+  };
+  const invContractRes = meteredChecker.verifySubproofFragment({
+    problem: p042EmptyRegion,
+    context: ctx42,
+    report: rep42,
+    targetPathMoves: p042Leaf0Path,
+    targetDagNodeId: 0,
+    verifiedOriginalRootReceipt: receipt42,
+  });
+  check(
+    invContractRes.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+      invContractRes.sourceReceipt.errorCode === 'LP-P01' &&
+      invContractRes.originalRootOutcome === null &&
+      invContractRes.originalRootVerificationSource !== 'reused_receipt',
+    'R14 §4 invalidation A: same-board contract change (empty region) invalidates receipt42 and rejects with LP-P01',
+    `src=${invContractRes.sourceReceipt.status}/${invContractRes.sourceReceipt.errorCode}, orig=${String(invContractRes.originalRootOutcome)}, verSrc=${String(invContractRes.originalRootVerificationSource)}`
+  );
+
+  // Invalidation Case B: In-place mutation of the SAME report object reference MUST invalidate receipt AND trigger fresh whole-root re-verification!
+  const rep42Mutable = cloneReport(rep42);
+  const invChecker = new ProofArtifactManager();
+  const receipt42Mut = invChecker.verifyOriginalRootReceipt({
+    problem: p042,
+    context: ctx42,
+    report: rep42Mutable,
+  });
+  const countBeforeMut = invChecker.getWholeRootVerificationCount();
+  const rsSnap42 = rep42Mutable.branchCoverageSnapshots?.find(
+    (s) => s.path === 'rs'
+  );
+  const passEntry42 = rsSnap42?.moves.find((m) => m.move === PASS_MOVE);
+  const childToCorrupt =
+    rep42Mutable.proofDagNodes[passEntry42!.dagNodeId].childNodeIds[0];
+  // Mutate rep42Mutable IN PLACE (same object reference, same Zobrist, same proofChecksum!)
+  rep42Mutable.proofDagNodes[childToCorrupt].stateId =
+    rep42Mutable.stateTable.length;
+
+  const invMutRes = invChecker.verifySubproofFragment({
+    problem: p042,
+    context: ctx42,
+    report: rep42Mutable,
+    targetPathMoves: p042Leaf0Path,
+    targetDagNodeId: 0,
+    verifiedOriginalRootReceipt: receipt42Mut,
+  });
+  const countAfterMut = invChecker.getWholeRootVerificationCount();
+  check(
+    countBeforeMut === 1 &&
+      countAfterMut === 2 &&
+      invMutRes.originalRootVerificationSource === 'verified_now' &&
+      invMutRes.originalRootOutcome === null &&
+      invMutRes.originalRootNodes === null &&
+      (Boolean(invMutRes.originalRootBindingNote?.includes('LP-S02')) ||
+        Boolean(invMutRes.originalRootBindingNote?.includes('LP-S10'))),
+    'R14 §4 invalidation B: in-place mutation of same report object reference invalidates receipt, re-runs whole-root verification (count 1->2), and detects corruption (LP-S02/LP-S10)',
+    `count=${countBeforeMut}->${countAfterMut}, verSrc=${String(invMutRes.originalRootVerificationSource)}, orig=${String(invMutRes.originalRootOutcome)}, note=${String(invMutRes.originalRootBindingNote)}`
+  );
+
+  // Invalidation Case C: Hand-forged plain-object receipt MUST be ignored (cannot spoof originalRootOutcome!)
+  const forgedReceipt = {
+    scope: 'original_root' as const,
+    contractDigest: receipt42.contractDigest,
+    reportContentFingerprint: receipt42.reportContentFingerprint,
+    originalRootOutcome: ProofOutcome.ProvenWin,
+    originalRootNodes: 1,
+  };
+  const forgeChecker = new ProofArtifactManager();
+  const forgedRes = forgeChecker.verifySubproofFragment({
+    problem: p001,
+    context: ctx001,
+    report: rep001NoFile,
+    targetPathMoves: [baMove],
+    targetDagNodeId: 0,
+    verifiedOriginalRootReceipt: forgedReceipt,
+  });
+  check(
+    forgedRes.originalRootOutcome === null &&
+      forgedRes.originalRootVerificationSource === 'verified_now' &&
+      forgedRes.sourceReceipt.passed,
+    'R14 §4 invalidation C: hand-forged plain-object VerifiedOriginalRootReceipt is ignored and cannot spoof PROVEN_WIN',
+    `orig=${String(forgedRes.originalRootOutcome)}, verSrc=${String(forgedRes.originalRootVerificationSource)}`
+  );
+});
+
 console.log(
   `\n========================================\nR5 TS Regression Summary: ${passedAssertions}/${totalAssertions} passed, ${failures.length} failed.\n========================================`
 );

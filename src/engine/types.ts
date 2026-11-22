@@ -247,6 +247,15 @@ export interface SubproofQueryReplayReceipt {
   queryHistoryLength: number;
 }
 
+export interface VerifiedOriginalRootReceipt {
+  readonly scope: 'original_root';
+  readonly contractDigest: string;
+  readonly reportContentFingerprint: string;
+  readonly originalRootOutcome: ProofOutcome | null;
+  readonly originalRootNodes: number | null;
+  readonly originalRootBindingNote?: string;
+}
+
 export interface SubproofFragmentVerificationResult {
   runSource: 'original_root' | 'standalone_subposition';
   runStartPathSgf: string[];
@@ -254,6 +263,10 @@ export interface SubproofFragmentVerificationResult {
   originalRootOutcome: ProofOutcome | null;
   originalRootNodes?: number | null;
   originalRootBindingNote?: string;
+  originalRootVerificationSource?:
+    | 'verified_now'
+    | 'reused_receipt'
+    | 'not_applicable';
   sourceReceipt: SubproofSourceReceipt;
   queryReplayReceipt: SubproofQueryReplayReceipt;
 }

@@ -245,12 +245,24 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
     return { moves, sgf };
   };
 
+  const fragmentChecker = useMemo(() => new ProofArtifactManager(), []);
+  const memoizedOriginalRootReceipt = useMemo(() => {
+    const inferredSource =
+      solveReport.branchCoverageSnapshots?.[0]?.runSource ??
+      (activeBaseMoves.length > 0 ? 'standalone_subposition' : 'original_root');
+    if (inferredSource !== 'original_root') return undefined;
+    return fragmentChecker.verifyOriginalRootReceipt({
+      problem,
+      context,
+      report: solveReport,
+    });
+  }, [fragmentChecker, problem, context, solveReport, activeBaseMoves.length]);
+
   const handleVerifyFragment = (
     relativeTargetPathMoves: number[],
     targetDagNodeId: number,
     relativeQueryPathMoves?: number[]
   ) => {
-    const checker = new ProofArtifactManager();
     const fullTargetMoves = [...activeBaseMoves, ...relativeTargetPathMoves];
     const fullTargetSgf = fullTargetMoves.map((mv) =>
       coordToSgf(mv, problem.boardSize)
@@ -258,13 +270,14 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
     const fullQueryMoves = relativeQueryPathMoves
       ? [...activeBaseMoves, ...relativeQueryPathMoves]
       : undefined;
-    const result = checker.verifySubproofFragment({
+    const result = fragmentChecker.verifySubproofFragment({
       problem,
       context,
       report: solveReport,
       targetPathMoves: fullTargetMoves,
       targetDagNodeId,
       queryPathMoves: fullQueryMoves,
+      verifiedOriginalRootReceipt: memoizedOriginalRootReceipt,
     });
     setFragmentReceipt({
       title: fullTargetSgf.length > 0 ? fullTargetSgf.join('/') : '(root)',
@@ -553,7 +566,7 @@ export const BranchCoveragePanel: React.FC<BranchCoveragePanelProps> = ({
               {fragmentReceipt.result.originalRootOutcome !== null &&
               fragmentReceipt.result.originalRootNodes !== null &&
               fragmentReceipt.result.originalRootNodes !== undefined
-                ? ` (${fragmentReceipt.result.originalRootNodes} 节点)`
+                ? ` (已搜 ${fragmentReceipt.result.originalRootNodes} 节点)`
                 : ''}{' '}
               · 模式: {fragmentReceipt.result.sourceReceipt.verificationMode}
             </span>
