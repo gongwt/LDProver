@@ -120,6 +120,8 @@ export interface SearchPathTraceEvent {
     | 'rep_proof'
     | 'rz_prune'
     | 'rz_reval_fail';
+  invocationId: number;
+  entryCallIndex: number;
   callIndex: number;
   path: string;
   depth: number;
@@ -130,6 +132,8 @@ export interface SearchPathTraceEvent {
   dn?: number;
   outcome?: ProofOutcome;
   exitReason?: string;
+  terminalEvidence?: string;
+  dagNodeId?: number;
   wideningLevel?: number;
   windowSize?: number;
   totalLegal?: number;
@@ -142,7 +146,103 @@ export interface SearchPathTraceEvent {
   representativeMoveSgf?: string;
   rzSize?: number;
   queryZobristHex?: string;
+  queryHistoryLength?: number;
   topCandidates?: SearchTraceCandidateSummary[];
+}
+
+export type BranchMoveCoverageStatus =
+  | 'PROVEN_SOURCE'
+  | 'TT_REPLAYED'
+  | 'RZ_REVALIDATED'
+  | 'DEFERRED_OUTSIDE_RZ'
+  | 'EXPANDED_UNRESOLVED'
+  | 'UNEXPANDED'
+  | 'KO_BARRIER';
+
+export interface BranchMoveCoverageEntry {
+  rank: number;
+  move: number;
+  moveSgf: string;
+  tacticalScore: number;
+  pn: number;
+  dn: number;
+  outcome: ProofOutcome;
+  status: BranchMoveCoverageStatus;
+  dagNodeId: number;
+  sourceProofNodeId: number | null;
+  terminalEvidence?: string;
+  lastThPn?: number;
+  lastThDn?: number;
+  lastExitReason?: string;
+}
+
+export interface BranchCoverageSnapshot {
+  path: string;
+  movesFromRoot: number[];
+  movesFromRootSgf: string[];
+  depth: number;
+  isOrNode: boolean;
+  obligation: 'EXISTENTIAL_OR' | 'UNIVERSAL_AND';
+  toPlay: Color;
+  runSource: 'original_root' | 'standalone_subposition';
+  rootOutcome: ProofOutcome;
+  nodeOutcome: ProofOutcome;
+  nodeDagNodeId: number;
+  terminalEvidence: string;
+  lastPn: number;
+  lastDn: number;
+  lastThPn: number;
+  lastThDn: number;
+  lastExitReason: string;
+  wideningLevel: number;
+  windowSize: number;
+  totalLegalMoves: number;
+  closedCount: number;
+  provenSourceCount: number;
+  ttReplayedCount: number;
+  rzRevalidatedCount: number;
+  deferredOutsideRzCount: number;
+  expandedUnresolvedCount: number;
+  unexpandedCount: number;
+  koBarrierCount: number;
+  representativeMoveSgf: string | null;
+  representativeDagNodeId: number | null;
+  representativeRzSize: number;
+  moves: BranchMoveCoverageEntry[];
+}
+
+export interface SubproofSourceReceipt {
+  status: 'SOURCE_VERIFIED' | 'UNCLOSED' | 'VERIFICATION_FAILED';
+  passed: boolean;
+  errorCode: string;
+  message: string;
+  scope: 'subproof_fragment';
+  targetPathSgf: string[];
+  targetDagNodeId: number;
+  outcome: ProofOutcome;
+  verifiedNodes: number;
+  verifiedLeaves: number;
+  verifiedUniversals: number;
+  replayedPruned: number;
+  replayedTt: number;
+  failedNodeId: number | null;
+}
+
+export interface SubproofQueryReplayReceipt {
+  status: 'QUERY_REPLAY_VERIFIED' | 'QUERY_REPLAY_FAILED' | 'NOT_REQUESTED';
+  passed: boolean;
+  errorCode: string;
+  message: string;
+  sourceDagNodeId: number;
+  queryPathSgf: string[];
+  queryHistoryLength: number;
+}
+
+export interface SubproofFragmentVerificationResult {
+  runSource: 'original_root' | 'standalone_subposition';
+  originalRootOutcome: ProofOutcome;
+  sourceReceipt: SubproofSourceReceipt;
+  queryReplayReceipt: SubproofQueryReplayReceipt;
 }
 
 export interface SolverConfig {
@@ -163,6 +263,8 @@ export interface SolverConfig {
   tracePathFilters?: string[];
   /** Default-off read-only callback receiving path trace events when tracePathFilters matches. */
   onPathTrace?: (event: SearchPathTraceEvent) => void;
+  /** Optional extra paths (e.g. ["sr/pass", "rr/rp"]) to include in branchCoverageSnapshots. */
+  coveragePathFilters?: string[];
 }
 
 export interface PrunedCertificateRecord {
@@ -253,6 +355,7 @@ export interface SolveReport {
   rootProofRzCoords: number[];
   rootDisproofRzCoords: number[];
   bensonAliveCoords: number[];
+  branchCoverageSnapshots?: BranchCoverageSnapshot[];
   eyeTopologyRegions: {
     regionId: number;
     coords: number[];

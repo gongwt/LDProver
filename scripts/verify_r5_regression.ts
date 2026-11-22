@@ -1316,9 +1316,214 @@ runSection('Section 8: R9 §1 Eye-Like Heuristic & AND-Node PASS Score Parity', 
   );
 });
 
+runSection('Section 9: R11 Observer Terminal Completeness, Branch Coverage Snapshots & Sub-Proof Fragment Verifier', () => {
+  const cfgRz: SolverConfig = {
+    ...defaultConfig(3500),
+    maxDepth: 48,
+    memoryBudgetMb: 512,
+    enableRzPruning: true,
+    useProblemDefaultKo: true,
+  };
+
+  // 9.1 p001 watching ['', 'ba']: immediate BENSON_UCA terminal leaf MUST emit paired enter + return
+  const p001 = getSpec('p001');
+  const p001Events: import('../src/engine/types').SearchPathTraceEvent[] = [];
+  const rep001 = new DfpnSolver({
+    ...cfgRz,
+    tracePathFilters: ['', 'ba'],
+    onPathTrace: (ev) => p001Events.push(ev),
+  }).solveProblem(p001);
+
+  const baEnters = p001Events.filter((e) => e.path === 'ba' && e.kind === 'enter');
+  const baReturns = p001Events.filter((e) => e.path === 'ba' && e.kind === 'return');
+  const baSnap = rep001.branchCoverageSnapshots?.find((s) => s.path === 'ba');
+  check(
+    baEnters.length === 1 &&
+      baReturns.length === 1 &&
+      baEnters[0].invocationId === baReturns[0].invocationId &&
+      baEnters[0].entryCallIndex === baReturns[0].entryCallIndex &&
+      baReturns[0].exitReason === 'terminal' &&
+      baReturns[0].terminalEvidence === 'BENSON_UCA' &&
+      baReturns[0].dagNodeId === 0,
+    'R11 §1 p001 watching ["", "ba"] emits paired enter + return on immediate BENSON_UCA terminal leaf ba',
+    `enters=${baEnters.length}, returns=${baReturns.length}, exit=${baReturns[0]?.exitReason}, ev=${baReturns[0]?.terminalEvidence}, dag=${baReturns[0]?.dagNodeId}`
+  );
+  check(
+    Boolean(baSnap) &&
+      baSnap!.nodeOutcome === ProofOutcome.ProvenWin &&
+      baSnap!.nodeDagNodeId === 0 &&
+      baSnap!.terminalEvidence === 'BENSON_UCA' &&
+      baSnap!.runSource === 'original_root',
+    'R11 §2 p001 branchCoverageSnapshots captures direct terminal child ba with BENSON_UCA evidence',
+    `snap=${JSON.stringify(baSnap && { outcome: baSnap.nodeOutcome, dag: baSnap.nodeDagNodeId, ev: baSnap.terminalEvidence })}`
+  );
+
+  // 9.2 p162 original root vs standalone p162/sr/pass
+  const p162 = getSpec('chao_vol2_p162');
+  const ctx162 = DfpnSolver.buildProofContext(p162, cfgRz);
+  const rep162Orig = new DfpnSolver(cfgRz).solveProblem(p162);
+  const srSnap = rep162Orig.branchCoverageSnapshots?.find((s) => s.path === 'sr');
+  check(
+    rep162Orig.rootStatus === ProofOutcome.Unknown &&
+      Boolean(srSnap) &&
+      srSnap!.runSource === 'original_root' &&
+      srSnap!.rootOutcome === ProofOutcome.Unknown &&
+      srSnap!.totalLegalMoves === 130 &&
+      srSnap!.closedCount === 0 &&
+      srSnap!.provenSourceCount === 0 &&
+      srSnap!.rzRevalidatedCount === 0 &&
+      srSnap!.deferredOutsideRzCount === 0 &&
+      srSnap!.nodeDagNodeId === -1,
+    'R11 §2 p162 original-root snapshot accurately reports sr coverage 0/130 (UNKNOWN, zero RZ/source closure)',
+    `root=${rep162Orig.rootStatus}, total=${srSnap?.totalLegalMoves}, closed=${srSnap?.closedCount}, dag=${srSnap?.nodeDagNodeId}`
+  );
+
+  const srMove = sgfToCoord('sr', 19);
+  const frag162Sr = checker.verifySubproofFragment({
+    problem: p162,
+    context: ctx162,
+    report: rep162Orig,
+    targetPathMoves: [srMove],
+    targetDagNodeId: srSnap?.nodeDagNodeId ?? -1,
+  });
+  check(
+    frag162Sr.sourceReceipt.status === 'UNCLOSED' &&
+      !frag162Sr.sourceReceipt.passed &&
+      frag162Sr.sourceReceipt.errorCode === 'LP-U01' &&
+      frag162Sr.queryReplayReceipt.status === 'NOT_REQUESTED',
+    'R11 §3 verifySubproofFragment on unclosed original-root p162/sr returns UNCLOSED (LP-U01)',
+    `status=${frag162Sr.sourceReceipt.status}, code=${frag162Sr.sourceReceipt.errorCode}`
+  );
+
+  // Standalone p162/sr/pass re-solve
+  const subPos162 = DfpnSolver.buildInitialPosition(p162, ctx162);
+  const playedSr = subPos162.playMove(srMove);
+  const playedPass = subPos162.playMove(PASS_MOVE);
+  const rep162Sub = new DfpnSolver(cfgRz).solveFromPosition(p162, subPos162, ctx162);
+  const ver162Traced = checker.verifySerializedLProofJson(rep162Sub.lproofJson, {
+    problem: p162,
+    scope: 'traced_within_rules',
+  });
+  const ver162Orig = checker.verifySerializedLProofJson(rep162Sub.lproofJson, {
+    problem: p162,
+    scope: 'original_root',
+  });
+  const subRootSnap = rep162Sub.branchCoverageSnapshots?.find((s) => s.path === '');
+  check(
+    playedSr.legal &&
+      playedPass.legal &&
+      rep162Sub.rootStatus === ProofOutcome.ProvenWin &&
+      rep162Sub.bestMoveSgf === 'os' &&
+      rep162Sub.numNodes === 315 &&
+      subRootSnap?.runSource === 'standalone_subposition' &&
+      ver162Traced.passed &&
+      !ver162Orig.passed &&
+      ver162Orig.errorCode === 'LP-P02',
+    'R11 §4 standalone p162/sr/pass solves in 315 nodes (best=os), traced_within_rules=PASS, original_root=LP-P02',
+    `status=${rep162Sub.rootStatus}, best=${rep162Sub.bestMoveSgf}, nodes=${rep162Sub.numNodes}, traced=${ver162Traced.errorCode}, orig=${ver162Orig.errorCode}`
+  );
+
+  // 9.3 p042 original root: verifySubproofFragment source verification + outside-RZ query replay + tamper/binding rejections
+  const p042 = getSpec('chao_vol1_p042');
+  const ctx42 = DfpnSolver.buildProofContext(p042, cfgRz);
+  const rep42 = new DfpnSolver(cfgRz).solveProblem(p042);
+  const rsSnap = rep42.branchCoverageSnapshots?.find((s) => s.path === 'rs');
+  const passEntry = rsSnap?.moves.find((m) => m.move === PASS_MOVE);
+  const rzEntry = rsSnap?.moves.find((m) => m.status === 'RZ_REVALIDATED');
+  const rsMove = sgfToCoord('rs', 19);
+
+  check(
+    rep42.numNodes === 331 &&
+      rep42.bestMoveSgf === 'rs' &&
+      Boolean(rsSnap) &&
+      rsSnap!.closedCount === rsSnap!.totalLegalMoves &&
+      rsSnap!.provenSourceCount > 0 &&
+      rsSnap!.rzRevalidatedCount > 0 &&
+      rsSnap!.deferredOutsideRzCount === 0 &&
+      Boolean(passEntry) &&
+      passEntry!.status === 'PROVEN_SOURCE' &&
+      passEntry!.dagNodeId >= 0 &&
+      Boolean(rzEntry),
+    'R11 §2 p042/rs snapshot achieves full closure (source + RZ revalidated, 0 deferred) with unchanged 331-node baseline',
+    `nodes=${rep42.numNodes}, closed=${rsSnap?.closedCount}/${rsSnap?.totalLegalMoves}, src=${rsSnap?.provenSourceCount}, rz=${rsSnap?.rzRevalidatedCount}, def=${rsSnap?.deferredOutsideRzCount}`
+  );
+
+  if (passEntry && rzEntry) {
+    const frag42 = checker.verifySubproofFragment({
+      problem: p042,
+      context: ctx42,
+      report: rep42,
+      targetPathMoves: [rsMove, PASS_MOVE],
+      targetDagNodeId: passEntry.dagNodeId,
+      queryPathMoves: [rsMove, rzEntry.move],
+    });
+    check(
+      frag42.sourceReceipt.status === 'SOURCE_VERIFIED' &&
+        frag42.sourceReceipt.passed &&
+        frag42.sourceReceipt.errorCode === 'PASS' &&
+        frag42.queryReplayReceipt.status === 'QUERY_REPLAY_VERIFIED' &&
+        frag42.queryReplayReceipt.passed &&
+        frag42.queryReplayReceipt.errorCode === 'PASS',
+      `R11 §3 verifySubproofFragment verifies p042 rs/pass source AND query replay on rs/${rzEntry.moveSgf} independently`,
+      `src=${frag42.sourceReceipt.status}/${frag42.sourceReceipt.errorCode}, q=${frag42.queryReplayReceipt.status}/${frag42.queryReplayReceipt.errorCode}`
+    );
+
+    // Binding mismatch rejection (LP-N10)
+    const fragWrongPath = checker.verifySubproofFragment({
+      problem: p042,
+      context: ctx42,
+      report: rep42,
+      targetPathMoves: [rsMove, rzEntry.move],
+      targetDagNodeId: passEntry.dagNodeId,
+    });
+    check(
+      fragWrongPath.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+        !fragWrongPath.sourceReceipt.passed &&
+        fragWrongPath.sourceReceipt.errorCode === 'LP-N10',
+      'R11 §3 verifySubproofFragment rejects wrong-path state binding with LP-N10',
+      `status=${fragWrongPath.sourceReceipt.status}, code=${fragWrongPath.sourceReceipt.errorCode}`
+    );
+
+    // Tampered fragment rejection (dropping children from rs/pass DAG node)
+    const tamperedReport = {
+      ...rep42,
+      proofDagNodes: rep42.proofDagNodes.map((n) =>
+        n.nodeId === passEntry.dagNodeId
+          ? { ...n, childNodeIds: [], childMoves: [] }
+          : n
+      ),
+    };
+    const fragTampered = checker.verifySubproofFragment({
+      problem: p042,
+      context: ctx42,
+      report: tamperedReport,
+      targetPathMoves: [rsMove, PASS_MOVE],
+      targetDagNodeId: passEntry.dagNodeId,
+    });
+    check(
+      fragTampered.sourceReceipt.status === 'VERIFICATION_FAILED' &&
+        !fragTampered.sourceReceipt.passed,
+      'R11 §3 verifySubproofFragment rejects tampered rs/pass fragment with missing children',
+      `status=${fragTampered.sourceReceipt.status}, code=${fragTampered.sourceReceipt.errorCode}`
+    );
+  }
+
+  // Verify p031 baseline stays untouched at 1892 nodes
+  const p031 = getSpec('chao_vol1_p031');
+  const rep031 = new DfpnSolver(cfgRz).solveProblem(p031);
+  check(
+    rep031.rootStatus === ProofOutcome.ProvenWin &&
+      rep031.bestMoveSgf === 'sr' &&
+      rep031.numNodes === 1892,
+    'R11 baseline guard: p031 still proves B[sr] in exactly 1892 nodes',
+    `status=${rep031.rootStatus}, best=${rep031.bestMoveSgf}, nodes=${rep031.numNodes}`
+  );
+});
+
 console.log(
   `\n========================================\nR5 TS Regression Summary: ${passedAssertions}/${totalAssertions} passed, ${failures.length} failed.\n========================================`
 );
 if (failures.length > 0) {
   process.exit(1);
 }
+

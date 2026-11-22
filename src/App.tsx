@@ -20,6 +20,7 @@ import {
   StepForward,
   Terminal,
 } from 'lucide-react';
+import { BranchCoveragePanel } from './components/BranchCoveragePanel';
 import { TsumegoBoardView } from './components/TsumegoBoardView';
 import { BensonTerminalEvaluator } from './engine/bensonUca';
 import { CPP_SOURCE_FILES } from './engine/cppSourceRegistry';
@@ -1828,6 +1829,15 @@ export default function App() {
         {/* TAB 2: PROOF DAG & SGF */}
         {activeTab === 'proof-dag' && (
           <div className="space-y-6">
+            <BranchCoveragePanel
+              problem={currentProblem}
+              context={proofContext}
+              rootInitialPosition={rootInitialPosition}
+              activeBaseMoves={isManualSubRoot ? manualMoves : []}
+              solverConfig={solverConfig}
+              solveReport={solveReport}
+            />
+
             <div className="border border-slate-200 bg-white rounded-lg p-6">
               <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-slate-200">
                 <div>

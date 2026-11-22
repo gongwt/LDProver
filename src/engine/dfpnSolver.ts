@@ -18,6 +18,9 @@ import {
 } from './relevanceZone';
 import { TranspositionStore } from './transpositionTable';
 import {
+  BranchCoverageSnapshot,
+  BranchMoveCoverageEntry,
+  BranchMoveCoverageStatus,
   CanonicalSnapshot,
   Color,
   LogicalOp,
@@ -59,6 +62,9 @@ interface SearchChildSlot {
   proofRz: ProofCertificateRZ;
   disproofRz: ProofCertificateRZ;
   prunedCert?: PrunedCertificateRecord;
+  lastThPn?: number;
+  lastThDn?: number;
+  lastExitReason?: string;
 }
 
 interface CachedNodeFrontier {
@@ -69,6 +75,14 @@ interface CachedNodeFrontier {
   representativeMove: number;
   representativeOutcome: ProofOutcome;
   anyKoDependent: boolean;
+  lastPn: number;
+  lastDn: number;
+  lastThPn: number;
+  lastThDn: number;
+  lastExitReason: string;
+  lastWindowSize: number;
+  nodeDagNodeId: number;
+  nodeOutcome: ProofOutcome;
 }
 
 interface NodeTacticalContext {
@@ -254,6 +268,18 @@ export class DfpnSolver {
       problem.boardSize
     );
 
+    const runSource: 'original_root' | 'standalone_subposition' =
+      initialPos.playedMoveTrace.length > 0
+        ? 'standalone_subposition'
+        : 'original_root';
+    const branchCoverageSnapshots = this.buildBranchCoverageSnapshots(
+      rootPos,
+      context,
+      rootStateId,
+      rootResult,
+      runSource
+    );
+
     this.compactProofStateAndHistoryTables();
 
     const elapsedMs = Math.max(1, Math.round(performance.now() - startTime));
@@ -313,6 +339,7 @@ export class DfpnSolver {
       rootProofRzCoords: rootResult.proofRz.toArray(),
       rootDisproofRzCoords: rootResult.disproofRz.toArray(),
       bensonAliveCoords: rootEval.bensonAliveCoords,
+      branchCoverageSnapshots,
       eyeTopologyRegions: rootEval.eyeTopologyRegions,
       principalVariation: pv,
       proofDagNodes: this.proofDagNodes,
@@ -1410,25 +1437,50 @@ export class DfpnSolver {
     proofRz: ProofCertificateRZ;
     disproofRz: ProofCertificateRZ;
     dagNodeId: number;
+    exitReason: string;
   } {
     this.numNodes++;
-    const callIndex = this.numNodes;
+    const entryCallIndex = this.numNodes;
     const isOrNode = pos.toPlay === context.rootAttacker;
     const traceThisNode =
       this.tracePathFilterSet !== null &&
       this.tracePathFilterSet.has(currentPath);
     const emitTrace = (
-      ev: Omit<SearchPathTraceEvent, 'callIndex' | 'path' | 'depth' | 'isOrNode'>
+      ev: Omit<
+        SearchPathTraceEvent,
+        'invocationId' | 'entryCallIndex' | 'callIndex' | 'path' | 'depth' | 'isOrNode'
+      >
     ): void => {
       if (traceThisNode && this.config.onPathTrace) {
         this.config.onPathTrace({
           ...ev,
+          invocationId: entryCallIndex,
+          entryCallIndex,
           callIndex: this.numNodes,
           path: currentPath,
           depth,
           isOrNode,
         });
       }
+    };
+    const emitEarlyEnterAndReturn = (
+      ret: Omit<
+        SearchPathTraceEvent,
+        'kind' | 'invocationId' | 'entryCallIndex' | 'callIndex' | 'path' | 'depth' | 'isOrNode'
+      >
+    ): void => {
+      if (!traceThisNode) return;
+      emitTrace({
+        kind: 'enter',
+        thPn,
+        thDn,
+      });
+      emitTrace({
+        kind: 'return',
+        ...ret,
+        thPn,
+        thDn,
+      });
     };
 
     // Step 1 (FR-3.2, FR-3.8): Evaluate Terminal BEFORE InPath cycle detection
@@ -1474,6 +1526,15 @@ export class DfpnSolver {
       });
       this.dagHasCapture.push(false);
 
+      emitEarlyEnterAndReturn({
+        pn,
+        dn,
+        outcome,
+        exitReason: 'terminal',
+        terminalEvidence: term.evidenceKind,
+        dagNodeId,
+      });
+
       return {
         pn,
         dn,
@@ -1482,6 +1543,7 @@ export class DfpnSolver {
         proofRz,
         disproofRz,
         dagNodeId,
+        exitReason: 'terminal',
       };
     }
 
@@ -1492,6 +1554,12 @@ export class DfpnSolver {
       if (this.unknownReason === UnknownReason.None) {
         this.unknownReason = UnknownReason.Cycle;
       }
+      emitEarlyEnterAndReturn({
+        pn: 1,
+        dn: 1,
+        outcome: ProofOutcome.Unknown,
+        exitReason: 'cycle',
+      });
       return {
         pn: 1,
         dn: 1,
@@ -1500,6 +1568,7 @@ export class DfpnSolver {
         proofRz: new ProofCertificateRZ(),
         disproofRz: new ProofCertificateRZ(),
         dagNodeId: -1,
+        exitReason: 'cycle',
       };
     }
 
@@ -1507,6 +1576,12 @@ export class DfpnSolver {
     if (depth >= this.config.maxDepth) {
       this.resourceExhausted = true;
       this.unknownReason = UnknownReason.DepthLimit;
+      emitEarlyEnterAndReturn({
+        pn: 1,
+        dn: 1,
+        outcome: ProofOutcome.Unknown,
+        exitReason: 'depth_limit',
+      });
       return {
         pn: 1,
         dn: 1,
@@ -1515,11 +1590,18 @@ export class DfpnSolver {
         proofRz: new ProofCertificateRZ(),
         disproofRz: new ProofCertificateRZ(),
         dagNodeId: -1,
+        exitReason: 'depth_limit',
       };
     }
     if (this.numNodes >= this.config.maxNodes) {
       this.resourceExhausted = true;
       this.unknownReason = UnknownReason.NodeLimit;
+      emitEarlyEnterAndReturn({
+        pn: 1,
+        dn: 1,
+        outcome: ProofOutcome.Unknown,
+        exitReason: 'node_limit',
+      });
       return {
         pn: 1,
         dn: 1,
@@ -1528,11 +1610,18 @@ export class DfpnSolver {
         proofRz: new ProofCertificateRZ(),
         disproofRz: new ProofCertificateRZ(),
         dagNodeId: -1,
+        exitReason: 'node_limit',
       };
     }
     if (this.isMemoryBudgetExceeded()) {
       this.resourceExhausted = true;
       this.unknownReason = UnknownReason.MemoryBudget;
+      emitEarlyEnterAndReturn({
+        pn: 1,
+        dn: 1,
+        outcome: ProofOutcome.Unknown,
+        exitReason: 'memory_limit',
+      });
       return {
         pn: 1,
         dn: 1,
@@ -1541,6 +1630,7 @@ export class DfpnSolver {
         proofRz: new ProofCertificateRZ(),
         disproofRz: new ProofCertificateRZ(),
         dagNodeId: -1,
+        exitReason: 'memory_limit',
       };
     }
 
@@ -1607,6 +1697,15 @@ export class DfpnSolver {
         boardHit.proofRz,
         boardHit.disproofRz
       );
+      emitEarlyEnterAndReturn({
+        pn: boardHit.pn,
+        dn: boardHit.dn,
+        outcome: boardHit.outcome,
+        exitReason: 'board_tt_hit',
+        terminalEvidence: 'TT_REVALIDATED_REUSE',
+        dagNodeId: ttNodeId,
+        sourceDagNodeId: boardHit.proofDagNodeId,
+      });
       return {
         pn: boardHit.pn,
         dn: boardHit.dn,
@@ -1615,6 +1714,7 @@ export class DfpnSolver {
         proofRz: boardHit.proofRz,
         disproofRz: boardHit.disproofRz,
         dagNodeId: ttNodeId,
+        exitReason: 'board_tt_hit',
       };
     }
 
@@ -1644,6 +1744,15 @@ export class DfpnSolver {
           patHit.record.storedRz,
           patHit.record.storedRz
         );
+        emitEarlyEnterAndReturn({
+          pn: patHit.record.pn,
+          dn: patHit.record.dn,
+          outcome: patHit.record.outcome,
+          exitReason: 'pattern_tt_hit',
+          terminalEvidence: 'TT_REVALIDATED_REUSE',
+          dagNodeId: ttNodeId,
+          sourceDagNodeId: patHit.record.proofDagNodeId,
+        });
         return {
           pn: patHit.record.pn,
           dn: patHit.record.dn,
@@ -1652,6 +1761,7 @@ export class DfpnSolver {
           proofRz: patHit.record.storedRz,
           disproofRz: patHit.record.storedRz,
           dagNodeId: ttNodeId,
+          exitReason: 'pattern_tt_hit',
         };
       }
     }
@@ -1728,6 +1838,14 @@ export class DfpnSolver {
         representativeMove: PASS_MOVE,
         representativeOutcome: ProofOutcome.Unknown,
         anyKoDependent: false,
+        lastPn: 1,
+        lastDn: 1,
+        lastThPn: PN_DN_SATURATION,
+        lastThDn: PN_DN_SATURATION,
+        lastExitReason: 'unknown',
+        lastWindowSize: children.length,
+        nodeDagNodeId: -1,
+        nodeOutcome: ProofOutcome.Unknown,
       };
       this.nodeFrontierCache.set(currentStateId, frontier);
     }
@@ -1744,7 +1862,7 @@ export class DfpnSolver {
     let traceExitReason = 'unknown';
     let lastWindowSize = children.length;
 
-    if (traceThisNode && this.config.onPathTrace) {
+    if (traceThisNode) {
       let initWindow = children.length;
       if (this.config.enableProgressiveWidening && frontier.wideningLevel < 6) {
         const baseK = isOrNode
@@ -1753,12 +1871,8 @@ export class DfpnSolver {
         const cap = baseK * Math.pow(2, frontier.wideningLevel);
         if (cap < children.length) initWindow = cap;
       }
-      this.config.onPathTrace({
+      emitTrace({
         kind: 'enter',
-        callIndex,
-        path: currentPath,
-        depth,
-        isOrNode,
         thPn,
         thDn,
         wideningLevel: frontier.wideningLevel,
@@ -1833,6 +1947,7 @@ export class DfpnSolver {
                 pos.boardSize
               ),
               queryZobristHex: nextPos.computeZobristHex(),
+              queryHistoryLength: nextPos.historySnapshots.length,
             });
           }
           return false;
@@ -1919,6 +2034,7 @@ export class DfpnSolver {
               pos.boardSize
             ),
             queryZobristHex: nextPos.computeZobristHex(),
+            queryHistoryLength: nextPos.historySnapshots.length,
           });
         }
         return true;
@@ -2038,6 +2154,16 @@ export class DfpnSolver {
         if (minPn > 0 && windowSumDn === 0 && unexpandedU > 0) {
           frontier.wideningLevel++;
           this.wideningUpgrades++;
+          if (traceThisNode) {
+            emitTrace({
+              kind: 'widen',
+              wideningLevel: frontier.wideningLevel,
+              windowSize,
+              totalLegal,
+              pn: minPn,
+              dn: windowSumDn,
+            });
+          }
           continue;
         }
         curPn = minPn;
@@ -2091,6 +2217,16 @@ export class DfpnSolver {
           } else {
             frontier.wideningLevel++;
             this.wideningUpgrades++;
+            if (traceThisNode) {
+              emitTrace({
+                kind: 'widen',
+                wideningLevel: frontier.wideningLevel,
+                windowSize,
+                totalLegal,
+                pn: windowSumPn,
+                dn: minDn,
+              });
+            }
             continue;
           }
         } else {
@@ -2114,6 +2250,16 @@ export class DfpnSolver {
           } else {
             frontier.wideningLevel++;
             this.wideningUpgrades++;
+            if (traceThisNode) {
+              emitTrace({
+                kind: 'widen',
+                wideningLevel: frontier.wideningLevel,
+                windowSize,
+                totalLegal,
+                pn: curPn,
+                dn: curDn,
+              });
+            }
           }
           continue;
         }
@@ -2423,6 +2569,9 @@ export class DfpnSolver {
       mpc.disproofRz = subRes.disproofRz;
       mpc.dagNodeId = subRes.dagNodeId;
       mpc.expanded = true;
+      mpc.lastThPn = childThPn;
+      mpc.lastThDn = childThDn;
+      mpc.lastExitReason = subRes.exitReason;
 
       // FR-5.7: KoDependent witness barrier check (reuses loop-scoped `restrictedSide`)
       if (
@@ -2492,6 +2641,15 @@ export class DfpnSolver {
 
     inPathHashes.delete(zHex);
 
+    frontier.lastPn = finalPn;
+    frontier.lastDn = finalDn;
+    frontier.lastThPn = thPn;
+    frontier.lastThDn = thDn;
+    frontier.lastExitReason = traceExitReason;
+    frontier.lastWindowSize = lastWindowSize;
+    frontier.nodeDagNodeId = finalDagNodeId;
+    frontier.nodeOutcome = finalOutcome;
+
     if (traceThisNode) {
       emitTrace({
         kind: 'return',
@@ -2501,6 +2659,11 @@ export class DfpnSolver {
         thPn,
         thDn,
         exitReason: traceExitReason,
+        terminalEvidence:
+          finalDagNodeId >= 0
+            ? this.proofDagNodes[finalDagNodeId]?.terminalEvidence
+            : undefined,
+        dagNodeId: finalDagNodeId >= 0 ? finalDagNodeId : undefined,
         wideningLevel: frontier.wideningLevel,
         windowSize: lastWindowSize,
         totalLegal: children.length,
@@ -2544,7 +2707,310 @@ export class DfpnSolver {
       proofRz: finalProofRz,
       disproofRz: finalDisproofRz,
       dagNodeId: finalDagNodeId,
+      exitReason: traceExitReason,
     };
+  }
+
+  private buildBranchCoverageSnapshots(
+    rootPos: GoPosition,
+    context: ProofContext,
+    rootStateId: number,
+    rootResult: {
+      pn: number;
+      dn: number;
+      outcome: ProofOutcome;
+      dagNodeId: number;
+      exitReason: string;
+    },
+    runSource: 'original_root' | 'standalone_subposition'
+  ): BranchCoverageSnapshot[] {
+    const snapshots: BranchCoverageSnapshot[] = [];
+    const seenPaths = new Set<string>();
+    const boardSize = rootPos.boardSize;
+
+    const buildSnapshotForNode = (
+      path: string,
+      movesFromRoot: number[],
+      movesFromRootSgf: string[],
+      toPlay: Color,
+      stateId: number,
+      slotFallback?: {
+        pn: number;
+        dn: number;
+        outcome: ProofOutcome;
+        dagNodeId: number;
+        lastThPn?: number;
+        lastThDn?: number;
+        lastExitReason?: string;
+      }
+    ): BranchCoverageSnapshot | null => {
+      if (seenPaths.has(path)) return null;
+      seenPaths.add(path);
+
+      const depth = movesFromRoot.length;
+      const isOrNode = toPlay === context.rootAttacker;
+      const obligation: 'EXISTENTIAL_OR' | 'UNIVERSAL_AND' = isOrNode
+        ? 'EXISTENTIAL_OR'
+        : 'UNIVERSAL_AND';
+      const frontier = stateId >= 0 ? this.nodeFrontierCache.get(stateId) : undefined;
+
+      if (!frontier) {
+        const dagId = slotFallback?.dagNodeId ?? -1;
+        const dagNode =
+          dagId >= 0 && dagId < this.proofDagNodes.length
+            ? this.proofDagNodes[dagId]
+            : undefined;
+        return {
+          path,
+          movesFromRoot: movesFromRoot.slice(),
+          movesFromRootSgf: movesFromRootSgf.slice(),
+          depth,
+          isOrNode,
+          obligation,
+          toPlay,
+          runSource,
+          rootOutcome: rootResult.outcome,
+          nodeOutcome: slotFallback?.outcome ?? ProofOutcome.Unknown,
+          nodeDagNodeId: dagId,
+          terminalEvidence: dagNode?.terminalEvidence ?? 'UNEXPANDED_OR_TERMINAL',
+          lastPn: slotFallback?.pn ?? 1,
+          lastDn: slotFallback?.dn ?? 1,
+          lastThPn: slotFallback?.lastThPn ?? PN_DN_SATURATION,
+          lastThDn: slotFallback?.lastThDn ?? PN_DN_SATURATION,
+          lastExitReason: slotFallback?.lastExitReason ?? 'terminal',
+          wideningLevel: 0,
+          windowSize: 0,
+          totalLegalMoves: 0,
+          closedCount: 0,
+          provenSourceCount: 0,
+          ttReplayedCount: 0,
+          rzRevalidatedCount: 0,
+          deferredOutsideRzCount: 0,
+          expandedUnresolvedCount: 0,
+          unexpandedCount: 0,
+          koBarrierCount: 0,
+          representativeMoveSgf: null,
+          representativeDagNodeId: null,
+          representativeRzSize: 0,
+          moves: [],
+        };
+      }
+
+      const hasActiveRz =
+        this.config.enableRzPruning &&
+        frontier.activeNullMoveRz !== null &&
+        frontier.representativeDagId >= 0;
+
+      let provenSourceCount = 0;
+      let ttReplayedCount = 0;
+      let rzRevalidatedCount = 0;
+      let deferredOutsideRzCount = 0;
+      let expandedUnresolvedCount = 0;
+      let unexpandedCount = 0;
+      let koBarrierCount = 0;
+
+      const moves: BranchMoveCoverageEntry[] = frontier.children.map((ch, idx) => {
+        const chDagNode =
+          ch.dagNodeId >= 0 && ch.dagNodeId < this.proofDagNodes.length
+            ? this.proofDagNodes[ch.dagNodeId]
+            : undefined;
+        let status: BranchMoveCoverageStatus;
+        if (ch.koDependent) {
+          status = 'KO_BARRIER';
+          koBarrierCount++;
+        } else if (ch.prunedOutsideRz && ch.dagNodeId >= 0) {
+          status = 'RZ_REVALIDATED';
+          rzRevalidatedCount++;
+        } else if (ch.outcome !== ProofOutcome.Unknown && ch.dagNodeId >= 0) {
+          if (chDagNode?.isTtHit) {
+            status = 'TT_REPLAYED';
+            ttReplayedCount++;
+          } else {
+            status = 'PROVEN_SOURCE';
+            provenSourceCount++;
+          }
+        } else if (
+          hasActiveRz &&
+          !ch.expanded &&
+          ch.outcome === ProofOutcome.Unknown &&
+          ch.checkedNullMoveDagId !== frontier.representativeDagId &&
+          this.rzEngine.isOutsideRZCandidate(ch.move, frontier.activeNullMoveRz!)
+        ) {
+          status = 'DEFERRED_OUTSIDE_RZ';
+          deferredOutsideRzCount++;
+        } else if (ch.expanded) {
+          status = 'EXPANDED_UNRESOLVED';
+          expandedUnresolvedCount++;
+        } else {
+          status = 'UNEXPANDED';
+          unexpandedCount++;
+        }
+
+        return {
+          rank: idx,
+          move: ch.move,
+          moveSgf: coordToSgf(ch.move, boardSize),
+          tacticalScore: ch.tacticalScore,
+          pn: ch.pn,
+          dn: ch.dn,
+          outcome: ch.outcome,
+          status,
+          dagNodeId: ch.dagNodeId,
+          sourceProofNodeId: chDagNode?.sourceProofNodeId ?? null,
+          terminalEvidence: chDagNode?.terminalEvidence,
+          lastThPn: ch.lastThPn,
+          lastThDn: ch.lastThDn,
+          lastExitReason: ch.lastExitReason,
+        };
+      });
+
+      const nodeDagId = frontier.nodeDagNodeId;
+      const nodeDag =
+        nodeDagId >= 0 && nodeDagId < this.proofDagNodes.length
+          ? this.proofDagNodes[nodeDagId]
+          : undefined;
+
+      return {
+        path,
+        movesFromRoot: movesFromRoot.slice(),
+        movesFromRootSgf: movesFromRootSgf.slice(),
+        depth,
+        isOrNode,
+        obligation,
+        toPlay,
+        runSource,
+        rootOutcome: rootResult.outcome,
+        nodeOutcome: frontier.nodeOutcome,
+        nodeDagNodeId: nodeDagId,
+        terminalEvidence: nodeDag?.terminalEvidence ?? 'NONE',
+        lastPn: frontier.lastPn,
+        lastDn: frontier.lastDn,
+        lastThPn: frontier.lastThPn,
+        lastThDn: frontier.lastThDn,
+        lastExitReason: frontier.lastExitReason,
+        wideningLevel: frontier.wideningLevel,
+        windowSize: frontier.lastWindowSize,
+        totalLegalMoves: frontier.children.length,
+        closedCount: provenSourceCount + ttReplayedCount + rzRevalidatedCount,
+        provenSourceCount,
+        ttReplayedCount,
+        rzRevalidatedCount,
+        deferredOutsideRzCount,
+        expandedUnresolvedCount,
+        unexpandedCount,
+        koBarrierCount,
+        representativeMoveSgf:
+          frontier.representativeDagId >= 0
+            ? coordToSgf(frontier.representativeMove, boardSize)
+            : null,
+        representativeDagNodeId:
+          frontier.representativeDagId >= 0 ? frontier.representativeDagId : null,
+        representativeRzSize: frontier.activeNullMoveRz?.size ?? 0,
+        moves,
+      };
+    };
+
+    // 1. Always capture root snapshot
+    const rootSnap = buildSnapshotForNode('', [], [], rootPos.toPlay, rootStateId, {
+      pn: rootResult.pn,
+      dn: rootResult.dn,
+      outcome: rootResult.outcome,
+      dagNodeId: rootResult.dagNodeId,
+      lastThPn: PN_DN_SATURATION,
+      lastThDn: PN_DN_SATURATION,
+      lastExitReason: rootResult.exitReason,
+    });
+    if (rootSnap) snapshots.push(rootSnap);
+
+    // 2. Capture all expanded depth-1 children (including direct terminal/TT leaves like p001/ba)
+    const rootFrontier = this.nodeFrontierCache.get(rootStateId);
+    if (rootFrontier) {
+      for (const ch of rootFrontier.children) {
+        if (!ch.expanded && ch.dagNodeId < 0) continue;
+        const moveSgf = coordToSgf(ch.move, boardSize);
+        const childSnap = buildSnapshotForNode(
+          moveSgf,
+          [ch.move],
+          [moveSgf],
+          oppositeColor(rootPos.toPlay),
+          ch.stateId,
+          {
+            pn: ch.pn,
+            dn: ch.dn,
+            outcome: ch.outcome,
+            dagNodeId: ch.dagNodeId,
+            lastThPn: ch.lastThPn,
+            lastThDn: ch.lastThDn,
+            lastExitReason: ch.lastExitReason,
+          }
+        );
+        if (childSnap) snapshots.push(childSnap);
+      }
+    }
+
+    // 3. Capture any extra requested coveragePathFilters / tracePathFilters paths
+    const extraPaths = new Set<string>();
+    for (const p of this.config.coveragePathFilters ?? []) {
+      if (p) extraPaths.add(p);
+    }
+    for (const p of this.config.tracePathFilters ?? []) {
+      if (p) extraPaths.add(p);
+    }
+
+    for (const rawPath of extraPaths) {
+      const normalized = rawPath.trim().replace(/^\/+|\/+$/g, '');
+      if (!normalized || seenPaths.has(normalized)) continue;
+      const segments = normalized.split('/').filter(Boolean);
+      let curStateId = rootStateId;
+      let curToPlay = rootPos.toPlay;
+      const movesFromRoot: number[] = [];
+      const movesFromRootSgf: string[] = [];
+      let matchedSlot: SearchChildSlot | undefined;
+      let valid = true;
+
+      for (const seg of segments) {
+        const curFrontier =
+          curStateId >= 0 ? this.nodeFrontierCache.get(curStateId) : undefined;
+        if (!curFrontier) {
+          valid = false;
+          break;
+        }
+        const slot = curFrontier.children.find(
+          (c) => coordToSgf(c.move, boardSize) === seg
+        );
+        if (!slot || (!slot.expanded && slot.dagNodeId < 0)) {
+          valid = false;
+          break;
+        }
+        movesFromRoot.push(slot.move);
+        movesFromRootSgf.push(seg);
+        curStateId = slot.stateId;
+        curToPlay = oppositeColor(curToPlay);
+        matchedSlot = slot;
+      }
+
+      if (valid && matchedSlot) {
+        const snap = buildSnapshotForNode(
+          normalized,
+          movesFromRoot,
+          movesFromRootSgf,
+          curToPlay,
+          curStateId,
+          {
+            pn: matchedSlot.pn,
+            dn: matchedSlot.dn,
+            outcome: matchedSlot.outcome,
+            dagNodeId: matchedSlot.dagNodeId,
+            lastThPn: matchedSlot.lastThPn,
+            lastThDn: matchedSlot.lastThDn,
+            lastExitReason: matchedSlot.lastExitReason,
+          }
+        );
+        if (snap) snapshots.push(snap);
+      }
+    }
+
+    return snapshots;
   }
 
   private extractPrincipalVariation(

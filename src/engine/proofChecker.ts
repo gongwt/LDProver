@@ -24,6 +24,9 @@ import {
   SearchGoal,
   SolveReport,
   StateTableEntry,
+  SubproofFragmentVerificationResult,
+  SubproofQueryReplayReceipt,
+  SubproofSourceReceipt,
   TerminalStatus,
   TsumegoProblemSpec,
   VerificationReport,
@@ -3232,6 +3235,405 @@ export class ProofArtifactManager {
         ? `PASS — 独立 Proof Checker 完成状态可达重建、区域约束、全称合法着覆盖与 RZ/TT 语义重放（scope=${effectiveScope}, region=${effectiveRegionCoords.length} 点）`
         : `FAIL (${firstErrorCode}) — 独立证明校验拒绝无效或不完备证书`,
       auditChecks,
+    };
+  }
+
+  /**
+   * R11 §2.3: Independent sub-proof fragment verifier for a specific DAG node captured inside
+   * a SolveReport (including UNKNOWN original-root runs). Reconstructs authentic board/history
+   * from the original problem contract along `targetPathMoves`, verifies the target DAG node's
+   * complete closure via `verifyCompactDagRecursive`, and optionally verifies semantic replay
+   * of that same source fragment on a distinct `queryPathMoves` position + history.
+   *
+   * Never mutates `rootDagNodeId` and never marks an UNKNOWN original root as PASS.
+   */
+  public verifySubproofFragment(params: {
+    problem: TsumegoProblemSpec;
+    context?: ProofContext;
+    report: SolveReport;
+    targetPathMoves: number[];
+    targetDagNodeId: number;
+    queryPathMoves?: number[];
+    runSource?: 'original_root' | 'standalone_subposition';
+  }): SubproofFragmentVerificationResult {
+    const {
+      problem,
+      report,
+      targetPathMoves,
+      targetDagNodeId,
+      queryPathMoves,
+    } = params;
+    const runSource = params.runSource ?? 'original_root';
+    const context =
+      params.context ??
+      deriveDefaultProofContextFromProblem(problem, KoRule.SituationalSuperko);
+    const targetPathSgf = targetPathMoves.map((mv) =>
+      coordToSgf(mv, problem.boardSize)
+    );
+    const queryPathSgf = (queryPathMoves ?? []).map((mv) =>
+      coordToSgf(mv, problem.boardSize)
+    );
+    const notRequestedQuery: SubproofQueryReplayReceipt = {
+      status: 'NOT_REQUESTED',
+      passed: false,
+      errorCode: 'NONE',
+      message: '未指定跨局面重放查询路径。',
+      sourceDagNodeId: targetDagNodeId,
+      queryPathSgf: [],
+      queryHistoryLength: 0,
+    };
+
+    const makeSourceFail = (
+      status: SubproofSourceReceipt['status'],
+      errorCode: string,
+      message: string,
+      failedNodeId: number | null = null,
+      outcome: ProofOutcome = ProofOutcome.Unknown
+    ): SubproofFragmentVerificationResult => ({
+      runSource,
+      originalRootOutcome: report.rootStatus,
+      sourceReceipt: {
+        status,
+        passed: false,
+        errorCode,
+        message,
+        scope: 'subproof_fragment',
+        targetPathSgf,
+        targetDagNodeId,
+        outcome,
+        verifiedNodes: 0,
+        verifiedLeaves: 0,
+        verifiedUniversals: 0,
+        replayedPruned: 0,
+        replayedTt: 0,
+        failedNodeId,
+      },
+      queryReplayReceipt: queryPathMoves
+        ? {
+            status: 'QUERY_REPLAY_FAILED',
+            passed: false,
+            errorCode,
+            message: `因源片段未通过校验（${errorCode}），跳过查询局面重放。`,
+            sourceDagNodeId: targetDagNodeId,
+            queryPathSgf,
+            queryHistoryLength: 0,
+          }
+        : notRequestedQuery,
+    });
+
+    // Validate region contract consistency first (R8 §3)
+    if (
+      problem.hasRegionHint !== undefined &&
+      typeof problem.hasRegionHint !== 'boolean'
+    ) {
+      return makeSourceFail(
+        'VERIFICATION_FAILED',
+        'LP-J02',
+        '原题 hasRegionHint 类型非法。'
+      );
+    }
+    if (problem.hasRegionHint === false && problem.regionCoords.length > 0) {
+      return makeSourceFail(
+        'VERIFICATION_FAILED',
+        'LP-J02',
+        '原题存在矛盾区域声明：hasRegionHint=false 且 regionCoords 非空。'
+      );
+    }
+
+    const hasRegionHint =
+      problem.hasRegionHint !== undefined
+        ? problem.hasRegionHint
+        : problem.regionCoords.length > 0;
+    const effectiveRegionMask: number[] | null = hasRegionHint
+      ? problem.regionCoords.slice()
+      : null;
+    const allowedRegionSet: Set<number> | null = hasRegionHint
+      ? new Set<number>(problem.regionCoords)
+      : null;
+
+    if (
+      targetDagNodeId < 0 ||
+      targetDagNodeId >= report.proofDagNodes.length
+    ) {
+      return makeSourceFail(
+        'UNCLOSED',
+        'LP-U01',
+        '该路径在当前运行产物中未形成已闭合的 DAG 片段。',
+        null,
+        ProofOutcome.Unknown
+      );
+    }
+
+    const targetNode = report.proofDagNodes[targetDagNodeId];
+    if (
+      !targetNode ||
+      targetNode.outcome === ProofOutcome.Unknown
+    ) {
+      return makeSourceFail(
+        'UNCLOSED',
+        'LP-U01',
+        `节点 #${targetDagNodeId} 尚未闭合为胜/负证明片段。`,
+        targetDagNodeId,
+        ProofOutcome.Unknown
+      );
+    }
+
+    const replayPathFromOriginalRoot = (
+      moves: number[]
+    ): { ok: true; pos: GoPosition } | { ok: false; code: string; detail: string } => {
+      const pos = new GoPosition(
+        context,
+        problem.boardSize,
+        problem.immortalWallCoords
+      );
+      const firstToPlay =
+        problem.turnColor === 'W' ? Color.White : Color.Black;
+      pos.setupInitialStones(
+        problem.blackInitialCoords,
+        problem.whiteInitialCoords,
+        firstToPlay
+      );
+      for (let i = 0; i < moves.length; i++) {
+        const mv = moves[i];
+        const restrictedSide =
+          (pos.toPlay === context.rootAttacker && !context.attackerAllowKo) ||
+          (pos.toPlay !== context.rootAttacker && !context.defenderAllowKo);
+        if (
+          mv !== PASS_MOVE &&
+          allowedRegionSet !== null &&
+          !allowedRegionSet.has(mv)
+        ) {
+          return {
+            ok: false,
+            code: 'LP-S11',
+            detail: `路径第 ${i + 1} 手 ${coordToSgf(mv, problem.boardSize)} 越出声明区域`,
+          };
+        }
+        const playRes = pos.playMove(mv);
+        if (!playRes.legal) {
+          return {
+            ok: false,
+            code: 'LP-S09',
+            detail: `路径第 ${i + 1} 手 ${coordToSgf(mv, problem.boardSize)} 非法`,
+          };
+        }
+        if (playRes.isKoCapture && restrictedSide) {
+          return {
+            ok: false,
+            code: 'LP-S12',
+            detail: `路径第 ${i + 1} 手 ${coordToSgf(mv, problem.boardSize)} 违反禁劫规则`,
+          };
+        }
+      }
+      return { ok: true, pos };
+    };
+
+    const targetReplay = replayPathFromOriginalRoot(targetPathMoves);
+    if (!targetReplay.ok) {
+      return makeSourceFail(
+        'VERIFICATION_FAILED',
+        targetReplay.code,
+        `源路径独立重放失败：${targetReplay.detail}`,
+        targetDagNodeId,
+        targetNode.outcome
+      );
+    }
+    const targetPos = targetReplay.pos;
+
+    // Bind targetNode's recorded state & history (when present in full state table)
+    if (
+      report.stateTable &&
+      targetNode.stateId >= 0 &&
+      targetNode.stateId < report.stateTable.length
+    ) {
+      const st = report.stateTable[targetNode.stateId];
+      const expectedBlack = targetPos.getBlackCoords();
+      const expectedWhite = targetPos.getWhiteCoords();
+      const sameArr = (a: number[], b: number[]) =>
+        a.length === b.length && a.every((v, idx) => v === b[idx]);
+      if (
+        !st ||
+        st.toPlay !== targetPos.toPlay ||
+        st.koPoint !== targetPos.koPoint ||
+        st.consecutivePasses !== targetPos.consecutivePasses ||
+        st.survivingTokensMask !== targetPos.survivingTargetTokensMask ||
+        !sameArr(st.blackCoords, expectedBlack) ||
+        !sameArr(st.whiteCoords, expectedWhite)
+      ) {
+        return makeSourceFail(
+          'VERIFICATION_FAILED',
+          'LP-N10',
+          `片段节点 #${targetDagNodeId} 的状态表记录与原题路径重放盘面不匹配`,
+          targetDagNodeId,
+          targetNode.outcome
+        );
+      }
+      if (
+        report.historyTable &&
+        targetNode.historyId >= 0 &&
+        targetNode.historyId < report.historyTable.length
+      ) {
+        const recHist = report.historyTable[targetNode.historyId];
+        const expHist = targetPos.historySnapshots;
+        const histMatch =
+          recHist.length === expHist.length &&
+          recHist.every(
+            (h, idx) =>
+              h.toPlay === expHist[idx].toPlay &&
+              h.zobristHex === expHist[idx].zobristHex &&
+              sameArr(h.blackCoords, expHist[idx].blackCoords) &&
+              sameArr(h.whiteCoords, expHist[idx].whiteCoords)
+          );
+        if (!histMatch) {
+          return makeSourceFail(
+            'VERIFICATION_FAILED',
+            'LP-S02',
+            `片段节点 #${targetDagNodeId} 的历史快照序列（len=${recHist.length}）与真实重放历史（len=${expHist.length}）不一致`,
+            targetDagNodeId,
+            targetNode.outcome
+          );
+        }
+      }
+    }
+
+    const independentTerminal = new BensonTerminalEvaluator();
+    let firstErrorCode = 'PASS';
+    let failedNodeId: number | null = null;
+    const recordFailure = (code: string, nid: number | null = null) => {
+      if (firstErrorCode === 'PASS') {
+        firstErrorCode = code;
+        failedNodeId = nid;
+      }
+    };
+    const stats = {
+      verifiedStates: 0,
+      verifiedLeaves: 0,
+      verifiedUniversals: 0,
+      replayedPruned: 0,
+      replayedTt: 0,
+    };
+
+    const recursiveRes = this.verifyCompactDagRecursive(
+      targetPos,
+      effectiveRegionMask,
+      allowedRegionSet,
+      context,
+      report,
+      targetDagNodeId,
+      independentTerminal,
+      0,
+      stats,
+      recordFailure
+    );
+
+    const sourceReceipt: SubproofSourceReceipt = recursiveRes.ok
+      ? {
+          status: 'SOURCE_VERIFIED',
+          passed: true,
+          errorCode: 'PASS',
+          message: `片段 #${targetDagNodeId} (${targetNode.outcome}) 在路径 [${
+            targetPathSgf.join(' -> ') || 'root'
+          }] 下通过独立闭环校验（核验 ${stats.verifiedStates} 节点 / ${
+            stats.verifiedLeaves
+          } 终局叶 / ${stats.verifiedUniversals} 全覆盖节点 / ${
+            stats.replayedPruned
+          } RZ重放 / ${stats.replayedTt} TT重放）。`,
+          scope: 'subproof_fragment',
+          targetPathSgf,
+          targetDagNodeId,
+          outcome: targetNode.outcome,
+          verifiedNodes: stats.verifiedStates,
+          verifiedLeaves: stats.verifiedLeaves,
+          verifiedUniversals: stats.verifiedUniversals,
+          replayedPruned: stats.replayedPruned,
+          replayedTt: stats.replayedTt,
+          failedNodeId: null,
+        }
+      : {
+          status: 'VERIFICATION_FAILED',
+          passed: false,
+          errorCode: firstErrorCode === 'PASS' ? 'LP-S01' : firstErrorCode,
+          message: recursiveRes.detail || `片段 #${targetDagNodeId} 独立闭环校验失败`,
+          scope: 'subproof_fragment',
+          targetPathSgf,
+          targetDagNodeId,
+          outcome: targetNode.outcome,
+          verifiedNodes: stats.verifiedStates,
+          verifiedLeaves: stats.verifiedLeaves,
+          verifiedUniversals: stats.verifiedUniversals,
+          replayedPruned: stats.replayedPruned,
+          replayedTt: stats.replayedTt,
+          failedNodeId,
+        };
+
+    let queryReplayReceipt: SubproofQueryReplayReceipt = notRequestedQuery;
+    if (queryPathMoves) {
+      if (!sourceReceipt.passed) {
+        queryReplayReceipt = {
+          status: 'QUERY_REPLAY_FAILED',
+          passed: false,
+          errorCode: sourceReceipt.errorCode,
+          message: `源片段 #${targetDagNodeId} 未通过校验，无法在查询局面重放。`,
+          sourceDagNodeId: targetDagNodeId,
+          queryPathSgf,
+          queryHistoryLength: 0,
+        };
+      } else {
+        const qReplay = replayPathFromOriginalRoot(queryPathMoves);
+        if (!qReplay.ok) {
+          queryReplayReceipt = {
+            status: 'QUERY_REPLAY_FAILED',
+            passed: false,
+            errorCode: qReplay.code,
+            message: `查询路径独立重放失败：${qReplay.detail}`,
+            sourceDagNodeId: targetDagNodeId,
+            queryPathSgf,
+            queryHistoryLength: 0,
+          };
+        } else {
+          const queryPos = qReplay.pos;
+          const replayOk = this.replaySourceSubgraphOnQueryState(
+            queryPos,
+            effectiveRegionMask,
+            context,
+            report.proofDagNodes,
+            targetDagNodeId,
+            targetNode.outcome,
+            independentTerminal,
+            0
+          );
+          queryReplayReceipt = replayOk
+            ? {
+                status: 'QUERY_REPLAY_VERIFIED',
+                passed: true,
+                errorCode: 'PASS',
+                message: `源片段 #${targetDagNodeId} (${targetNode.outcome}) 在查询路径 [${
+                  queryPathSgf.join(' -> ') || 'root'
+                }]（历史长度 ${queryPos.historySnapshots.length}）下语义重放通过。`,
+                sourceDagNodeId: targetDagNodeId,
+                queryPathSgf,
+                queryHistoryLength: queryPos.historySnapshots.length,
+              }
+            : {
+                status: 'QUERY_REPLAY_FAILED',
+                passed: false,
+                errorCode: 'LP-R03',
+                message: `源片段 #${targetDagNodeId} 在查询路径 [${
+                  queryPathSgf.join(' -> ') || 'root'
+                }]（历史长度 ${queryPos.historySnapshots.length}）下语义重放失败（盘面或超劫历史不兼容）。`,
+                sourceDagNodeId: targetDagNodeId,
+                queryPathSgf,
+                queryHistoryLength: queryPos.historySnapshots.length,
+              };
+        }
+      }
+    }
+
+    return {
+      runSource,
+      originalRootOutcome: report.rootStatus,
+      sourceReceipt,
+      queryReplayReceipt,
     };
   }
 }
