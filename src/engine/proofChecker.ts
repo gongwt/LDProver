@@ -1233,14 +1233,65 @@ export class ProofArtifactManager {
       throw err;
     }
     if (
-      report.rootStatus !== ProofOutcome.Unknown &&
-      report.stateTable.length === 0
+      report.rootStatus !== ProofOutcome.ProvenWin &&
+      report.rootStatus !== ProofOutcome.ProvenLoss &&
+      report.rootStatus !== ProofOutcome.Unknown
     ) {
       const err = new Error(
-        'serializeLProofJson 拒绝导出空 stateTable 的已定论 full_state_table 报告 (LP-J02)。'
+        `serializeLProofJson 拒绝导出非法 rootStatus=${String(report.rootStatus)} 报告 (LP-J02)。`
       ) as Error & { errorCode: string };
       err.errorCode = 'LP-J02';
       throw err;
+    }
+    if (
+      typeof report.rootDagNodeId !== 'number' ||
+      !Number.isInteger(report.rootDagNodeId)
+    ) {
+      const err = new Error(
+        `serializeLProofJson 拒绝导出缺失或非整数 rootDagNodeId=${String(report.rootDagNodeId)} 的报告 (LP-J02)。`
+      ) as Error & { errorCode: string };
+      err.errorCode = 'LP-J02';
+      throw err;
+    }
+    // R18 §1 (P2): For proven outcomes (PROVEN_WIN / PROVEN_LOSS), confirm non-empty stateTable,
+    // non-empty proofDagNodes, in-bounds integer rootDagNodeId, and matching rootNode.nodeId
+    // before emitting a checksummed lproof/1 file. UNKNOWN partial searches remain exportable.
+    if (
+      report.rootStatus === ProofOutcome.ProvenWin ||
+      report.rootStatus === ProofOutcome.ProvenLoss
+    ) {
+      if (report.stateTable.length === 0) {
+        const err = new Error(
+          'serializeLProofJson 拒绝导出空 stateTable 的已定论 full_state_table 报告 (LP-J02)。'
+        ) as Error & { errorCode: string };
+        err.errorCode = 'LP-J02';
+        throw err;
+      }
+      if (report.proofDagNodes.length === 0) {
+        const err = new Error(
+          `serializeLProofJson 拒绝导出空 proofDagNodes 的已定论 ${report.rootStatus} 报告 (LP-R00)。`
+        ) as Error & { errorCode: string };
+        err.errorCode = 'LP-R00';
+        throw err;
+      }
+      if (
+        report.rootDagNodeId < 0 ||
+        report.rootDagNodeId >= report.proofDagNodes.length
+      ) {
+        const err = new Error(
+          `serializeLProofJson 拒绝导出 rootDagNodeId=${report.rootDagNodeId} 越界的已定论 ${report.rootStatus} 报告（nodes.length=${report.proofDagNodes.length}，LP-R00）。`
+        ) as Error & { errorCode: string };
+        err.errorCode = 'LP-R00';
+        throw err;
+      }
+      const rootNode = report.proofDagNodes[report.rootDagNodeId];
+      if (!rootNode || rootNode.nodeId !== report.rootDagNodeId) {
+        const err = new Error(
+          `serializeLProofJson 拒绝导出根节点编号失配的已定论 ${report.rootStatus} 报告：rootDagNodeId=${report.rootDagNodeId} 与 proofDagNodes[${report.rootDagNodeId}].nodeId=${String(rootNode?.nodeId)} 不一致 (LP-R00)。`
+        ) as Error & { errorCode: string };
+        err.errorCode = 'LP-R00';
+        throw err;
+      }
     }
     return this.serializeLProofJsonInternal(initialPos, context, report);
   }

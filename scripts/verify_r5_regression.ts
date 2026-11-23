@@ -3349,6 +3349,160 @@ runSection('Section 14: R17 Encoding Mode Single Source of Truth & Public Serial
   }
 });
 
+runSection('Section 15: R18 Proven-Root Export Boundary & UNKNOWN Diagnostic Preservation', () => {
+  const cfgRz: SolverConfig = {
+    ...defaultConfig(3500),
+    maxDepth: 48,
+    memoryBudgetMb: 512,
+    enableRzPruning: true,
+    useProblemDefaultKo: true,
+  };
+  const cloneReport = <T,>(r: T): T => JSON.parse(JSON.stringify(r));
+
+  const p001 = getSpec('p001');
+  const ctx001 = DfpnSolver.buildProofContext(p001, cfgRz);
+  const pos001 = DfpnSolver.buildInitialPosition(p001, ctx001);
+  const rep001Win = new DfpnSolver(cfgRz).solveProblem(p001);
+
+  const p007 = getSpec('p007');
+  const ctx007 = DfpnSolver.buildProofContext(p007, cfgRz);
+  const pos007 = DfpnSolver.buildInitialPosition(p007, ctx007);
+  const rep007Loss = new DfpnSolver(cfgRz).solveProblem(p007);
+
+  // 15.1 Positive controls: normal PROVEN_WIN (p001) and PROVEN_LOSS (p007) export & round-trip PASS
+  const expWin = checker.serializeLProofJson(pos001, ctx001, rep001Win);
+  const rtWin = checker.verifySerializedLProofJson(expWin.json, {
+    problem: p001,
+    context: ctx001,
+    scope: 'original_root',
+  });
+  const expLoss = checker.serializeLProofJson(pos007, ctx007, rep007Loss);
+  const rtLoss = checker.verifySerializedLProofJson(expLoss.json, {
+    problem: p007,
+    context: ctx007,
+    scope: 'original_root',
+  });
+  check(
+    rep001Win.rootStatus === ProofOutcome.ProvenWin &&
+      rtWin.passed &&
+      rep007Loss.rootStatus === ProofOutcome.ProvenLoss &&
+      rtLoss.passed,
+    'R18 §1 positive controls: normal PROVEN_WIN (p001) and PROVEN_LOSS (p007) export and round-trip PASS under original_root binding',
+    `p001=${rep001Win.rootStatus}/${rtWin.passed}, p007=${rep007Loss.rootStatus}/${rtLoss.passed}`
+  );
+
+  // 15.2 Proven-root negative cases on BOTH PROVEN_WIN (p001) and PROVEN_LOSS (p007)
+  const casesByOutcome = [
+    {
+      tag: 'p001 PROVEN_WIN',
+      pos: pos001,
+      ctx: ctx001,
+      base: rep001Win,
+    },
+    {
+      tag: 'p007 PROVEN_LOSS',
+      pos: pos007,
+      ctx: ctx007,
+      base: rep007Loss,
+    },
+  ] as const;
+
+  for (const { tag, pos, ctx, base } of casesByOutcome) {
+    const repEmptyDag = cloneReport(base);
+    repEmptyDag.proofDagNodes = [];
+
+    const repMissingRootId = cloneReport(base);
+    delete (repMissingRootId as unknown as Record<string, unknown>)
+      .rootDagNodeId;
+
+    const repFloatRootId = cloneReport(base);
+    repFloatRootId.rootDagNodeId = 0.5;
+
+    const repNegRootId = cloneReport(base);
+    repNegRootId.rootDagNodeId = -1;
+
+    const repOobRootId = cloneReport(base);
+    repOobRootId.rootDagNodeId = repOobRootId.proofDagNodes.length;
+
+    const repMismatchNodeId = cloneReport(base);
+    repMismatchNodeId.proofDagNodes[repMismatchNodeId.rootDagNodeId].nodeId =
+      repMismatchNodeId.rootDagNodeId + 1;
+
+    const mutations: Array<{
+      label: string;
+      report: typeof base;
+      expectedCode: 'LP-R00' | 'LP-J02';
+    }> = [
+      { label: 'empty proofDagNodes', report: repEmptyDag, expectedCode: 'LP-R00' },
+      { label: 'missing rootDagNodeId', report: repMissingRootId, expectedCode: 'LP-J02' },
+      { label: 'non-integer rootDagNodeId', report: repFloatRootId, expectedCode: 'LP-J02' },
+      { label: 'negative rootDagNodeId (-1)', report: repNegRootId, expectedCode: 'LP-R00' },
+      { label: 'out-of-bounds rootDagNodeId', report: repOobRootId, expectedCode: 'LP-R00' },
+      {
+        label: 'mismatched rootNode.nodeId',
+        report: repMismatchNodeId,
+        expectedCode: 'LP-R00',
+      },
+    ];
+
+    for (const m of mutations) {
+      let rejected = false;
+      let actualCode = 'NONE';
+      let errMsg = '';
+      try {
+        checker.serializeLProofJson(pos, ctx, m.report);
+      } catch (e) {
+        const err = e as Error & { errorCode?: string };
+        errMsg = err?.message ?? String(e);
+        actualCode = err?.errorCode ?? 'UNKNOWN';
+        rejected =
+          err?.errorCode === m.expectedCode && errMsg.includes(m.expectedCode);
+      }
+      check(
+        rejected,
+        `R18 §1 (P2): serializeLProofJson rejects ${tag} with ${m.label} (${m.expectedCode})`,
+        `actualCode=${actualCode}, err=${errMsg}`
+      );
+    }
+  }
+
+  // 15.3 UNKNOWN diagnostic preservation: partial DAG (p162) and empty DAG with rootDagNodeId=-1 remain exportable
+  const p162 = getSpec('chao_vol2_p162');
+  const ctx162 = DfpnSolver.buildProofContext(p162, cfgRz);
+  const pos162 = DfpnSolver.buildInitialPosition(p162, ctx162);
+  const rep162Unknown = new DfpnSolver(cfgRz).solveProblem(p162);
+
+  const rep162EmptyDiag = cloneReport(rep162Unknown);
+  rep162EmptyDiag.proofDagNodes = [];
+  rep162EmptyDiag.rootDagNodeId = -1;
+
+  const expUnknownPartial = checker.serializeLProofJson(
+    pos162,
+    ctx162,
+    rep162Unknown
+  );
+  const expUnknownEmpty = checker.serializeLProofJson(
+    pos162,
+    ctx162,
+    rep162EmptyDiag
+  );
+  const parsedUnknownPartial = JSON.parse(expUnknownPartial.json);
+  const parsedUnknownEmpty = JSON.parse(expUnknownEmpty.json);
+  check(
+    rep162Unknown.rootStatus === ProofOutcome.Unknown &&
+      parsedUnknownPartial.rootOutcome === ProofOutcome.Unknown &&
+      parsedUnknownPartial.rootNode === -1 &&
+      Array.isArray(parsedUnknownPartial.nodes) &&
+      parsedUnknownPartial.nodes.length > 0 &&
+      parsedUnknownEmpty.rootOutcome === ProofOutcome.Unknown &&
+      parsedUnknownEmpty.rootNode === -1 &&
+      Array.isArray(parsedUnknownEmpty.nodes) &&
+      parsedUnknownEmpty.nodes.length === 0,
+    'R18 §1: UNKNOWN partial searches (both partial DAG and empty diagnostic DAG with rootDagNodeId=-1) remain exportable',
+    `partialNodes=${parsedUnknownPartial.nodes?.length}, emptyNodes=${parsedUnknownEmpty.nodes?.length}, root=${parsedUnknownEmpty.rootNode}`
+  );
+});
+
 console.log(
   `\n========================================\nR5 TS Regression Summary: ${passedAssertions}/${totalAssertions} passed, ${failures.length} failed.\n========================================`
 );
