@@ -24,15 +24,22 @@ import {
   BranchMoveCoverageStatus,
   CanonicalSnapshot,
   Color,
+  FrontierMemoryDiagnostics,
   LogicalOp,
   oppositeColor,
   PN_DN_SATURATION,
+  ParentUsableSubproofEvent,
   ProofContext,
   ProofDagNode,
   ProofOutcome,
   PrunedCertificateRecord,
+  ResidualDivergenceKind,
+  ResidualReplayDiagnostics,
+  ResidualSiblingReplayMode,
   SearchGoal,
   SearchPathTraceEvent,
+  ShortTacticalProbeConfig,
+  ShortTacticalProbeDiagnostics,
   SolveReport,
   SolverConfig,
   StateTableEntry,
@@ -66,6 +73,9 @@ interface SearchChildSlot {
   lastThPn?: number;
   lastThDn?: number;
   lastExitReason?: string;
+  subtreeWorkNodes?: number;
+  firstDivergence?: ResidualDivergenceKind;
+  triedSourceDagIds?: Set<number>;
 }
 
 interface CachedNodeFrontier {
@@ -84,6 +94,11 @@ interface CachedNodeFrontier {
   lastWindowSize: number;
   nodeDagNodeId: number;
   nodeOutcome: ProofOutcome;
+  provenSources?: Array<{
+    move: number;
+    dagId: number;
+    rz: ProofCertificateRZ;
+  }>;
 }
 
 interface NodeTacticalContext {
@@ -120,9 +135,139 @@ export class DfpnSolver {
   private historyTable: CanonicalSnapshot[][] = [];
   private rootBestMove: number = PASS_MOVE;
   private tracePathFilterSet: Set<string> | null = null;
+  private residualDiag: ResidualReplayDiagnostics;
+  private shortProbeDiag: ShortTacticalProbeDiagnostics;
+  private lastSolveContext: ProofContext | null = null;
+  private lastSolveRegionCoords: number[] | null = null;
 
   constructor(config: SolverConfig) {
     this.config = { ...config };
+    this.residualDiag = this.createEmptyResidualDiagnostics();
+    this.shortProbeDiag = this.createEmptyShortProbeDiagnostics();
+  }
+
+  private resolveShortProbeConfig(): {
+    enabled: boolean;
+    maxProbeSearchDepth: number;
+    maxCandidatesPerFrontier: number;
+    defenderBranchFactor: number;
+    maxTotalProbeNodes: number;
+  } {
+    const raw: boolean | ShortTacticalProbeConfig | undefined =
+      this.config.enableOrShortTacticalProbe;
+    if (!raw) {
+      return {
+        enabled: false,
+        maxProbeSearchDepth: 2,
+        maxCandidatesPerFrontier: 5,
+        defenderBranchFactor: 2,
+        maxTotalProbeNodes: 180,
+      };
+    }
+    const obj = typeof raw === 'object' ? raw : {};
+    return {
+      enabled: true,
+      maxProbeSearchDepth: obj.maxProbeSearchDepth ?? 2,
+      maxCandidatesPerFrontier: obj.maxCandidatesPerFrontier ?? 5,
+      defenderBranchFactor: obj.defenderBranchFactor ?? 2,
+      maxTotalProbeNodes: obj.maxTotalProbeNodes ?? 180,
+    };
+  }
+
+  private createEmptyShortProbeDiagnostics(): ShortTacticalProbeDiagnostics {
+    const cfg = this.resolveShortProbeConfig();
+    return {
+      enabled: cfg.enabled,
+      maxProbeSearchDepth: cfg.maxProbeSearchDepth,
+      maxCandidatesPerFrontier: cfg.maxCandidatesPerFrontier,
+      defenderBranchFactor: cfg.defenderBranchFactor,
+      maxTotalProbeNodes: cfg.maxTotalProbeNodes,
+      probesTriggered: 0,
+      candidatesProbed: 0,
+      probeNodesUsed: 0,
+      mainSearchNodesUsed: 0,
+      probeTimeMs: 0,
+      rankPromotions: 0,
+      firstParentUsableSubproof: null,
+    };
+  }
+
+  public getShortTacticalProbeDiagnostics(): ShortTacticalProbeDiagnostics {
+    return {
+      ...this.shortProbeDiag,
+      mainSearchNodesUsed: Math.max(
+        0,
+        this.numNodes - this.shortProbeDiag.probeNodesUsed
+      ),
+      firstParentUsableSubproof: this.shortProbeDiag.firstParentUsableSubproof
+        ? { ...this.shortProbeDiag.firstParentUsableSubproof }
+        : null,
+    };
+  }
+
+  private getResidualReplayMode(): ResidualSiblingReplayMode {
+    if (
+      !this.config.enableResidualSiblingReplay ||
+      this.config.enableResidualSiblingReplay === 'off'
+    ) {
+      return 'off';
+    }
+    if (this.config.enableResidualSiblingReplay === true) {
+      return 'grouped-1ply-filter';
+    }
+    return this.config.enableResidualSiblingReplay;
+  }
+
+  private createEmptyResidualDiagnostics(): ResidualReplayDiagnostics {
+    return {
+      mode: this.getResidualReplayMode(),
+      sourcesRecorded: 0,
+      prefilterSkips: 0,
+      replayAttempts: 0,
+      replaySuccesses: 0,
+      replayFailures: 0,
+      replayTimeMs: 0,
+      divergenceClassifyTimeMs: 0,
+      prefilterTimeMs: 0,
+      replaySuccessTimeMs: 0,
+      replayFailureTimeMs: 0,
+      divergenceCounts: {
+        WITNESS_OCCUPIED: 0,
+        DESCENDANT_LEGAL_CHANGED: 0,
+        LEAF_TERMINAL_FAILED: 0,
+      },
+      rootFirstSourceCallIndex: null,
+      sourceClosureEvents: [],
+    };
+  }
+
+  public getResidualReplayDiagnostics(): ResidualReplayDiagnostics {
+    return {
+      ...this.residualDiag,
+      divergenceCounts: { ...this.residualDiag.divergenceCounts },
+      sourceClosureEvents: this.residualDiag.sourceClosureEvents.map((ev) => ({
+        ...ev,
+        closedMovesSgf: ev.closedMovesSgf.slice(),
+        failedMovesSgf: ev.failedMovesSgf.slice(),
+        prefilterSkippedMovesSgf: ev.prefilterSkippedMovesSgf.slice(),
+      })),
+    };
+  }
+
+  private derivePathFromStateTable(stateId: number, boardSize: number): string {
+    if (stateId <= 0 || stateId >= this.stateTable.length) return '';
+    const movesSgf: string[] = [];
+    let cur = stateId;
+    let safety = 0;
+    while (cur > 0 && cur < this.stateTable.length && safety < 256) {
+      const st = this.stateTable[cur];
+      if (!st || st.parentStateId < 0) break;
+      movesSgf.push(coordToSgf(st.moveFromParent, boardSize));
+      cur = st.parentStateId;
+      safety++;
+    }
+    movesSgf.reverse();
+    return movesSgf.join('/');
   }
 
   private static assertRegionHintConsistent(problem: TsumegoProblemSpec): void {
@@ -215,6 +360,8 @@ export class DfpnSolver {
     this.stateTable = [];
     this.historyTable = [];
     this.rootBestMove = PASS_MOVE;
+    this.residualDiag = this.createEmptyResidualDiagnostics();
+    this.shortProbeDiag = this.createEmptyShortProbeDiagnostics();
 
     this.activeAttentionMask =
       problem.attentionCoords && problem.attentionCoords.length > 0
@@ -231,6 +378,11 @@ export class DfpnSolver {
         : problem.regionCoords.length > 0;
     const effectiveRegionMask: number[] | null = hasRegionHint
       ? problem.regionCoords
+      : null;
+
+    this.lastSolveContext = DfpnSolver.cloneProofContext(context);
+    this.lastSolveRegionCoords = effectiveRegionMask
+      ? [...effectiveRegionMask]
       : null;
 
     this.tracePathFilterSet =
@@ -1285,7 +1437,9 @@ export class DfpnSolver {
     regionCoords: number[] | null,
     sourceDagNodeId: number,
     expectedOutcome: ProofOutcome,
-    guardDepth = 0
+    guardDepth = 0,
+    mutateCache = true,
+    revalCacheOverride?: Map<string, boolean>
   ): boolean {
     if (
       guardDepth > 48 ||
@@ -1319,14 +1473,15 @@ export class DfpnSolver {
     }:${queryPos.consecutivePasses}:${
       queryPos.survivingTargetTokensMask
     }:${histTag}:${resolvedId}:${expectedOutcome}`;
-    const cached = this.revalCache.get(cacheKey);
+    const cache = revalCacheOverride ?? this.revalCache;
+    const cached = cache.get(cacheKey);
     if (cached !== undefined) {
       return cached;
     }
 
     const finish = (ok: boolean): boolean => {
-      if (ok || guardDepth <= 40) {
-        this.revalCache.set(cacheKey, ok);
+      if (mutateCache && (ok || guardDepth <= 40)) {
+        cache.set(cacheKey, ok);
       }
       return ok;
     };
@@ -1377,7 +1532,9 @@ export class DfpnSolver {
             regionCoords,
             sourceNode.childNodeIds[i],
             expectedOutcome,
-            guardDepth + 1
+            guardDepth + 1,
+            mutateCache,
+            revalCacheOverride
           )
         ) {
           return finish(true);
@@ -1410,7 +1567,9 @@ export class DfpnSolver {
           regionCoords,
           childDagId,
           expectedOutcome,
-          guardDepth + 1
+          guardDepth + 1,
+          mutateCache,
+          revalCacheOverride
         )
       ) {
         return finish(checkEarlyTerminal());
@@ -1418,6 +1577,946 @@ export class DfpnSolver {
     }
 
     return finish(true);
+  }
+
+  private diagnoseFirstDivergence(
+    queryPos: GoPosition,
+    context: ProofContext,
+    regionCoords: number[] | null,
+    sourceDagNodeId: number,
+    expectedOutcome: ProofOutcome,
+    guardDepth = 0
+  ): ResidualDivergenceKind | null {
+    if (
+      guardDepth > 48 ||
+      sourceDagNodeId < 0 ||
+      sourceDagNodeId >= this.proofDagNodes.length
+    ) {
+      return 'LEAF_TERMINAL_FAILED';
+    }
+
+    let sourceNode = this.proofDagNodes[sourceDagNodeId];
+    let unwrapSafety = 0;
+    while (
+      sourceNode &&
+      (sourceNode.isPrunedOutsideRz || sourceNode.isTtHit) &&
+      sourceNode.sourceProofNodeId !== null &&
+      sourceNode.sourceProofNodeId >= 0 &&
+      sourceNode.sourceProofNodeId < sourceNode.nodeId &&
+      unwrapSafety < 32
+    ) {
+      unwrapSafety++;
+      sourceNode = this.proofDagNodes[sourceNode.sourceProofNodeId];
+    }
+    if (!sourceNode || sourceNode.outcome !== expectedOutcome) {
+      return 'LEAF_TERMINAL_FAILED';
+    }
+
+    if (sourceNode.childNodeIds.length === 0 || queryPos.isAtDoublePass()) {
+      const term = this.terminalEval.evaluateTerminal(queryPos, context, false);
+      const ok =
+        (term.status === TerminalStatus.Win &&
+          expectedOutcome === ProofOutcome.ProvenWin) ||
+        (term.status === TerminalStatus.Loss &&
+          expectedOutcome === ProofOutcome.ProvenLoss);
+      return ok ? null : 'LEAF_TERMINAL_FAILED';
+    }
+
+    const isOr = queryPos.toPlay === context.rootAttacker;
+    const restrictedSide =
+      (queryPos.toPlay === context.rootAttacker && !context.attackerAllowKo) ||
+      (queryPos.toPlay !== context.rootAttacker && !context.defenderAllowKo);
+
+    const allowedRegion =
+      regionCoords !== null ? new Set<number>(regionCoords) : null;
+
+    if (
+      (isOr && expectedOutcome === ProofOutcome.ProvenWin) ||
+      (!isOr && expectedOutcome === ProofOutcome.ProvenLoss)
+    ) {
+      let fallbackDiv: ResidualDivergenceKind | null = null;
+      for (let i = 0; i < sourceNode.childNodeIds.length; i++) {
+        const mv = sourceNode.childMoves[i];
+        if (mv !== PASS_MOVE && allowedRegion !== null && !allowedRegion.has(mv)) {
+          continue;
+        }
+        const chNode = this.proofDagNodes[sourceNode.childNodeIds[i]];
+        if (!chNode || chNode.outcome !== expectedOutcome) continue;
+        const nextPos = queryPos.clone();
+        const playRes = nextPos.playMove(mv);
+        if (!playRes.legal || (playRes.isKoCapture && restrictedSide)) {
+          if (!fallbackDiv) fallbackDiv = 'WITNESS_OCCUPIED';
+          continue;
+        }
+        const sub = this.diagnoseFirstDivergence(
+          nextPos,
+          context,
+          regionCoords,
+          sourceNode.childNodeIds[i],
+          expectedOutcome,
+          guardDepth + 1
+        );
+        if (sub === null) return null;
+        if (!fallbackDiv) fallbackDiv = sub;
+      }
+      return fallbackDiv ?? 'WITNESS_OCCUPIED';
+    }
+
+    const moveMap = new Map<number, number>();
+    for (let i = 0; i < sourceNode.childMoves.length; i++) {
+      moveMap.set(sourceNode.childMoves[i], sourceNode.childNodeIds[i]);
+    }
+
+    const queryLegalMoves = queryPos.generateLegalMoves(regionCoords);
+    for (let i = 0; i < queryLegalMoves.length; i++) {
+      if (!moveMap.has(queryLegalMoves[i])) {
+        return 'DESCENDANT_LEGAL_CHANGED';
+      }
+    }
+
+    queryLegalMoves.sort((a, b) => {
+      const ca = moveMap.get(a)!;
+      const cb = moveMap.get(b)!;
+      const pa =
+        a === PASS_MOVE ? 0 : !this.proofDagNodes[ca]?.isPrunedOutsideRz ? 1 : 2;
+      const pb =
+        b === PASS_MOVE ? 0 : !this.proofDagNodes[cb]?.isPrunedOutsideRz ? 1 : 2;
+      return pa - pb;
+    });
+
+    for (let i = 0; i < queryLegalMoves.length; i++) {
+      const mv = queryLegalMoves[i];
+      const childDagId = moveMap.get(mv)!;
+      const nextPos = queryPos.clone();
+      const playRes = nextPos.playMove(mv);
+      if (!playRes.legal) continue;
+      const sub = this.diagnoseFirstDivergence(
+        nextPos,
+        context,
+        regionCoords,
+        childDagId,
+        expectedOutcome,
+        guardDepth + 1
+      );
+      if (sub !== null) return sub;
+    }
+
+    return null;
+  }
+
+  private unwrapSourceDagNode(dagNodeId: number): ProofDagNode | undefined {
+    let node = this.proofDagNodes[dagNodeId];
+    let unwrapSafety = 0;
+    while (
+      node &&
+      (node.isPrunedOutsideRz || node.isTtHit) &&
+      node.sourceProofNodeId !== null &&
+      node.sourceProofNodeId >= 0 &&
+      node.sourceProofNodeId < node.nodeId &&
+      unwrapSafety < 32
+    ) {
+      unwrapSafety++;
+      node = this.proofDagNodes[node.sourceProofNodeId];
+    }
+    return node;
+  }
+
+  /**
+   * Side-effect-free assessment of whether `src`'s existing proof DAG can close
+   * `sibPos` after `sibMove`. Never mutates `stateTable`, `historyTable`,
+   * `proofDagNodes`, `dagHasCapture`, or `residualDiag`.
+   */
+  private assessSiblingReplayCandidate(
+    sibMove: number,
+    sibPos: GoPosition,
+    src: { move: number; dagId: number; rz: ProofCertificateRZ },
+    mode: ResidualSiblingReplayMode,
+    context: ProofContext,
+    regionCoords: number[] | null,
+    triedSourceDagIds?: ReadonlySet<number>,
+    mutateCache = true,
+    revalCacheOverride?: Map<string, boolean>
+  ): {
+    status: 'closed' | 'failed' | 'prefilter_skip' | 'already_tried';
+    prefilterDtMs: number;
+    replayDtMs: number;
+  } {
+    if (triedSourceDagIds?.has(src.dagId)) {
+      return {
+        status: 'already_tried',
+        prefilterDtMs: 0,
+        replayDtMs: 0,
+      };
+    }
+
+    const tPre0 = performance.now();
+    const srcRoot = this.unwrapSourceDagNode(src.dagId);
+    const winIndices: number[] = [];
+    if (srcRoot) {
+      for (let i = 0; i < srcRoot.childNodeIds.length; i++) {
+        if (this.proofDagNodes[srcRoot.childNodeIds[i]]?.outcome === ProofOutcome.ProvenWin) {
+          winIndices.push(i);
+        }
+      }
+    }
+    const singleWinIdx = winIndices.length === 1 ? winIndices[0] : -1;
+    const w0 = singleWinIdx >= 0 && srcRoot ? srcRoot.childMoves[singleWinIdx] : -999;
+    const c0 =
+      singleWinIdx >= 0 && srcRoot
+        ? this.unwrapSourceDagNode(srcRoot.childNodeIds[singleWinIdx])
+        : undefined;
+
+    if (sibMove !== PASS_MOVE && sibMove === w0) {
+      return {
+        status: 'already_tried',
+        prefilterDtMs: performance.now() - tPre0,
+        replayDtMs: 0,
+      };
+    }
+
+    if (
+      mode === 'grouped-1ply-filter' &&
+      src.move !== PASS_MOVE &&
+      !sibPos.isAtDoublePass() &&
+      w0 >= 0 &&
+      c0 &&
+      c0.childNodeIds.length > 0 &&
+      !c0.childMoves.includes(src.move)
+    ) {
+      const afterW0 = sibPos.clone();
+      const w0Play = afterW0.playMove(w0);
+      const w0InRegion =
+        w0 === PASS_MOVE || regionCoords === null || regionCoords.includes(w0);
+      const restrictedAttacker =
+        (sibPos.toPlay === context.rootAttacker && !context.attackerAllowKo) ||
+        (sibPos.toPlay !== context.rootAttacker && !context.defenderAllowKo);
+      const w0Legal = w0InRegion && w0Play.legal && !(w0Play.isKoCapture && restrictedAttacker);
+      const isSibEarlyWin = (): boolean =>
+        this.terminalEval.evaluateTerminal(sibPos, context, false).status === TerminalStatus.Win;
+
+      if (!w0Legal) {
+        if (!isSibEarlyWin()) {
+          return {
+            status: 'prefilter_skip',
+            prefilterDtMs: performance.now() - tPre0,
+            replayDtMs: 0,
+          };
+        }
+      } else if (!afterW0.isAtDoublePass() && afterW0.clone().playMove(src.move).legal) {
+        const afterW0EarlyWin =
+          this.terminalEval.evaluateTerminal(afterW0, context, false).status ===
+          TerminalStatus.Win;
+        if (!afterW0EarlyWin && !isSibEarlyWin()) {
+          return {
+            status: 'prefilter_skip',
+            prefilterDtMs: performance.now() - tPre0,
+            replayDtMs: 0,
+          };
+        }
+      }
+    }
+
+    const prefilterDtMs = performance.now() - tPre0;
+    const t0 = performance.now();
+    const ok = this.revalidateSourceProofOnQueryState(
+      sibPos,
+      context,
+      regionCoords,
+      src.dagId,
+      ProofOutcome.ProvenWin,
+      0,
+      mutateCache,
+      revalCacheOverride
+    );
+    const replayDtMs = performance.now() - t0;
+
+    return {
+      status: ok ? 'closed' : 'failed',
+      prefilterDtMs,
+      replayDtMs,
+    };
+  }
+
+  private tryReplaySourceOnSiblingSlot(
+    sib: SearchChildSlot,
+    sibPos: GoPosition,
+    hasCaptureOnSibMove: boolean,
+    parentPos: GoPosition,
+    currentStateId: number,
+    isOrNode: boolean,
+    src: { move: number; dagId: number; rz: ProofCertificateRZ },
+    mode: ResidualSiblingReplayMode,
+    context: ProofContext,
+    regionCoords: number[] | null
+  ): 'closed' | 'failed' | 'prefilter_skip' | 'already_tried' {
+    if (!sib.triedSourceDagIds) sib.triedSourceDagIds = new Set<number>();
+    if (sib.triedSourceDagIds.has(src.dagId)) return 'already_tried';
+    const assessment = this.assessSiblingReplayCandidate(
+      sib.move,
+      sibPos,
+      src,
+      mode,
+      context,
+      regionCoords,
+      sib.triedSourceDagIds,
+      true
+    );
+    sib.triedSourceDagIds.add(src.dagId);
+
+    this.residualDiag.prefilterTimeMs += assessment.prefilterDtMs;
+    this.residualDiag.replayTimeMs += assessment.prefilterDtMs;
+
+    if (assessment.status === 'already_tried') {
+      return 'already_tried';
+    }
+    if (assessment.status === 'prefilter_skip') {
+      this.residualDiag.prefilterSkips++;
+      return 'prefilter_skip';
+    }
+
+    this.residualDiag.replayTimeMs += assessment.replayDtMs;
+    this.residualDiag.replayAttempts++;
+
+    if (assessment.status === 'failed') {
+      this.residualDiag.replayFailureTimeMs += assessment.replayDtMs;
+      this.residualDiag.replayFailures++;
+      return 'failed';
+    }
+
+    this.residualDiag.replaySuccessTimeMs += assessment.replayDtMs;
+    this.residualDiag.replaySuccesses++;
+    const qSid =
+      sib.stateId >= 0
+        ? sib.stateId
+        : this.registerState(sibPos, currentStateId, sib.move);
+    sib.stateId = qSid;
+    sib.hasCapture = hasCaptureOnSibMove;
+    const qStEntry = this.stateTable[qSid];
+    const ttNodeId = this.proofDagNodes.length;
+    this.proofDagNodes.push({
+      nodeId: ttNodeId,
+      stateId: qSid,
+      historyId: qStEntry.historyId,
+      parentStateId: currentStateId,
+      isOrNode: !isOrNode,
+      toPlay: sibPos.toPlay,
+      incomingMove: sib.move,
+      incomingMoveSgf: coordToSgf(sib.move, parentPos.boardSize),
+      pn: 0,
+      dn: PN_DN_SATURATION,
+      outcome: ProofOutcome.ProvenWin,
+      terminalEvidence: 'TT_REVALIDATED_REUSE',
+      isPrunedOutsideRz: false,
+      isTtHit: true,
+      isKoDependentBarrier: false,
+      sourceProofNodeId: src.dagId,
+      proofRzCoords: src.rz.toArray(),
+      disproofRzCoords: src.rz.toArray(),
+      childNodeIds: [],
+      childMoves: [],
+    });
+    this.dagHasCapture.push(
+      sib.hasCapture || Boolean(this.dagHasCapture[src.dagId])
+    );
+
+    sib.expanded = true;
+    sib.outcome = ProofOutcome.ProvenWin;
+    sib.pn = 0;
+    sib.dn = PN_DN_SATURATION;
+    sib.proofRz = src.rz;
+    sib.disproofRz = src.rz;
+    sib.dagNodeId = ttNodeId;
+    sib.lastExitReason = 'sibling_tt_replay';
+    return 'closed';
+  }
+
+  private static cloneProofContext(ctx: ProofContext): ProofContext {
+    return {
+      contextId: ctx.contextId,
+      rootAttacker: ctx.rootAttacker,
+      attackerGoal: ctx.attackerGoal,
+      crucialStoneOp: ctx.crucialStoneOp,
+      koRule: ctx.koRule,
+      attackerAllowKo: ctx.attackerAllowKo,
+      defenderAllowKo: ctx.defenderAllowKo,
+      initialTokens: ctx.initialTokens.map((t) => ({
+        tokenId: t.tokenId,
+        initialCoord: t.initialCoord,
+        groupIndex: t.groupIndex,
+        stoneColor: t.stoneColor,
+      })),
+    };
+  }
+
+  private static sameProofContext(a: ProofContext, b: ProofContext): boolean {
+    if (
+      a.contextId !== b.contextId ||
+      a.rootAttacker !== b.rootAttacker ||
+      a.attackerGoal !== b.attackerGoal ||
+      a.crucialStoneOp !== b.crucialStoneOp ||
+      a.koRule !== b.koRule ||
+      a.attackerAllowKo !== b.attackerAllowKo ||
+      a.defenderAllowKo !== b.defenderAllowKo ||
+      a.initialTokens.length !== b.initialTokens.length
+    ) {
+      return false;
+    }
+    for (let i = 0; i < a.initialTokens.length; i++) {
+      const ta = a.initialTokens[i];
+      const tb = b.initialTokens[i];
+      if (
+        ta.tokenId !== tb.tokenId ||
+        ta.initialCoord !== tb.initialCoord ||
+        ta.groupIndex !== tb.groupIndex ||
+        ta.stoneColor !== tb.stoneColor
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static sameRegionCoords(
+    a: number[] | null,
+    b: number[] | null
+  ): boolean {
+    if (a === null || b === null) return a === b;
+    const setA = new Set<number>(a);
+    const setB = new Set<number>(b);
+    if (setA.size !== setB.size) return false;
+    for (const c of setA) {
+      if (!setB.has(c)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Read-only diagnostic entry to evaluate whether `src` can replay on `queryMove`
+   * against a source DAG already stored on this solver instance without mutating
+   * `stateTable`, `historyTable`, `proofDagNodes`, `dagHasCapture`, `revalCache`, or `residualDiag`.
+   *
+   * Binds to the `ProofContext` and `regionCoords` that produced the stored DAG by default
+   * (`regionPolicy = 'bound'`) and always evaluates inside an isolated temporary cache so
+   * warm and cold instances cannot leak stale cross-region entries.
+   */
+  public evaluateSiblingReplayCandidate(params: {
+    parentPos: GoPosition;
+    sourceMove: number;
+    sourceDagId: number;
+    sourceRz: ProofCertificateRZ;
+    queryMove: number;
+    mode: ResidualSiblingReplayMode;
+    context: ProofContext;
+    regionCoords: number[] | null;
+    regionPolicy?: 'bound' | 'counterfactual';
+  }): 'closed' | 'failed' | 'prefilter_skip' | 'already_tried' {
+    if (
+      params.queryMove !== PASS_MOVE &&
+      params.regionCoords !== null &&
+      !params.regionCoords.includes(params.queryMove)
+    ) {
+      return 'failed';
+    }
+    if (!DfpnSolver.sameProofContext(params.parentPos.context, params.context)) {
+      return 'failed';
+    }
+    if (
+      this.lastSolveContext !== null &&
+      (!DfpnSolver.sameProofContext(params.context, this.lastSolveContext) ||
+        !DfpnSolver.sameProofContext(params.parentPos.context, this.lastSolveContext))
+    ) {
+      return 'failed';
+    }
+    const policy = params.regionPolicy ?? 'bound';
+    if (
+      policy === 'bound' &&
+      this.lastSolveContext !== null &&
+      !DfpnSolver.sameRegionCoords(params.regionCoords, this.lastSolveRegionCoords)
+    ) {
+      return 'failed';
+    }
+
+    const qPos = params.parentPos.clone();
+    const qPlay = qPos.playMove(params.queryMove);
+    const restrictedSide =
+      (params.parentPos.toPlay === params.context.rootAttacker &&
+        !params.context.attackerAllowKo) ||
+      (params.parentPos.toPlay !== params.context.rootAttacker &&
+        !params.context.defenderAllowKo);
+    if (!qPlay.legal || (qPlay.isKoCapture && restrictedSide)) {
+      return 'failed';
+    }
+
+    const isolatedRevalCache = new Map<string, boolean>();
+    return this.assessSiblingReplayCandidate(
+      params.queryMove,
+      qPos,
+      { move: params.sourceMove, dagId: params.sourceDagId, rz: params.sourceRz },
+      params.mode,
+      params.context,
+      params.regionCoords,
+      undefined,
+      true,
+      isolatedRevalCache
+    ).status;
+  }
+
+  private hasInteriorEmptyTriangle(
+    pos: GoPosition,
+    move: number,
+    color: Color
+  ): boolean {
+    const bs = pos.boardSize;
+    const r = Math.floor(move / bs);
+    const c = move % bs;
+    for (let dr = -1; dr <= 0; dr++) {
+      for (let dc = -1; dc <= 0; dc++) {
+        if (r + dr < 0 || r + dr + 1 >= bs || c + dc < 0 || c + dc + 1 >= bs) {
+          continue;
+        }
+        const pts = [
+          (r + dr) * bs + (c + dc),
+          (r + dr) * bs + (c + dc + 1),
+          (r + dr + 1) * bs + (c + dc),
+          (r + dr + 1) * bs + (c + dc + 1),
+        ];
+        let friendly = 0;
+        let emptyCoord = -1;
+        let emptyCount = 0;
+        for (let i = 0; i < 4; i++) {
+          const st = pos.grid[pts[i]];
+          if (st === color) friendly++;
+          else if (st === Color.Empty) {
+            emptyCount++;
+            emptyCoord = pts[i];
+          }
+        }
+        if (friendly === 3 && emptyCount === 1 && emptyCoord >= 0) {
+          const oNbs = pos.orthogonalNeighbors(emptyCoord);
+          if (oNbs.length === 4) {
+            let fWalls = 0;
+            for (let k = 0; k < 4; k++) {
+              if (pos.grid[oNbs[k]] === color) fWalls++;
+            }
+            if (fWalls === 2) return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  private evaluateGroupBaseAndEyeSectors(
+    pos: GoPosition,
+    context: ProofContext,
+    targetColor: Color
+  ): {
+    crucialAlive: boolean;
+    minCrucialLibs: number;
+    enclosedCount: number;
+    tigerCount: number;
+    distinctSectors: number;
+    edgeBaseSpan: number;
+  } {
+    let crucialAlive = true;
+    let minCrucialLibs = 99;
+    const seen = new Set<number>();
+    for (let idx = 0; idx < context.initialTokens.length; idx++) {
+      if ((pos.survivingTargetTokensMask & (1 << idx)) === 0) {
+        if (context.crucialStoneOp === LogicalOp.Conjunction) crucialAlive = false;
+        continue;
+      }
+      const coord = context.initialTokens[idx].initialCoord;
+      if (seen.has(coord) || pos.grid[coord] !== targetColor) continue;
+      const ch = pos.floodFillChain(coord);
+      for (const s of ch.stones) seen.add(s);
+      if (ch.liberties.size < minCrucialLibs) minCrucialLibs = ch.liberties.size;
+    }
+    if (context.crucialStoneOp !== LogicalOp.Conjunction) {
+      crucialAlive = pos.survivingTargetTokensMask !== 0;
+    }
+    if (!crucialAlive) {
+      return {
+        crucialAlive: false,
+        minCrucialLibs: 0,
+        enclosedCount: 0,
+        tigerCount: 0,
+        distinctSectors: 0,
+        edgeBaseSpan: 0,
+      };
+    }
+
+    const bs = pos.boardSize;
+    const oppColor = oppositeColor(targetColor);
+    let enclosedCount = 0;
+    let tigerCount = 0;
+    const pocketCoords: number[] = [];
+    let minR = bs;
+    let maxR = -1;
+    let minC = bs;
+    let maxC = -1;
+    for (let p = 0; p < bs * bs; p++) {
+      if (pos.grid[p] === targetColor && !pos.immortalWallSet.has(p)) {
+        const pr = Math.floor(p / bs);
+        const pc = p % bs;
+        if (Math.min(Math.min(pr, bs - 1 - pr), Math.min(pc, bs - 1 - pc)) <= 2) {
+          if (pr < minR) minR = pr;
+          if (pr > maxR) maxR = pr;
+          if (pc < minC) minC = pc;
+          if (pc > maxC) maxC = pc;
+        }
+        continue;
+      }
+      if (pos.grid[p] !== Color.Empty || pos.immortalWallSet.has(p)) continue;
+      const oNbs = pos.orthogonalNeighbors(p);
+      let fO = 0;
+      let eO = 0;
+      let tacF = 0;
+      for (let k = 0; k < oNbs.length; k++) {
+        const nb = oNbs[k];
+        if (pos.grid[nb] === targetColor) {
+          fO++;
+          if (!pos.immortalWallSet.has(nb)) tacF++;
+        } else if (pos.grid[nb] === oppColor) {
+          eO++;
+        }
+      }
+      if (tacF === 0 || eO > 0) continue;
+      if (fO >= oNbs.length - 1) {
+        enclosedCount++;
+        pocketCoords.push(p);
+      } else if (fO >= 2) {
+        tigerCount++;
+        pocketCoords.push(p);
+      }
+    }
+    let distinctSectors = 0;
+    const used = new Uint8Array(pocketCoords.length);
+    for (let i = 0; i < pocketCoords.length; i++) {
+      if (used[i]) continue;
+      distinctSectors++;
+      used[i] = 1;
+      const q = [pocketCoords[i]];
+      while (q.length > 0) {
+        const cur = q.pop()!;
+        const cr = Math.floor(cur / bs);
+        const cc = cur % bs;
+        for (let j = 0; j < pocketCoords.length; j++) {
+          if (used[j]) continue;
+          const jr = Math.floor(pocketCoords[j] / bs);
+          const jc = pocketCoords[j] % bs;
+          if (Math.abs(cr - jr) + Math.abs(cc - jc) <= 2) {
+            used[j] = 1;
+            q.push(pocketCoords[j]);
+          }
+        }
+      }
+    }
+    return {
+      crucialAlive,
+      minCrucialLibs,
+      enclosedCount,
+      tigerCount,
+      distinctSectors,
+      edgeBaseSpan: maxR >= minR ? maxR - minR + (maxC - minC) : 0,
+    };
+  }
+
+  private runShortTacticalProbeOnOrFrontier(
+    pos: GoPosition,
+    context: ProofContext,
+    regionCoords: number[] | null,
+    tacCtx: NodeTacticalContext,
+    scored: Array<{
+      mv: number;
+      meta: {
+        score: number;
+        immediateWin: boolean;
+        immediateLoss: boolean;
+        inAttention: boolean;
+      };
+    }>
+  ): void {
+    const cfg = this.resolveShortProbeConfig();
+    if (!cfg.enabled || scored.length <= 3) return;
+    if (
+      this.shortProbeDiag.probeNodesUsed >= cfg.maxTotalProbeNodes ||
+      this.numNodes >= this.config.maxNodes - 1
+    ) {
+      return;
+    }
+    if (scored.some((x) => x.meta.immediateWin)) return;
+    if (scored[0].meta.score >= 3800) return;
+
+    const toLive = context.attackerGoal === SearchGoal.ToLive;
+    const basePot = this.evaluateGroupBaseAndEyeSectors(
+      pos,
+      context,
+      tacCtx.targetColor
+    );
+    if (toLive && basePot.distinctSectors >= 2 && basePot.enclosedCount >= 2) {
+      return;
+    }
+
+    const t0 = performance.now();
+    const bs = pos.boardSize;
+    const ourColor = pos.toPlay;
+    const enemyColor = oppositeColor(ourColor);
+    const legalRegion = regionCoords ? new Set<number>(regionCoords) : null;
+
+    const fightZone: number[] = [];
+    for (let p = 0; p < bs * bs; p++) {
+      if (pos.grid[p] !== Color.Empty || pos.immortalWallSet.has(p)) continue;
+      if (legalRegion && !legalRegion.has(p)) continue;
+      const r = Math.floor(p / bs);
+      const c = p % bs;
+      let near = false;
+      for (let dr = -2; dr <= 2 && !near; dr++) {
+        for (let dc = -2; dc <= 2 && !near; dc++) {
+          const nr = r + dr;
+          const nc = c + dc;
+          if (nr < 0 || nr >= bs || nc < 0 || nc >= bs) continue;
+          const q = nr * bs + nc;
+          if (pos.grid[q] !== Color.Empty && !pos.immortalWallSet.has(q)) {
+            near = true;
+          }
+        }
+      }
+      if (near) fightZone.push(p);
+    }
+
+    const candIndices: number[] = [];
+    for (
+      let i = 2;
+      i < Math.min(scored.length, 11) && candIndices.length < cfg.maxCandidatesPerFrontier;
+      i++
+    ) {
+      const it = scored[i];
+      if (it.mv === PASS_MOVE || !it.meta.inAttention || it.meta.immediateLoss) {
+        continue;
+      }
+      const r = Math.floor(it.mv / bs);
+      const c = it.mv % bs;
+      const distR = Math.min(r, bs - 1 - r);
+      const distC = Math.min(c, bs - 1 - c);
+      const distEdge = Math.min(distR, distC);
+      const oNbs = pos.orthogonalNeighbors(it.mv);
+      let fOrtho = 0;
+      let eOrtho = 0;
+      let emptyOrtho = 0;
+      for (let k = 0; k < oNbs.length; k++) {
+        const st = pos.grid[oNbs[k]];
+        if (st === ourColor) fOrtho++;
+        else if (st === enemyColor) eOrtho++;
+        else emptyOrtho++;
+      }
+      if (fOrtho > 0) continue;
+      if (distR === 0 && distC === 0 && emptyOrtho === 2) continue;
+      const dNbs = pos.diagonalNeighbors(it.mv);
+      let ourTacDiag = 0;
+      let enemyTacDiag = 0;
+      for (let k = 0; k < dNbs.length; k++) {
+        const st = pos.grid[dNbs[k]];
+        if (st === ourColor && !pos.immortalWallSet.has(dNbs[k])) ourTacDiag++;
+        else if (st === enemyColor && !pos.immortalWallSet.has(dNbs[k])) {
+          enemyTacDiag++;
+        }
+      }
+      if (
+        toLive
+          ? ourTacDiag >= 1 && distEdge <= 2
+          : enemyTacDiag >= 2 && eOrtho >= 1 && distEdge <= 2
+      ) {
+        candIndices.push(i);
+      }
+    }
+
+    if (candIndices.length === 0) {
+      this.shortProbeDiag.probeTimeMs += performance.now() - t0;
+      return;
+    }
+
+    this.shortProbeDiag.probesTriggered++;
+    let bestIdxToPromote = -1;
+    let bestMinimaxVal = -999999;
+
+    for (let ci = 0; ci < candIndices.length; ci++) {
+      if (
+        this.shortProbeDiag.probeNodesUsed >= cfg.maxTotalProbeNodes ||
+        this.numNodes >= this.config.maxNodes - 1
+      ) {
+        break;
+      }
+      const origIdx = candIndices[ci];
+      const item = scored[origIdx];
+      const p1 = pos.clone();
+      const r1 = p1.playMove(item.mv);
+      if (!r1.legal) continue;
+      if (
+        toLive &&
+        r1.capturedCoords.length === 0 &&
+        this.hasInteriorEmptyTriangle(p1, item.mv, ourColor)
+      ) {
+        continue;
+      }
+      const b1Ch = p1.floodFillChain(item.mv);
+      if (b1Ch.liberties.size <= 1 && r1.capturedCoords.length === 0) continue;
+      this.shortProbeDiag.candidatesProbed++;
+
+      const defMoves: Array<{ w: number; s: number; pw: GoPosition }> = [];
+      for (let j = 0; j < fightZone.length; j++) {
+        const w = fightZone[j];
+        if (p1.grid[w] !== Color.Empty) continue;
+        const pw = p1.clone();
+        const rw = pw.playMove(w);
+        if (!rw.legal) continue;
+        let ws = rw.capturedCoords.length * 1400;
+        const oNbs = p1.orthogonalNeighbors(w);
+        for (let k = 0; k < oNbs.length; k++) {
+          const nb = oNbs[k];
+          if (nb === item.mv) ws += 520;
+          if (pw.grid[nb] === ourColor && !pw.immortalWallSet.has(nb)) {
+            const ch = pw.floodFillChain(nb);
+            if (ch.liberties.size === 1) ws += 950;
+            else if (ch.liberties.size === 2) ws += 420;
+            if (tacCtx.crucialStoneMask[nb]) ws += 380;
+          }
+        }
+        const wr = Math.floor(w / bs);
+        const wc = w % bs;
+        if (Math.min(Math.min(wr, bs - 1 - wr), Math.min(wc, bs - 1 - wc)) <= 1) {
+          ws += 220;
+        }
+        defMoves.push({ w, s: ws, pw });
+      }
+      defMoves.sort((a, b) => b.s - a.s);
+      const kDef = Math.min(cfg.defenderBranchFactor, defMoves.length);
+      if (kDef === 0) continue;
+
+      let worstVal = 999999;
+      let validAll = true;
+      for (let d = 0; d < kDef; d++) {
+        if (
+          this.shortProbeDiag.probeNodesUsed >= cfg.maxTotalProbeNodes ||
+          this.numNodes >= this.config.maxNodes - 1
+        ) {
+          validAll = false;
+          break;
+        }
+        this.numNodes++;
+        this.shortProbeDiag.probeNodesUsed++;
+        const pw = defMoves[d].pw;
+        if (pw.grid[item.mv] !== ourColor) {
+          worstVal = -2000;
+          break;
+        }
+
+        let topB2a: { p2: GoPosition; cap: number } | null = null;
+        let topB2b: { p2: GoPosition; cap: number } | null = null;
+        let sa = -999999;
+        let sb = -999999;
+        for (let j = 0; j < fightZone.length; j++) {
+          const b2 = fightZone[j];
+          if (pw.grid[b2] !== Color.Empty) continue;
+          const p2 = pw.clone();
+          const r2 = p2.playMove(b2);
+          if (!r2.legal || p2.grid[item.mv] !== ourColor) continue;
+          if (
+            toLive &&
+            r2.capturedCoords.length === 0 &&
+            this.hasInteriorEmptyTriangle(p2, b2, ourColor)
+          ) {
+            continue;
+          }
+          let qs2 = r2.capturedCoords.length * 1000;
+          const oNbs = pw.orthogonalNeighbors(b2);
+          for (let k = 0; k < oNbs.length; k++) {
+            const nb = oNbs[k];
+            if (pw.grid[nb] === ourColor && !pw.immortalWallSet.has(nb)) qs2 += 280;
+            else if (pw.grid[nb] !== Color.Empty && !pw.immortalWallSet.has(nb)) {
+              qs2 += 200;
+            }
+          }
+          const br = Math.floor(b2 / bs);
+          const bc = b2 % bs;
+          if (
+            Math.min(Math.min(br, bs - 1 - br), Math.min(bc, bs - 1 - bc)) <= 1
+          ) {
+            qs2 += 260;
+          }
+          if (qs2 > sa) {
+            sb = sa;
+            topB2b = topB2a;
+            sa = qs2;
+            topB2a = { p2, cap: r2.capturedCoords.length };
+          } else if (qs2 > sb) {
+            sb = qs2;
+            topB2b = { p2, cap: r2.capturedCoords.length };
+          }
+        }
+
+        let bestReplyVal = -999999;
+        for (const cand of [topB2a, topB2b]) {
+          if (!cand) continue;
+          const chAfter = cand.p2.floodFillChain(item.mv);
+          if (chAfter.liberties.size <= 1 && cand.cap === 0) continue;
+          const ev = this.evaluateGroupBaseAndEyeSectors(
+            cand.p2,
+            context,
+            tacCtx.targetColor
+          );
+          const val = toLive
+            ? !ev.crucialAlive
+              ? -2000
+              : ev.distinctSectors * 650 +
+                ev.enclosedCount * 360 +
+                ev.tigerCount * 220 +
+                Math.min(ev.edgeBaseSpan, 8) * 140 +
+                Math.min(ev.minCrucialLibs, 5) * 110 +
+                cand.cap * 400
+            : !ev.crucialAlive
+            ? 2400
+            : -ev.distinctSectors * 600 -
+              ev.enclosedCount * 360 -
+              Math.min(ev.minCrucialLibs, 5) * 150 +
+              cand.cap * 450;
+          if (val > bestReplyVal) bestReplyVal = val;
+        }
+        if (bestReplyVal < worstVal) worstVal = bestReplyVal;
+      }
+
+      if (validAll && worstVal > bestMinimaxVal) {
+        bestMinimaxVal = worstVal;
+        bestIdxToPromote = origIdx;
+      }
+    }
+
+    const threshold = toLive ? 1400 : 200;
+    if (bestIdxToPromote > 2 && bestMinimaxVal >= threshold) {
+      const promoted = scored.splice(bestIdxToPromote, 1)[0];
+      promoted.meta.score = Math.max(
+        promoted.meta.score,
+        scored[2].meta.score + 1
+      );
+      if (promoted.meta.score >= scored[1].meta.score) {
+        promoted.meta.score = scored[1].meta.score - 1;
+      }
+      scored.splice(2, 0, promoted);
+      this.shortProbeDiag.rankPromotions++;
+    }
+    this.shortProbeDiag.probeTimeMs += performance.now() - t0;
+  }
+
+  private computeEstimatedBytes(): number {
+    // Conservative byte estimate across stateTable, historyTable, DAG nodes, frontier cache, revalCache, and TT
+    return (
+      this.stateTable.length * 1024 +
+      this.historyTable.length * 2048 +
+      this.proofDagNodes.length * 768 +
+      this.nodeFrontierCache.size * 4096 +
+      this.revalCache.size * 128 +
+      this.ttStore.size * 1024
+    );
   }
 
   private isMemoryBudgetExceeded(): boolean {
@@ -1428,15 +2527,50 @@ export class DfpnSolver {
       return false;
     }
     const budgetBytes = this.config.memoryBudgetMb * 1024 * 1024;
-    // Conservative byte estimate across stateTable, historyTable, DAG nodes, frontier cache, revalCache, and TT
-    const estimatedBytes =
-      this.stateTable.length * 1024 +
-      this.historyTable.length * 2048 +
-      this.proofDagNodes.length * 768 +
-      this.nodeFrontierCache.size * 4096 +
-      this.revalCache.size * 128 +
-      this.ttStore.size * 1024;
-    return estimatedBytes > budgetBytes;
+    return this.computeEstimatedBytes() > budgetBytes;
+  }
+
+  /**
+   * Read-only memory & slot accounting over resident frontier cache and solver tables.
+   */
+  public getFrontierMemoryDiagnostics(): FrontierMemoryDiagnostics {
+    let frontiers = 0;
+    let candidateSlots = 0;
+    let expandedSlots = 0;
+    let emptyRzRefs = 0;
+    let nonEmptyRzRefs = 0;
+    const uniqueEmptyRzs = new Set<ProofCertificateRZ>();
+
+    for (const fr of this.nodeFrontierCache.values()) {
+      frontiers++;
+      for (const ch of fr.children) {
+        candidateSlots++;
+        if (ch.expanded) expandedSlots++;
+        for (const rz of [ch.proofRz, ch.disproofRz]) {
+          if (rz.size === 0) {
+            emptyRzRefs++;
+            uniqueEmptyRzs.add(rz);
+          } else {
+            nonEmptyRzRefs++;
+          }
+        }
+      }
+    }
+
+    return {
+      frontiers,
+      candidateSlots,
+      expandedSlots,
+      emptyRzRefs,
+      nonEmptyRzRefs,
+      uniqueEmptyRzInstances: uniqueEmptyRzs.size,
+      engineEstimatedBytes: this.computeEstimatedBytes(),
+      stateTableEntries: this.stateTable.length,
+      historyTableEntries: this.historyTable.length,
+      dagNodes: this.proofDagNodes.length,
+      revalCacheEntries: this.revalCache.size,
+      ttEntries: this.ttStore.size,
+    };
   }
 
   private midSearch(
@@ -1463,6 +2597,8 @@ export class DfpnSolver {
     this.numNodes++;
     const entryCallIndex = this.numNodes;
     const isOrNode = pos.toPlay === context.rootAttacker;
+    const residualMode = this.getResidualReplayMode();
+    const residualActiveHere = residualMode !== 'off' && !isOrNode && depth <= 1;
     const traceThisNode =
       this.tracePathFilterSet !== null &&
       this.tracePathFilterSet.has(currentPath);
@@ -1516,10 +2652,10 @@ export class DfpnSolver {
       const outcome = isWin ? ProofOutcome.ProvenWin : ProofOutcome.ProvenLoss;
       const proofRz = isWin
         ? new ProofCertificateRZ(term.leafCertificateRz)
-        : new ProofCertificateRZ();
+        : ProofCertificateRZ.EMPTY;
       const disproofRz = !isWin
         ? new ProofCertificateRZ(term.leafCertificateRz)
-        : new ProofCertificateRZ();
+        : ProofCertificateRZ.EMPTY;
 
       const dagNodeId = this.proofDagNodes.length;
       const stEntry = this.stateTable[currentStateId];
@@ -1586,8 +2722,8 @@ export class DfpnSolver {
         dn: 1,
         outcome: ProofOutcome.Unknown,
         koDependent: false,
-        proofRz: new ProofCertificateRZ(),
-        disproofRz: new ProofCertificateRZ(),
+        proofRz: ProofCertificateRZ.EMPTY,
+        disproofRz: ProofCertificateRZ.EMPTY,
         dagNodeId: -1,
         exitReason: 'cycle',
       };
@@ -1608,8 +2744,8 @@ export class DfpnSolver {
         dn: 1,
         outcome: ProofOutcome.Unknown,
         koDependent: false,
-        proofRz: new ProofCertificateRZ(),
-        disproofRz: new ProofCertificateRZ(),
+        proofRz: ProofCertificateRZ.EMPTY,
+        disproofRz: ProofCertificateRZ.EMPTY,
         dagNodeId: -1,
         exitReason: 'depth_limit',
       };
@@ -1628,8 +2764,8 @@ export class DfpnSolver {
         dn: 1,
         outcome: ProofOutcome.Unknown,
         koDependent: false,
-        proofRz: new ProofCertificateRZ(),
-        disproofRz: new ProofCertificateRZ(),
+        proofRz: ProofCertificateRZ.EMPTY,
+        disproofRz: ProofCertificateRZ.EMPTY,
         dagNodeId: -1,
         exitReason: 'node_limit',
       };
@@ -1648,8 +2784,8 @@ export class DfpnSolver {
         dn: 1,
         outcome: ProofOutcome.Unknown,
         koDependent: false,
-        proofRz: new ProofCertificateRZ(),
-        disproofRz: new ProofCertificateRZ(),
+        proofRz: ProofCertificateRZ.EMPTY,
+        disproofRz: ProofCertificateRZ.EMPTY,
         dagNodeId: -1,
         exitReason: 'memory_limit',
       };
@@ -1824,6 +2960,16 @@ export class DfpnSolver {
 
       if (this.config.enableFastCaptureOrdering) {
         scored.sort((a, b) => b.meta.score - a.meta.score);
+        const probeCfg = this.resolveShortProbeConfig();
+        if (probeCfg.enabled && isOrNode && depth <= probeCfg.maxProbeSearchDepth) {
+          this.runShortTacticalProbeOnOrFrontier(
+            pos,
+            context,
+            regionCoords,
+            tacCtx!,
+            scored
+          );
+        }
       }
 
       const children: SearchChildSlot[] = scored.map(({ mv, meta }, idx) => {
@@ -1846,8 +2992,8 @@ export class DfpnSolver {
           hasCapture: false,
           checkedNullMoveDagId: -1,
           dagNodeId: -1,
-          proofRz: new ProofCertificateRZ(),
-          disproofRz: new ProofCertificateRZ(),
+          proofRz: ProofCertificateRZ.EMPTY,
+          disproofRz: ProofCertificateRZ.EMPTY,
         };
       });
 
@@ -1877,8 +3023,8 @@ export class DfpnSolver {
     let finalPn = 1;
     let finalDn = 1;
     let finalOutcome = ProofOutcome.Unknown;
-    let finalProofRz = new ProofCertificateRZ();
-    let finalDisproofRz = new ProofCertificateRZ();
+    let finalProofRz = ProofCertificateRZ.EMPTY;
+    let finalDisproofRz = ProofCertificateRZ.EMPTY;
     let finalDagNodeId = -1;
     let traceExitReason = 'unknown';
     let lastWindowSize = children.length;
@@ -2457,6 +3603,30 @@ export class DfpnSolver {
         bestMetric = children[forceExpandPassIdx].dn;
         secondBestMetric = PN_DN_SATURATION;
       } else {
+        let divGroupSizes: Map<ResidualDivergenceKind, number> | null = null;
+        if (residualActiveHere && hasActiveRz) {
+          for (let k = 0; k < activeIndices.length; k++) {
+            const ch = children[activeIndices[k]];
+            if (
+              ch.outcome === ProofOutcome.Unknown &&
+              !ch.koDependent &&
+              ch.firstDivergence
+            ) {
+              if (!divGroupSizes) divGroupSizes = new Map();
+              divGroupSizes.set(
+                ch.firstDivergence,
+                (divGroupSizes.get(ch.firstDivergence) ?? 0) + 1
+              );
+            }
+          }
+        }
+        const getTieRank = (ch: SearchChildSlot): [number, number] => [
+          ch.firstDivergence && divGroupSizes
+            ? divGroupSizes.get(ch.firstDivergence) ?? 0
+            : 0,
+          (ch.subtreeWorkNodes ?? 0) > 0 ? 1 : 0,
+        ];
+
         for (let k = 0; k < activeIndices.length; k++) {
           const i = activeIndices[k];
           if (children[i].koDependent) continue;
@@ -2465,6 +3635,18 @@ export class DfpnSolver {
             secondBestMetric = bestMetric;
             bestMetric = m;
             bestIdx = i;
+          } else if (m === bestMetric) {
+            secondBestMetric = m;
+            if (divGroupSizes && bestIdx >= 0) {
+              const [candGrp, candWork] = getTieRank(children[i]);
+              const [bestGrp, bestWork] = getTieRank(children[bestIdx]);
+              if (
+                candGrp > bestGrp ||
+                (candGrp === bestGrp && candWork > bestWork)
+              ) {
+                bestIdx = i;
+              }
+            }
           } else if (m < secondBestMetric) {
             secondBestMetric = m;
           }
@@ -2563,6 +3745,48 @@ export class DfpnSolver {
       }
       mpc.hasCapture = playRes.capturedCoords.length > 0;
 
+      // Just-In-Time (JIT) sibling proof replay before descending into unresolved AND child
+      if (
+        residualActiveHere &&
+        mpc.outcome === ProofOutcome.Unknown &&
+        frontier.provenSources &&
+        frontier.provenSources.length > 0
+      ) {
+        let jitClosed = false;
+        const mpcSgf = coordToSgf(mpc.move, pos.boardSize);
+        for (let si = 0; si < frontier.provenSources.length; si++) {
+          const src = frontier.provenSources[si];
+          const res = this.tryReplaySourceOnSiblingSlot(
+            mpc,
+            nextPos,
+            mpc.hasCapture,
+            pos,
+            currentStateId,
+            isOrNode,
+            src,
+            residualMode,
+            context,
+            regionCoords
+          );
+          if (res === 'closed') {
+            this.residualDiag.sourceClosureEvents.push({
+              parentPath: this.derivePathFromStateTable(
+                currentStateId,
+                pos.boardSize
+              ),
+              sourceMoveSgf: coordToSgf(src.move, pos.boardSize),
+              sourceDagId: src.dagId,
+              closedMovesSgf: [mpcSgf],
+              failedMovesSgf: [],
+              prefilterSkippedMovesSgf: [],
+            });
+            jitClosed = true;
+            break;
+          }
+        }
+        if (jitClosed) continue;
+      }
+
       const childPath =
         this.tracePathFilterSet !== null
           ? currentPath
@@ -2570,6 +3794,7 @@ export class DfpnSolver {
             : coordToSgf(mpc.move, pos.boardSize)
           : '';
 
+      const nodesBeforeChild = residualActiveHere ? this.numNodes : 0;
       const subRes = this.midSearch(
         nextPos,
         context,
@@ -2582,6 +3807,10 @@ export class DfpnSolver {
         inPathHashes,
         childPath
       );
+      if (residualActiveHere) {
+        mpc.subtreeWorkNodes =
+          (mpc.subtreeWorkNodes ?? 0) + (this.numNodes - nodesBeforeChild);
+      }
 
       mpc.pn = subRes.pn;
       mpc.dn = subRes.dn;
@@ -2606,6 +3835,150 @@ export class DfpnSolver {
         mpc.dn = Math.floor(PN_DN_SATURATION / 2);
         frontier.anyKoDependent = true;
         this.koDependentRejections++;
+      }
+
+      if (
+        this.shortProbeDiag.firstParentUsableSubproof === null &&
+        !mpc.koDependent &&
+        mpc.dagNodeId >= 0 &&
+        (mpc.outcome === ProofOutcome.ProvenWin ||
+          mpc.outcome === ProofOutcome.ProvenLoss)
+      ) {
+        const usableEv: ParentUsableSubproofEvent = {
+          callIndex: this.numNodes,
+          parentPath: this.derivePathFromStateTable(
+            currentStateId,
+            pos.boardSize
+          ),
+          closedMoveSgf: coordToSgf(mpc.move, pos.boardSize),
+          outcome: mpc.outcome,
+          dagNodeId: mpc.dagNodeId,
+        };
+        this.shortProbeDiag.firstParentUsableSubproof = usableEv;
+      }
+
+      // Residual defense divergence classification & sibling replay hook (default OFF)
+      if (
+        residualActiveHere &&
+        !mpc.koDependent &&
+        mpc.pn === 0 &&
+        mpc.outcome === ProofOutcome.ProvenWin &&
+        mpc.dagNodeId >= 0
+      ) {
+        if (depth <= 1 && this.residualDiag.rootFirstSourceCallIndex === null) {
+          this.residualDiag.rootFirstSourceCallIndex = this.numNodes;
+        }
+        if (!frontier.provenSources) frontier.provenSources = [];
+        const alreadyRecorded = frontier.provenSources.some(
+          (s) => s.dagId === mpc.dagNodeId
+        );
+        if (!alreadyRecorded) {
+          const srcObj = {
+            move: mpc.move,
+            dagId: mpc.dagNodeId,
+            rz: mpc.proofRz,
+          };
+          if (mpc.move === PASS_MOVE) {
+            frontier.provenSources.unshift(srcObj);
+          } else {
+            frontier.provenSources.push(srcObj);
+          }
+          this.residualDiag.sourcesRecorded++;
+
+          if (frontier.provenSources.length === 1 || mpc.move === PASS_MOVE) {
+            const tDiv0 = performance.now();
+            for (let si = 0; si < children.length; si++) {
+              const sib = children[si];
+              if (
+                sib === mpc ||
+                sib.outcome !== ProofOutcome.Unknown ||
+                sib.koDependent ||
+                sib.firstDivergence !== undefined ||
+                this.rzEngine.isOutsideRZCandidate(sib.move, mpc.proofRz)
+              ) {
+                continue;
+              }
+              const qPos = pos.clone();
+              const qPlay = qPos.playMove(sib.move);
+              if (!qPlay.legal || (qPlay.isKoCapture && restrictedSide)) continue;
+              const div = this.diagnoseFirstDivergence(
+                qPos,
+                context,
+                regionCoords,
+                mpc.dagNodeId,
+                ProofOutcome.ProvenWin
+              );
+              if (div !== null) {
+                sib.firstDivergence = div;
+                this.residualDiag.divergenceCounts[div]++;
+              }
+            }
+            this.residualDiag.divergenceClassifyTimeMs +=
+              performance.now() - tDiv0;
+          }
+
+          const expandedUnresolved = children.filter(
+            (s) =>
+              s !== mpc &&
+              s.expanded &&
+              s.outcome === ProofOutcome.Unknown &&
+              !s.koDependent
+          );
+          if (expandedUnresolved.length > 0) {
+            const mpcDiv = mpc.firstDivergence;
+            expandedUnresolved.sort((a, b) => {
+              const pa = mpcDiv !== undefined && a.firstDivergence === mpcDiv ? 0 : 1;
+              const pb = mpcDiv !== undefined && b.firstDivergence === mpcDiv ? 0 : 1;
+              return pa - pb;
+            });
+            const closedMovesSgf: string[] = [];
+            const failedMovesSgf: string[] = [];
+            const prefilterSkippedMovesSgf: string[] = [];
+
+            for (let si = 0; si < expandedUnresolved.length; si++) {
+              const sib = expandedUnresolved[si];
+              const qPos = pos.clone();
+              const qPlay = qPos.playMove(sib.move);
+              if (!qPlay.legal || (qPlay.isKoCapture && restrictedSide)) continue;
+              const sibSgf = coordToSgf(sib.move, pos.boardSize);
+              const res = this.tryReplaySourceOnSiblingSlot(
+                sib,
+                qPos,
+                qPlay.capturedCoords.length > 0,
+                pos,
+                currentStateId,
+                isOrNode,
+                srcObj,
+                residualMode,
+                context,
+                regionCoords
+              );
+              if (res === 'closed') closedMovesSgf.push(sibSgf);
+              else if (res === 'failed') failedMovesSgf.push(sibSgf);
+              else if (res === 'prefilter_skip') {
+                prefilterSkippedMovesSgf.push(sibSgf);
+              }
+            }
+
+            if (
+              depth <= 1 ||
+              closedMovesSgf.length > 0 ||
+              failedMovesSgf.length > 0
+            ) {
+              this.residualDiag.sourceClosureEvents.push({
+                parentPath: this.derivePathFromStateTable(
+                  currentStateId,
+                  pos.boardSize
+                ),
+                sourceMoveSgf: coordToSgf(mpc.move, pos.boardSize),
+                sourceDagId: mpc.dagNodeId,
+                closedMovesSgf,
+                failedMovesSgf,
+                prefilterSkippedMovesSgf,
+              });
+            }
+          }
+        }
       }
 
       // Record compact sibling certificate RZ for OutsideRZRevalidated pruning (FR-5.5).

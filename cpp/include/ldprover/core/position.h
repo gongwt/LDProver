@@ -56,6 +56,9 @@ class Position {
   uint8_t ConsecutivePasses() const noexcept { return consecutive_passes_; }
   bool IsAtDoublePass() const noexcept { return consecutive_passes_ >= 2; }
   uint64_t ZobristHash() const noexcept { return zobrist_hash_; }
+  uint64_t RecomputeZobristForTest() const noexcept {
+    return ComputeZobrist();
+  }
   uint64_t SurvivingTargetTokensMask() const noexcept {
     return surviving_target_tokens_mask_;
   }
@@ -123,6 +126,13 @@ class Position {
   const std::vector<int16_t>& PlayedMoveTrace() const noexcept {
     return played_move_trace_;
   }
+
+  struct OrthoNeighborList {
+    int16_t coords[4]{};
+    uint8_t count = 0;
+  };
+  static OrthoNeighborList PrecomputedOrthogonalNeighborsForTest(
+      int coord) noexcept;
 
   std::vector<int> OrthogonalNeighbors(int coord) const;
   std::vector<int> DiagonalNeighbors(int coord) const;

@@ -7,7 +7,35 @@
 
 #include "ldprover/tt/transposition_table.h"
 
+#include <chrono>
+
 namespace ldprover {
+
+namespace {
+
+using SteadyClock = std::chrono::steady_clock;
+
+uint64_t ElapsedNs(SteadyClock::time_point t0,
+                   SteadyClock::time_point t1) noexcept {
+  const auto diff =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+  return diff > 0 ? static_cast<uint64_t>(diff) : 0ULL;
+}
+
+}  // namespace
+
+template <int N>
+TTProfileStats TranspositionStore<N>::ProfileStats() const noexcept {
+  TTProfileStats out = profile_stats_;
+  out.board_bucket_count = static_cast<uint64_t>(board_buckets_.size());
+  uint64_t total_board = 0;
+  for (const auto& kv : board_buckets_) {
+    total_board += static_cast<uint64_t>(kv.second.size());
+  }
+  out.board_total_entries = total_board;
+  out.pattern_entry_count = static_cast<uint64_t>(pattern_entries_.size());
+  return out;
+}
 
 template <int N>
 void TranspositionStore<N>::ClearAll() noexcept {
@@ -19,18 +47,43 @@ void TranspositionStore<N>::ClearAll() noexcept {
   pattern_hits_ = 0;
   pattern_proof_reusable_hits_ = 0;
   ghi_rejected_count_ = 0;
+  profile_stats_ = TTProfileStats{};
 }
 
 template <int N>
 std::optional<BoardTTEntry<N>> TranspositionStore<N>::LookupBoardTT(
     const Position<N>& pos, const ProofContext& context,
     const RevalidateFn& revalidate_fn) {
+  const bool prof = profiling_enabled_;
+  const SteadyClock::time_point fn_t0 =
+      prof ? SteadyClock::now() : SteadyClock::time_point{};
+  uint64_t scanned = 0;
+  uint64_t reval_cb_ns = 0;
+  struct Guard {
+    bool enabled;
+    SteadyClock::time_point t0;
+    uint64_t* scanned_ptr;
+    uint64_t* cb_ns_ptr;
+    TTProfileStats* stats;
+    ~Guard() {
+      if (!enabled) return;
+      const uint64_t total_ns = ElapsedNs(t0, SteadyClock::now());
+      stats->board_entries_scanned += *scanned_ptr;
+      stats->board_lookup_exclusive_ns +=
+          (total_ns > *cb_ns_ptr) ? (total_ns - *cb_ns_ptr) : 0ULL;
+    }
+  } guard{prof, fn_t0, &scanned, &reval_cb_ns, &profile_stats_};
+
+  if (prof) ++profile_stats_.board_queries;
+
   auto it = board_buckets_.find(pos.ZobristHash());
   if (it == board_buckets_.end()) return std::nullopt;
+  if (prof) ++profile_stats_.board_bucket_hits;
 
   const bool query_monotonic = pos.IsCaptureFreeMonotonicHistory();
 
   for (const auto& entry : it->second) {
+    if (prof) ++scanned;
     // FR-6.1 & C-6: Hash only locates bucket; verify full structural equality.
     if (entry.proof_context_id != context.context_id ||
         !(entry.full_context == context) ||
@@ -45,6 +98,7 @@ std::optional<BoardTTEntry<N>> TranspositionStore<N>::LookupBoardTT(
 
     // Verify canonical HistorySet equality under active KoRule, with O(1)
     // monotonic stone-count certificate & GHI revalidation fallback.
+    bool via_reval = false;
     if (context.ko_rule != KoRule::kSimpleKoOnly) {
       const bool monotonic_safe = query_monotonic &&
                                   entry.source_monotonic_history &&
@@ -71,10 +125,20 @@ std::optional<BoardTTEntry<N>> TranspositionStore<N>::LookupBoardTT(
         if (!hist_ok) {
           if (entry.proof_closure_available &&
               entry.outcome != ProofOutcome::kUnknown && revalidate_fn) {
-            if (!revalidate_fn(entry.proof_dag_node_id, entry.outcome)) {
+            bool reval_ok = false;
+            if (prof) {
+              ++profile_stats_.board_reval_entered;
+              const auto r0 = SteadyClock::now();
+              reval_ok = revalidate_fn(entry.proof_dag_node_id, entry.outcome);
+              reval_cb_ns += ElapsedNs(r0, SteadyClock::now());
+            } else {
+              reval_ok = revalidate_fn(entry.proof_dag_node_id, entry.outcome);
+            }
+            if (!reval_ok) {
               ++ghi_rejected_count_;
               continue;
             }
+            via_reval = true;
           } else {
             continue;
           }
@@ -82,6 +146,13 @@ std::optional<BoardTTEntry<N>> TranspositionStore<N>::LookupBoardTT(
       }
     }
 
+    if (prof) {
+      if (via_reval) {
+        ++profile_stats_.board_reval_succeeded;
+      } else {
+        ++profile_stats_.board_exact_or_monotonic_hits;
+      }
+    }
     ++board_hits_;
     return entry;
   }
@@ -97,6 +168,20 @@ void TranspositionStore<N>::StoreBoardTT(
     const ProofCertificateRZ<N>& disproof_rz, bool has_capture_in_subtree) {
   // FR-5.7: KoDependent states must never be stored as decisive proof entries.
   if (is_ko_dependent && outcome != ProofOutcome::kUnknown) return;
+
+  const bool prof = profiling_enabled_;
+  const SteadyClock::time_point fn_t0 =
+      prof ? SteadyClock::now() : SteadyClock::time_point{};
+  struct StoreGuard {
+    bool enabled;
+    SteadyClock::time_point t0;
+    TTProfileStats* stats;
+    ~StoreGuard() {
+      if (!enabled) return;
+      ++stats->board_store_calls;
+      stats->board_store_ns += ElapsedNs(t0, SteadyClock::now());
+    }
+  } guard{prof, fn_t0, &profile_stats_};
 
   auto history_sets_equal = [&](const std::vector<CanonicalSnapshot<N>>& a,
                                 const std::vector<CanonicalSnapshot<N>>& b) {
@@ -168,11 +253,37 @@ template <int N>
 PatternHitGrade TranspositionStore<N>::LookupPatternTT(
     const Position<N>& pos, const ProofContext& context,
     RadixPatternRecord<N>* out_record, const RevalidateFn& revalidate_fn) {
+  const bool prof = profiling_enabled_;
+  const SteadyClock::time_point fn_t0 =
+      prof ? SteadyClock::now() : SteadyClock::time_point{};
+  uint64_t scanned = 0;
+  uint64_t ctx_matched = 0;
+  uint64_t reval_cb_ns = 0;
+  struct Guard {
+    bool enabled;
+    SteadyClock::time_point t0;
+    uint64_t* scanned_ptr;
+    uint64_t* ctx_ptr;
+    uint64_t* cb_ns_ptr;
+    TTProfileStats* stats;
+    ~Guard() {
+      if (!enabled) return;
+      const uint64_t total_ns = ElapsedNs(t0, SteadyClock::now());
+      stats->pattern_entries_scanned += *scanned_ptr;
+      stats->pattern_context_matched += *ctx_ptr;
+      stats->pattern_scan_exclusive_ns +=
+          (total_ns > *cb_ns_ptr) ? (total_ns - *cb_ns_ptr) : 0ULL;
+    }
+  } guard{prof, fn_t0, &scanned, &ctx_matched, &reval_cb_ns, &profile_stats_};
+
+  if (prof) ++profile_stats_.pattern_queries;
+
   const RadixPatternRecord<N>* first_heuristic = nullptr;
   int reval_attempts = 0;
   constexpr int kMaxRevalAttempts = 6;
 
   for (size_t idx = pattern_entries_.size(); idx-- > 0;) {
+    if (prof) ++scanned;
     auto& rec = pattern_entries_[idx];
     if (rec.proof_context_id != context.context_id ||
         rec.to_play != pos.ToPlay() ||
@@ -180,6 +291,7 @@ PatternHitGrade TranspositionStore<N>::LookupPatternTT(
         rec.surviving_tokens_mask != pos.SurvivingTargetTokensMask()) {
       continue;
     }
+    if (prof) ++ctx_matched;
 
     // Project current position onto stored_rz (FR-6.3, FR-6.5 same-coordinate).
     const BitBoard<N>& zone_bits = rec.stored_rz.Bits();
@@ -204,6 +316,7 @@ PatternHitGrade TranspositionStore<N>::LookupPatternTT(
 
     rec.last_touch_seq = ++touch_seq_;
     ++pattern_hits_;
+    if (prof) ++profile_stats_.pattern_geom_matched;
 
     // Two-grade classification (FR-6.3, FR-6.9):
     const bool full_board_equal =
@@ -232,6 +345,7 @@ PatternHitGrade TranspositionStore<N>::LookupPatternTT(
     if (full_board_equal && full_hist_equal && rec.proof_closure_available &&
         !rec.ghi_flag) {
       ++pattern_proof_reusable_hits_;
+      if (prof) ++profile_stats_.pattern_direct_exact_hits;
       if (out_record != nullptr) *out_record = rec;
       return PatternHitGrade::kProofReusable;
     }
@@ -239,8 +353,18 @@ PatternHitGrade TranspositionStore<N>::LookupPatternTT(
     if (revalidate_fn && rec.proof_closure_available && !rec.ghi_flag &&
         reval_attempts < kMaxRevalAttempts) {
       ++reval_attempts;
-      if (revalidate_fn(rec.proof_dag_node_id, rec.outcome)) {
+      bool reval_ok = false;
+      if (prof) {
+        ++profile_stats_.pattern_reval_entered;
+        const auto r0 = SteadyClock::now();
+        reval_ok = revalidate_fn(rec.proof_dag_node_id, rec.outcome);
+        reval_cb_ns += ElapsedNs(r0, SteadyClock::now());
+      } else {
+        reval_ok = revalidate_fn(rec.proof_dag_node_id, rec.outcome);
+      }
+      if (reval_ok) {
         ++pattern_proof_reusable_hits_;
+        if (prof) ++profile_stats_.pattern_reval_succeeded;
         if (out_record != nullptr) *out_record = rec;
         return PatternHitGrade::kProofReusable;
       }
@@ -255,6 +379,7 @@ PatternHitGrade TranspositionStore<N>::LookupPatternTT(
   }
 
   if (first_heuristic != nullptr) {
+    if (prof) ++profile_stats_.pattern_heuristic_hits;
     if (out_record != nullptr) *out_record = *first_heuristic;
     return PatternHitGrade::kHeuristicOnly;
   }
@@ -268,6 +393,19 @@ void TranspositionStore<N>::StorePatternTT(
     ProofOutcome outcome, uint32_t proof_dag_node_id,
     bool proof_closure_available, bool has_capture_in_subtree) {
   if (outcome == ProofOutcome::kUnknown || zone.Size() == 0) return;
+  const bool prof = profiling_enabled_;
+  const SteadyClock::time_point fn_t0 =
+      prof ? SteadyClock::now() : SteadyClock::time_point{};
+  struct StoreGuard {
+    bool enabled;
+    SteadyClock::time_point t0;
+    TTProfileStats* stats;
+    ~StoreGuard() {
+      if (!enabled) return;
+      ++stats->pattern_store_calls;
+      stats->pattern_store_ns += ElapsedNs(t0, SteadyClock::now());
+    }
+  } guard{prof, fn_t0, &profile_stats_};
   RadixPatternRecord<N> rec;
   rec.proof_context_id = context.context_id;
   rec.to_play = pos.ToPlay();

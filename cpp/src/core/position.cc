@@ -41,6 +41,28 @@ struct ZobristTable {
 
 constexpr ZobristTable kZobrist{};
 
+template <int N>
+struct OrthoNeighborTable {
+  std::array<typename Position<N>::OrthoNeighborList, N * N> entries{};
+
+  constexpr OrthoNeighborTable() noexcept {
+    for (int coord = 0; coord < N * N; ++coord) {
+      const int r = coord / N;
+      const int c = coord % N;
+      auto& e = entries[coord];
+      uint8_t k = 0;
+      if (r > 0) e.coords[k++] = static_cast<int16_t>((r - 1) * N + c);
+      if (r + 1 < N) e.coords[k++] = static_cast<int16_t>((r + 1) * N + c);
+      if (c > 0) e.coords[k++] = static_cast<int16_t>(r * N + (c - 1));
+      if (c + 1 < N) e.coords[k++] = static_cast<int16_t>(r * N + (c + 1));
+      e.count = k;
+    }
+  }
+};
+
+template <int N>
+inline constexpr OrthoNeighborTable<N> kOrthoNeighbors{};
+
 }  // namespace
 
 template <int N>
@@ -125,6 +147,13 @@ uint64_t Position<N>::ComputeZobrist() const noexcept {
 }
 
 template <int N>
+typename Position<N>::OrthoNeighborList
+Position<N>::PrecomputedOrthogonalNeighborsForTest(int coord) noexcept {
+  if (coord < 0 || coord >= N * N) return OrthoNeighborList{};
+  return kOrthoNeighbors<N>.entries[coord];
+}
+
+template <int N>
 std::vector<int> Position<N>::OrthogonalNeighbors(int coord) const {
   std::vector<int> nb;
   nb.reserve(4);
@@ -155,6 +184,7 @@ BitBoard<N> Position<N>::FloodFillChain(int start_coord,
                                         BitBoard<N>* out_liberties) const {
   BitBoard<N> chain;
   if (out_liberties != nullptr) out_liberties->Clear();
+  if (start_coord < 0 || start_coord >= N * N) return chain;
   const Color color = StoneAt(start_coord);
   if (color == Color::kEmpty) return chain;
 
@@ -165,7 +195,9 @@ BitBoard<N> Position<N>::FloodFillChain(int start_coord,
   while (!q.empty()) {
     const int cur = q.front();
     q.pop();
-    for (int nb : OrthogonalNeighbors(cur)) {
+    const auto& nbs = kOrthoNeighbors<N>.entries[cur];
+    for (uint8_t i = 0; i < nbs.count; ++i) {
+      const int nb = nbs.coords[i];
       const Color nb_color = StoneAt(nb);
       if (nb_color == Color::kEmpty) {
         if (out_liberties != nullptr) out_liberties->Set(nb, true);
@@ -225,10 +257,15 @@ bool Position<N>::PlayMove(int16_t move, bool* out_is_ko_capture) noexcept {
   };
 
   if (move == kPassMove) {
+    uint64_t next_hash = zobrist_hash_;
+    if (undo.prev_ko_point >= 0 && undo.prev_ko_point < N * N) {
+      next_hash ^= kZobrist.ko_keys[undo.prev_ko_point];
+    }
+    next_hash ^= kZobrist.white_to_play_key;
     ko_point_ = kNullMove;
     ++consecutive_passes_;
     to_play_ = OppositeColor(to_play_);
-    zobrist_hash_ = ComputeZobrist();
+    zobrist_hash_ = next_hash;
     undo_stack_.push_back(undo);
     played_move_trace_.push_back(kPassMove);
     history_snapshots_.push_back(CurrentCanonicalSnapshot());
@@ -242,6 +279,13 @@ bool Position<N>::PlayMove(int16_t move, bool* out_is_ko_capture) noexcept {
 
   const Color us = to_play_;
   const Color them = OppositeColor(us);
+  const int us_idx = (us == Color::kBlack) ? 1 : 2;
+  const int them_idx = (them == Color::kBlack) ? 1 : 2;
+  uint64_t next_hash = zobrist_hash_;
+  if (undo.prev_ko_point >= 0 && undo.prev_ko_point < N * N) {
+    next_hash ^= kZobrist.ko_keys[undo.prev_ko_point];
+  }
+  next_hash ^= kZobrist.stone_keys[us_idx][move];
   if (us == Color::kBlack) {
     black_stones_.Set(move, true);
   } else {
@@ -250,7 +294,9 @@ bool Position<N>::PlayMove(int16_t move, bool* out_is_ko_capture) noexcept {
 
   BitBoard<N> captured_stones;
   int last_captured_coord = kNullMove;
-  for (int nb : OrthogonalNeighbors(move)) {
+  const auto& move_nbs = kOrthoNeighbors<N>.entries[move];
+  for (uint8_t i = 0; i < move_nbs.count; ++i) {
+    const int nb = move_nbs.coords[i];
     if (StoneAt(nb) == them && !captured_stones.Get(nb)) {
       BitBoard<N> liberties;
       BitBoard<N> enemy_chain = FloodFillChain(nb, &liberties);
@@ -266,6 +312,7 @@ bool Position<N>::PlayMove(int16_t move, bool* out_is_ko_capture) noexcept {
       last_captured_coord = coord;
       black_stones_.Reset(coord);
       white_stones_.Reset(coord);
+      next_hash ^= kZobrist.stone_keys[them_idx][coord];
       // FR-2.6: Permanently clear captured target tokens (non-revivable).
       for (size_t t = 0; t < context_.initial_tokens.size() && t < 64; ++t) {
         if (context_.initial_tokens[t].initial_coord == coord) {
@@ -294,10 +341,15 @@ bool Position<N>::PlayMove(int16_t move, bool* out_is_ko_capture) noexcept {
     if (out_is_ko_capture != nullptr) *out_is_ko_capture = true;
   }
 
+  if (next_ko >= 0 && next_ko < N * N) {
+    next_hash ^= kZobrist.ko_keys[next_ko];
+  }
+  next_hash ^= kZobrist.white_to_play_key;
+
   ko_point_ = next_ko;
   consecutive_passes_ = 0;
   to_play_ = them;
-  zobrist_hash_ = ComputeZobrist();
+  zobrist_hash_ = next_hash;
 
   // FR-2.2: Enforce SSK/PSK against full canonical history snapshots.
   if (context_.ko_rule != KoRule::kSimpleKoOnly) {
@@ -345,10 +397,14 @@ std::vector<int16_t> Position<N>::GenerateLegalMoves(
   std::vector<int16_t> moves;
   if (IsAtDoublePass()) return moves;
 
+  Position<N> scratch = *this;
   for (int coord = 0; coord < N * N; ++coord) {
     if (region_filter.has_value() && !region_filter->Get(coord)) continue;
-    if (IsLegalMove(static_cast<int16_t>(coord))) {
+    if (scratch.StoneAt(coord) != Color::kEmpty) continue;
+    if (coord == scratch.ko_point_) continue;
+    if (scratch.PlayMove(static_cast<int16_t>(coord))) {
       moves.push_back(static_cast<int16_t>(coord));
+      scratch.UndoMove();
     }
   }
   moves.push_back(kPassMove);  // FR-2.3: pass is always legal before double-pass

@@ -70,3 +70,13 @@ target_link_libraries(ldprover_r5_tests PRIVATE
 )
 add_test(NAME ldprover_r5_tests COMMAND ldprover_r5_tests)
 
+# Versioned CLI Boundary & Path-Reservation Regression Suite (R22/R23 P1 & P2)
+add_executable(ldprover_cli_tests
+  tests/cli_boundary_test.cc
+)
+add_test(
+  NAME ldprover_cli_tests
+  COMMAND ldprover_cli_tests $<TARGET_FILE:tprover> ${CMAKE_CURRENT_SOURCE_DIR}/../public/tsumego
+)
+set_tests_properties(ldprover_cli_tests PROPERTIES SKIP_RETURN_CODE 77)
+

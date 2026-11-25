@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <utility>
@@ -16,6 +17,15 @@
 namespace ldprover {
 
 namespace {
+
+using SteadyClock = std::chrono::steady_clock;
+
+uint64_t ElapsedNs(SteadyClock::time_point t0,
+                   SteadyClock::time_point t1) noexcept {
+  const auto diff =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+  return diff > 0 ? static_cast<uint64_t>(diff) : 0ULL;
+}
 
 constexpr uint32_t ClampSat(uint64_t val) noexcept {
   return val >= kPnDnSaturation ? kPnDnSaturation : static_cast<uint32_t>(val);
@@ -29,6 +39,61 @@ std::string HexU64Compact(uint64_t v) {
     v >>= 4;
   }
   return out;
+}
+
+template <int N>
+std::string FormatMoveSgfForTrace(int16_t mv) {
+  if (mv == kPassMove) return "pass";
+  if (mv < 0 || mv >= N * N) return "null";
+  const int r = mv / N;
+  const int c = mv % N;
+  std::string s(2, 'a');
+  s[0] = static_cast<char>('a' + c);
+  s[1] = static_cast<char>('a' + r);
+  return s;
+}
+
+template <int N>
+std::string FormatTracePath(const std::vector<int16_t>& moves) {
+  std::string out;
+  for (size_t i = 0; i < moves.size(); ++i) {
+    if (i > 0U) out.push_back('/');
+    out.append(FormatMoveSgfForTrace<N>(moves[i]));
+  }
+  return out;
+}
+
+std::string NormalizeObservedPath(std::string raw) {
+  size_t b = 0;
+  size_t e = raw.size();
+  while (b < e && (raw[b] == ' ' || raw[b] == '/')) ++b;
+  while (e > b && (raw[e - 1U] == ' ' || raw[e - 1U] == '/')) --e;
+  raw = raw.substr(b, e - b);
+  if (raw == "root") return "";
+  return raw;
+}
+
+bool PathHasPrefix(const std::string& path, const std::string& prefix) {
+  if (prefix.empty()) return true;
+  if (path == prefix) return true;
+  return path.size() > prefix.size() && path[prefix.size()] == '/' &&
+         path.compare(0, prefix.size(), prefix) == 0;
+}
+
+std::vector<std::string> SplitPathSegments(const std::string& path) {
+  std::vector<std::string> segs;
+  if (path.empty()) return segs;
+  size_t start = 0;
+  while (start < path.size()) {
+    const size_t slash = path.find('/', start);
+    if (slash == std::string::npos) {
+      segs.push_back(path.substr(start));
+      break;
+    }
+    if (slash > start) segs.push_back(path.substr(start, slash - start));
+    start = slash + 1U;
+  }
+  return segs;
 }
 
 }  // namespace
@@ -53,6 +118,36 @@ SolveReport<N> DfpnSolver<N>::Solve(
     const std::string& problem_id) {
   // FR-6.2: Clear BoardTT, PatternTT, and per-solve caches at problem start.
   tt_store_.ClearAll();
+  tt_store_.SetProfilingEnabled(config_.enable_stage_profiling);
+  stage_profile_ = SolverStageProfile{};
+  stage_profile_.enabled = config_.enable_stage_profiling;
+  convergence_trace_ = ConvergenceTraceReport{};
+  convergence_trace_.enabled = config_.enable_convergence_trace;
+  if (config_.enable_convergence_trace) {
+    for (const std::string& raw_p : config_.observed_paths) {
+      const std::string norm = NormalizeObservedPath(raw_p);
+      bool dup = false;
+      for (const auto& existing : convergence_trace_.watched_paths) {
+        if (existing.path == norm) {
+          dup = true;
+          break;
+        }
+      }
+      if (!dup) {
+        ObservedPathTrace wt;
+        wt.path = norm;
+        convergence_trace_.watched_paths.push_back(std::move(wt));
+      }
+    }
+    if (convergence_trace_.watched_paths.empty()) {
+      ObservedPathTrace wt;
+      wt.path = "";
+      convergence_trace_.watched_paths.push_back(std::move(wt));
+    }
+  }
+  const SteadyClock::time_point solve_t0 = config_.enable_stage_profiling
+                                               ? SteadyClock::now()
+                                               : SteadyClock::time_point{};
   node_frontier_cache_.clear();
   reval_cache_.clear();
   dag_has_capture_.clear();
@@ -196,7 +291,209 @@ SolveReport<N> DfpnSolver<N>::Solve(
       (report_.root_status == ProofOutcome::kProvenWin)
           ? report_.root_proof_rz.Size()
           : report_.root_disproof_rz.Size();
+
+  if (config_.enable_stage_profiling) {
+    stage_profile_.solve_total_ns = ElapsedNs(solve_t0, SteadyClock::now());
+    stage_profile_.tt = tt_store_.ProfileStats();
+    stage_profile_.live_frontiers_at_end =
+        static_cast<uint64_t>(node_frontier_cache_.size());
+    stage_profile_.reval_cache_entries =
+        static_cast<uint64_t>(reval_cache_.size());
+    stage_profile_.dag_nodes =
+        static_cast<uint64_t>(report_.proof_dag_nodes.size());
+    uint64_t benson_leaves = 0;
+    uint64_t tok_leaves = 0;
+    uint64_t dp_leaves = 0;
+    uint64_t pruned_nodes = 0;
+    uint64_t tt_nodes = 0;
+    for (const auto& dn : report_.proof_dag_nodes) {
+      if (dn.terminal_evidence == EvidenceKind::kBensonUca) ++benson_leaves;
+      else if (dn.terminal_evidence == EvidenceKind::kTokensCaptured) ++tok_leaves;
+      else if (dn.terminal_evidence == EvidenceKind::kDoublePassResolution) {
+        ++dp_leaves;
+      }
+      if (dn.is_pruned_outside_rz) ++pruned_nodes;
+      if (dn.is_tt_hit) ++tt_nodes;
+    }
+    stage_profile_.benson_uca_leaves = benson_leaves;
+    stage_profile_.tokens_captured_leaves = tok_leaves;
+    stage_profile_.double_pass_leaves = dp_leaves;
+    stage_profile_.pruned_outside_rz_dag_nodes = pruned_nodes;
+    stage_profile_.tt_hit_dag_nodes = tt_nodes;
+    stage_profile_.estimated_memory_bytes =
+        static_cast<uint64_t>(report_.proof_dag_nodes.size()) * 768ULL +
+        static_cast<uint64_t>(tt_store_.EstimatedEntryCount()) * 1024ULL +
+        static_cast<uint64_t>(node_frontier_cache_.size()) * 4096ULL +
+        static_cast<uint64_t>(reval_cache_.size()) * 128ULL;
+  }
+
+  if (config_.enable_convergence_trace) {
+    for (ObservedPathTrace& wt : convergence_trace_.watched_paths) {
+      if (wt.frontier_exists) continue;
+      uint64_t cur_pid = root_path_id;
+      bool cur_is_or = (initial_pos.ToPlay() == context.root_attacker);
+      uint32_t cur_depth = 0U;
+      const auto segs = SplitPathSegments(wt.path);
+      bool reachable = true;
+      for (const std::string& seg : segs) {
+        auto it = node_frontier_cache_.find(cur_pid);
+        if (it == node_frontier_cache_.end()) {
+          reachable = false;
+          break;
+        }
+        bool found_child = false;
+        for (const SearchChild& ch : it->second.children) {
+          if (FormatMoveSgfForTrace<N>(ch.move) == seg) {
+            cur_pid = ch.child_path_id;
+            cur_is_or = !cur_is_or;
+            ++cur_depth;
+            found_child = true;
+            break;
+          }
+        }
+        if (!found_child) {
+          reachable = false;
+          break;
+        }
+      }
+      if (!reachable) continue;
+      auto target_it = node_frontier_cache_.find(cur_pid);
+      if (target_it != node_frontier_cache_.end()) {
+        FinalizeObservedFrontier(target_it->second, cur_is_or, cur_depth,
+                                 region_hint, false, &wt);
+      }
+    }
+  }
   return report_;
+}
+
+template <int N>
+void DfpnSolver<N>::FinalizeObservedFrontier(
+    const CachedNodeFrontier& frontier, bool is_or_node, uint32_t depth,
+    const std::optional<BitBoard<N>>& region_hint, bool erased_on_proof,
+    ObservedPathTrace* out) const {
+  (void)region_hint;
+  out->frontier_exists = true;
+  out->frontier_erased_on_proof = erased_on_proof;
+  out->is_or_node = is_or_node;
+  out->total_legal_moves = static_cast<uint32_t>(frontier.children.size());
+  out->widening_level = frontier.widening_level;
+
+  size_t window_size = frontier.children.size();
+  if (config_.enable_progressive_widening && frontier.widening_level < 6U) {
+    const size_t base_k =
+        is_or_node
+            ? std::min<size_t>(static_cast<size_t>(config_.widening_base_k),
+                               depth == 0U ? 4U : 3U)
+            : std::min<size_t>(
+                  std::max<size_t>(
+                      2U, static_cast<size_t>(config_.widening_base_k) / 2U),
+                  3U);
+    const size_t cap = base_k << frontier.widening_level;
+    if (cap < frontier.children.size()) window_size = cap;
+  }
+  out->window_size = static_cast<uint32_t>(window_size);
+
+  const bool has_active_rz =
+      config_.enable_rz_pruning && frontier.has_null_move_rz &&
+      frontier.representative_dag_id != kInvalidDagNodeId;
+  out->has_active_rz_source = has_active_rz;
+  out->representative_move =
+      has_active_rz ? frontier.representative_move : kNullMove;
+  out->representative_move_sgf =
+      has_active_rz ? FormatMoveSgfForTrace<N>(frontier.representative_move)
+                    : "";
+  out->active_rz_size =
+      has_active_rz ? frontier.active_null_move_rz.Size() : 0;
+
+  out->closed_proven_win_direct = 0;
+  out->closed_proven_win_outside_rz = 0;
+  out->closed_proven_loss_direct = 0;
+  out->closed_proven_loss_outside_rz = 0;
+  out->deferred_outside_rz_count = 0;
+  out->ko_barrier_count = 0;
+  out->expanded_unknown_count = 0;
+  out->unexpanded_unknown_count = 0;
+  out->top_unclosed_children.clear();
+  out->watched_next_moves.clear();
+
+  std::vector<ObservedChildSummary> unclosed_candidates;
+  std::vector<std::string> direct_watched_next;
+  for (const auto& wp : convergence_trace_.watched_paths) {
+    if (out->path.empty()) {
+      if (!wp.path.empty() && wp.path.find('/') == std::string::npos) {
+        direct_watched_next.push_back(wp.path);
+      }
+    } else if (wp.path.size() > out->path.size() + 1U &&
+               wp.path.compare(0, out->path.size(), out->path) == 0 &&
+               wp.path[out->path.size()] == '/' &&
+               wp.path.find('/', out->path.size() + 1U) == std::string::npos) {
+      direct_watched_next.push_back(wp.path.substr(out->path.size() + 1U));
+    }
+  }
+
+  for (size_t i = 0; i < frontier.children.size(); ++i) {
+    const SearchChild& ch = frontier.children[i];
+    const bool deferred =
+        has_active_rz && !ch.probed && !ch.has_decisive_dag &&
+        ch.outcome == ProofOutcome::kUnknown &&
+        ch.checked_null_move_dag_id != frontier.representative_dag_id &&
+        rz_engine_.IsOutsideRZCandidate(ch.move, frontier.active_null_move_rz);
+    const bool in_win = has_active_rz ? !deferred : (i < window_size);
+
+    if (ch.outcome == ProofOutcome::kProvenWin && ch.has_decisive_dag) {
+      if (ch.pruned_outside_rz) ++out->closed_proven_win_outside_rz;
+      else ++out->closed_proven_win_direct;
+    } else if (ch.outcome == ProofOutcome::kProvenLoss && ch.has_decisive_dag) {
+      if (ch.pruned_outside_rz) ++out->closed_proven_loss_outside_rz;
+      else ++out->closed_proven_loss_direct;
+    } else if (ch.ko_dependent) {
+      ++out->ko_barrier_count;
+    } else if (deferred) {
+      ++out->deferred_outside_rz_count;
+    } else if (ch.probed) {
+      ++out->expanded_unknown_count;
+    } else {
+      ++out->unexpanded_unknown_count;
+    }
+
+    const std::string mv_sgf = FormatMoveSgfForTrace<N>(ch.move);
+    ObservedChildSummary sum;
+    sum.move_sgf = mv_sgf;
+    sum.move = ch.move;
+    sum.rank = static_cast<uint32_t>(i);
+    sum.tactical_score = ch.tactical_score;
+    sum.pn = ch.pn;
+    sum.dn = ch.dn;
+    sum.probed = ch.probed;
+    sum.ko_dependent = ch.ko_dependent;
+    sum.in_window = in_win;
+    sum.deferred_outside_rz = deferred;
+    sum.pruned_outside_rz = ch.pruned_outside_rz;
+    sum.has_decisive_dag = ch.has_decisive_dag;
+    sum.outcome = ch.outcome;
+
+    if (std::find(direct_watched_next.begin(), direct_watched_next.end(),
+                  mv_sgf) != direct_watched_next.end()) {
+      out->watched_next_moves.push_back(sum);
+    }
+    if (ch.outcome == ProofOutcome::kUnknown && !ch.ko_dependent && !deferred) {
+      unclosed_candidates.push_back(std::move(sum));
+    }
+  }
+
+  std::stable_sort(
+      unclosed_candidates.begin(), unclosed_candidates.end(),
+      [is_or_node](const ObservedChildSummary& a,
+                   const ObservedChildSummary& b) {
+        if (a.probed != b.probed) return a.probed > b.probed;
+        const uint32_t ma = is_or_node ? a.pn : a.dn;
+        const uint32_t mb = is_or_node ? b.pn : b.dn;
+        if (ma != mb) return ma < mb;
+        return a.rank < b.rank;
+      });
+  if (unclosed_candidates.size() > 12U) unclosed_candidates.resize(12U);
+  out->top_unclosed_children = std::move(unclosed_candidates);
 }
 
 template <int N>
@@ -387,11 +684,23 @@ typename DfpnSolver<N>::MoveEvalMeta DfpnSolver<N>::EvaluateCandidateMove(
     const Position<N>& pos, const ProofContext& context,
     const NodeTacticalContext& tctx, int16_t move, bool is_or_node,
     int parent_eye_like_count) const {
+  const bool prof = config_.enable_stage_profiling;
+  if (prof) ++stage_profile_.candidates_scored;
   if (move == kPassMove) {
+    if (prof) ++stage_profile_.candidates_pass_scored;
     if (pos.ConsecutivePasses() >= 1U) {
       Position<N> probe = pos;
+      if (prof) ++stage_profile_.candidate_scoring_play_moves;
       if (probe.PlayMove(kPassMove)) {
-        const auto term = terminal_eval_.EvaluateTerminal(probe, context);
+        TerminalEvaluationResult<N> term{};
+        if (prof) {
+          ++stage_profile_.benson_cand_calls;
+          const auto t0 = SteadyClock::now();
+          term = terminal_eval_.EvaluateTerminal(probe, context);
+          stage_profile_.benson_cand_ns += ElapsedNs(t0, SteadyClock::now());
+        } else {
+          term = terminal_eval_.EvaluateTerminal(probe, context);
+        }
         if (is_or_node && term.status == TerminalStatus::kWin) {
           return MoveEvalMeta{60000, true, false, true};
         }
@@ -457,6 +766,7 @@ typename DfpnSolver<N>::MoveEvalMeta DfpnSolver<N>::EvaluateCandidateMove(
       }
     }
     if (!touches_tactical_stone) {
+      if (prof) ++stage_profile_.candidates_outer_moat_skipped;
       return MoveEvalMeta{-950, false, false, false};
     }
   }
@@ -541,6 +851,7 @@ typename DfpnSolver<N>::MoveEvalMeta DfpnSolver<N>::EvaluateCandidateMove(
   // 2. Simulate move on probe for fast capture, crucial-token, & liberty checks.
   Position<N> probe = pos;
   const int prev_enemy_count = pos.Stones(enemy).Count();
+  if (prof) ++stage_profile_.candidate_scoring_play_moves;
   if (!probe.PlayMove(move)) {
     return MoveEvalMeta{-99999, false, false, false};
   }
@@ -590,6 +901,7 @@ typename DfpnSolver<N>::MoveEvalMeta DfpnSolver<N>::EvaluateCandidateMove(
       if (!sole_libs.empty()) {
         const int sole_lib = sole_libs[0];
         Position<N> cap_probe = probe;
+        if (prof) ++stage_profile_.candidate_scoring_play_moves;
         if (cap_probe.PlayMove(static_cast<int16_t>(sole_lib))) {
           BitBoard<N> enemy_after_libs;
           (void)cap_probe.FloodFillChain(sole_lib, &enemy_after_libs);
@@ -785,7 +1097,15 @@ typename DfpnSolver<N>::MoveEvalMeta DfpnSolver<N>::EvaluateCandidateMove(
 
     if (is_or_node && context.attacker_goal == SearchGoal::kToLive &&
         (post_true_eyes > 0 || captured_count > 0 || score >= 2200)) {
-      const auto term = terminal_eval_.EvaluateTerminal(probe, context);
+      TerminalEvaluationResult<N> term{};
+      if (prof) {
+        ++stage_profile_.benson_cand_calls;
+        const auto t0 = SteadyClock::now();
+        term = terminal_eval_.EvaluateTerminal(probe, context);
+        stage_profile_.benson_cand_ns += ElapsedNs(t0, SteadyClock::now());
+      } else {
+        term = terminal_eval_.EvaluateTerminal(probe, context);
+      }
       if (term.status == TerminalStatus::kWin) {
         return MoveEvalMeta{58000, true, false, true};
       }
@@ -842,7 +1162,36 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
     const Position<N>& query_pos, const ProofContext& context,
     const std::optional<BitBoard<N>>& region_hint,
     uint32_t source_dag_node_id, ProofOutcome expected_outcome,
+    uint32_t guard_depth, RevalCaller caller) const {
+  if (!config_.enable_stage_profiling || guard_depth > 0) {
+    return RevalidateSourceProofOnQueryStateImpl(
+        query_pos, context, region_hint, source_dag_node_id, expected_outcome,
+        guard_depth);
+  }
+  const auto t0 = SteadyClock::now();
+  const bool ok = RevalidateSourceProofOnQueryStateImpl(
+      query_pos, context, region_hint, source_dag_node_id, expected_outcome,
+      guard_depth);
+  auto& cs = stage_profile_.reval_by_caller[static_cast<size_t>(caller)];
+  ++cs.top_calls;
+  if (ok) {
+    ++cs.top_successes;
+  } else {
+    ++cs.top_failures;
+  }
+  cs.inclusive_ns += ElapsedNs(t0, SteadyClock::now());
+  return ok;
+}
+
+template <int N>
+bool DfpnSolver<N>::RevalidateSourceProofOnQueryStateImpl(
+    const Position<N>& query_pos, const ProofContext& context,
+    const std::optional<BitBoard<N>>& region_hint,
+    uint32_t source_dag_node_id, ProofOutcome expected_outcome,
     uint32_t guard_depth) const {
+  const bool prof = config_.enable_stage_profiling;
+  if (prof) ++stage_profile_.reval_recursive_visits;
+
   if (guard_depth > 48 || source_dag_node_id >= report_.proof_dag_nodes.size()) {
     return false;
   }
@@ -860,6 +1209,8 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
   if (node.outcome != expected_outcome) return false;
 
   // Memoize revalidation per exact semantic query state + history + source DAG.
+  const SteadyClock::time_point cache_t0 =
+      prof ? SteadyClock::now() : SteadyClock::time_point{};
   std::string cache_key;
   cache_key.reserve(96);
   cache_key.append(HexU64Compact(query_pos.ZobristHash()));
@@ -883,18 +1234,40 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
   cache_key.push_back(
       expected_outcome == ProofOutcome::kProvenWin ? 'W' : 'L');
 
-  if (const auto it = reval_cache_.find(cache_key); it != reval_cache_.end()) {
+  const auto it = reval_cache_.find(cache_key);
+  if (prof) {
+    stage_profile_.reval_cache_lookup_ns +=
+        ElapsedNs(cache_t0, SteadyClock::now());
+  }
+  if (it != reval_cache_.end()) {
+    if (prof) ++stage_profile_.reval_cache_hits;
     return it->second;
   }
+  if (prof) ++stage_profile_.reval_cache_misses;
 
   auto finish = [&](bool result) -> bool {
-    if (reval_cache_.size() < 200000U) {
+    if (prof) {
+      const auto emp_t0 = SteadyClock::now();
+      if (reval_cache_.size() < 200000U) {
+        reval_cache_.emplace(std::move(cache_key), result);
+      }
+      stage_profile_.reval_cache_lookup_ns +=
+          ElapsedNs(emp_t0, SteadyClock::now());
+    } else if (reval_cache_.size() < 200000U) {
       reval_cache_.emplace(std::move(cache_key), result);
     }
     return result;
   };
 
-  const auto term = terminal_eval_.EvaluateTerminal(query_pos, context);
+  TerminalEvaluationResult<N> term{};
+  if (prof) {
+    ++stage_profile_.benson_replay_calls;
+    const auto b0 = SteadyClock::now();
+    term = terminal_eval_.EvaluateTerminal(query_pos, context);
+    stage_profile_.benson_replay_ns += ElapsedNs(b0, SteadyClock::now());
+  } else {
+    term = terminal_eval_.EvaluateTerminal(query_pos, context);
+  }
   if (term.status == TerminalStatus::kWin) {
     return finish(expected_outcome == ProofOutcome::kProvenWin);
   }
@@ -913,6 +1286,7 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
   // Case 1: Single-witness node (OR -> ProvenWin, or AND -> ProvenLoss)
   if ((is_or && expected_outcome == ProofOutcome::kProvenWin) ||
       (!is_or && expected_outcome == ProofOutcome::kProvenLoss)) {
+    if (prof) ++stage_profile_.reval_witness_visits;
     for (size_t i = 0; i < node.child_node_ids.size(); ++i) {
       const uint32_t cid = node.child_node_ids[i];
       if (cid >= report_.proof_dag_nodes.size() ||
@@ -924,11 +1298,23 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
           (mv < 0 || mv >= N * N || !region_hint->Get(mv))) {
         continue;
       }
+      bool play_ok = false;
       Position<N> next = query_pos;
-      bool is_ko_cap = false;
-      if (!next.PlayMove(mv, &is_ko_cap)) continue;
-      if (is_ko_cap && restricted_side) continue;
-      if (RevalidateSourceProofOnQueryState(
+      if (prof) {
+        ++stage_profile_.reval_witness_play_moves;
+        const auto pm0 = SteadyClock::now();
+        bool is_ko_cap = false;
+        play_ok = next.PlayMove(mv, &is_ko_cap) &&
+                  !(is_ko_cap && restricted_side);
+        stage_profile_.reval_witness_play_move_ns +=
+            ElapsedNs(pm0, SteadyClock::now());
+      } else {
+        bool is_ko_cap = false;
+        play_ok = next.PlayMove(mv, &is_ko_cap) &&
+                  !(is_ko_cap && restricted_side);
+      }
+      if (!play_ok) continue;
+      if (RevalidateSourceProofOnQueryStateImpl(
               next, context, region_hint, cid, expected_outcome,
               guard_depth + 1U)) {
         return finish(true);
@@ -939,13 +1325,39 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
 
   // Case 2: Full-coverage node (AND -> ProvenWin, or OR -> ProvenLoss).
   // Every legal move on `query_pos` must exist in `node` and replay cleanly!
-  const auto query_legal = query_pos.GenerateLegalMoves(region_hint);
+  std::vector<int16_t> query_legal;
+  if (prof) {
+    ++stage_profile_.reval_universal_visits;
+    const auto gl0 = SteadyClock::now();
+    query_legal = query_pos.GenerateLegalMoves(region_hint);
+    stage_profile_.reval_universal_gen_legal_ns +=
+        ElapsedNs(gl0, SteadyClock::now());
+    stage_profile_.reval_universal_legal_moves +=
+        static_cast<uint64_t>(query_legal.size());
+  } else {
+    query_legal = query_pos.GenerateLegalMoves(region_hint);
+  }
   for (int16_t mv : query_legal) {
     int found_idx = -1;
-    for (size_t i = 0; i < node.child_moves.size(); ++i) {
-      if (node.child_moves[i] == mv) {
-        found_idx = static_cast<int>(i);
-        break;
+    if (prof) {
+      const auto es0 = SteadyClock::now();
+      uint64_t cmps = 0;
+      for (size_t i = 0; i < node.child_moves.size(); ++i) {
+        ++cmps;
+        if (node.child_moves[i] == mv) {
+          found_idx = static_cast<int>(i);
+          break;
+        }
+      }
+      stage_profile_.reval_universal_edge_comparisons += cmps;
+      stage_profile_.reval_universal_edge_scan_ns +=
+          ElapsedNs(es0, SteadyClock::now());
+    } else {
+      for (size_t i = 0; i < node.child_moves.size(); ++i) {
+        if (node.child_moves[i] == mv) {
+          found_idx = static_cast<int>(i);
+          break;
+        }
       }
     }
     if (found_idx < 0) return finish(false);
@@ -955,8 +1367,18 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryState(
       return finish(false);
     }
     Position<N> next = query_pos;
-    if (!next.PlayMove(mv)) return finish(false);
-    if (!RevalidateSourceProofOnQueryState(
+    bool play_ok = false;
+    if (prof) {
+      ++stage_profile_.reval_universal_play_moves;
+      const auto pm0 = SteadyClock::now();
+      play_ok = next.PlayMove(mv);
+      stage_profile_.reval_universal_play_move_ns +=
+          ElapsedNs(pm0, SteadyClock::now());
+    } else {
+      play_ok = next.PlayMove(mv);
+    }
+    if (!play_ok) return finish(false);
+    if (!RevalidateSourceProofOnQueryStateImpl(
             next, context, region_hint, cid, expected_outcome,
             guard_depth + 1U)) {
       return finish(false);
@@ -980,10 +1402,41 @@ void DfpnSolver<N>::MidSearch(
   *out_has_capture = false;
   *out_dag_node_id = kInvalidDagNodeId;
   const bool is_or_node = (pos.ToPlay() == context.root_attacker);
+  const bool prof = config_.enable_stage_profiling;
+  const bool trace_on = config_.enable_convergence_trace;
+  const std::string cur_trace_path =
+      trace_on ? FormatTracePath<N>(pos.PlayedMoveTrace()) : std::string{};
+  int watched_idx = -1;
+  if (trace_on) {
+    if (depth > convergence_trace_.max_depth_reached) {
+      convergence_trace_.max_depth_reached = depth;
+      convergence_trace_.deepest_path = cur_trace_path;
+    }
+    for (size_t wi = 0; wi < convergence_trace_.watched_paths.size(); ++wi) {
+      ObservedPathTrace& wt = convergence_trace_.watched_paths[wi];
+      if (cur_trace_path == wt.path) {
+        watched_idx = static_cast<int>(wi);
+        if (wt.first_enter_node == 0ULL) wt.first_enter_node = report_.num_nodes;
+        ++wt.visit_count;
+      }
+      if (PathHasPrefix(cur_trace_path, wt.path) &&
+          depth >= wt.max_depth_under_path) {
+        wt.max_depth_under_path = depth;
+        wt.deepest_line_under_path = cur_trace_path;
+      }
+    }
+  }
 
   // Step 1 (FR-3.2, FR-3.8): Evaluate Terminal BEFORE InPath cycle detection.
-  const TerminalEvaluationResult<N> term =
-      terminal_eval_.EvaluateTerminal(pos, context);
+  TerminalEvaluationResult<N> term{};
+  if (prof) {
+    ++stage_profile_.benson_main_calls;
+    const auto b0 = SteadyClock::now();
+    term = terminal_eval_.EvaluateTerminal(pos, context);
+    stage_profile_.benson_main_ns += ElapsedNs(b0, SteadyClock::now());
+  } else {
+    term = terminal_eval_.EvaluateTerminal(pos, context);
+  }
   if (term.status == TerminalStatus::kWin ||
       term.status == TerminalStatus::kLoss) {
     const bool is_win = (term.status == TerminalStatus::kWin);
@@ -1011,6 +1464,19 @@ void DfpnSolver<N>::MidSearch(
     report_.proof_dag_nodes.push_back(dag_node);
     dag_has_capture_.push_back(false);
     *out_dag_node_id = dag_node.node_id;
+    if (trace_on) {
+      if (convergence_trace_.first_terminal_leaf_node == 0ULL) {
+        convergence_trace_.first_terminal_leaf_node = report_.num_nodes;
+        convergence_trace_.first_terminal_leaf_kind = term.evidence_kind;
+        convergence_trace_.first_terminal_leaf_path = cur_trace_path;
+      }
+      if (convergence_trace_.first_proven_subproof_node == 0ULL) {
+        convergence_trace_.first_proven_subproof_node = report_.num_nodes;
+        convergence_trace_.first_proven_subproof_outcome = *out_outcome;
+        convergence_trace_.first_proven_subproof_dag_id = dag_node.node_id;
+        convergence_trace_.first_proven_subproof_path = cur_trace_path;
+      }
+    }
     return;
   }
 
@@ -1074,13 +1540,20 @@ void DfpnSolver<N>::MidSearch(
     return tt_node.node_id;
   };
 
-  auto reval_cb = [&](uint32_t src_id, ProofOutcome expected_out) -> bool {
+  auto reval_cb_board = [&](uint32_t src_id, ProofOutcome expected_out) -> bool {
     return RevalidateSourceProofOnQueryState(pos, context, region_hint, src_id,
-                                             expected_out);
+                                             expected_out, 0,
+                                             RevalCaller::kBoardTt);
+  };
+  auto reval_cb_pattern = [&](uint32_t src_id,
+                              ProofOutcome expected_out) -> bool {
+    return RevalidateSourceProofOnQueryState(pos, context, region_hint, src_id,
+                                             expected_out, 0,
+                                             RevalCaller::kPatternTt);
   };
 
   // Step 4 (FR-6.1, FR-6.3, FR-6.9): History-safe BoardTT & PatternTT lookup.
-  if (auto hit = tt_store_.LookupBoardTT(pos, context, reval_cb);
+  if (auto hit = tt_store_.LookupBoardTT(pos, context, reval_cb_board);
       hit.has_value()) {
     if (hit->outcome != ProofOutcome::kUnknown &&
         hit->proof_closure_available &&
@@ -1105,7 +1578,7 @@ void DfpnSolver<N>::MidSearch(
   if (config_.enable_pattern_tt) {
     RadixPatternRecord<N> pat_rec;
     const PatternHitGrade grade =
-        tt_store_.LookupPatternTT(pos, context, &pat_rec, reval_cb);
+        tt_store_.LookupPatternTT(pos, context, &pat_rec, reval_cb_pattern);
     if (grade == PatternHitGrade::kProofReusable &&
         pat_rec.proof_dag_node_id < report_.proof_dag_nodes.size()) {
       const bool inh_cap =
@@ -1129,7 +1602,10 @@ void DfpnSolver<N>::MidSearch(
   // search-tree path node so threshold cutoffs preserve child (pn, dn) and RZ!
   auto frontier_it = node_frontier_cache_.find(node_path_id);
   if (frontier_it == node_frontier_cache_.end()) {
+    if (prof) ++stage_profile_.new_frontiers;
     CachedNodeFrontier fresh;
+    const SteadyClock::time_point tc0 =
+        prof ? SteadyClock::now() : SteadyClock::time_point{};
     const int parent_eye_like_count =
         (!is_or_node && pos.ConsecutivePasses() == 0 &&
          config_.enable_fast_capture_ordering)
@@ -1139,7 +1615,20 @@ void DfpnSolver<N>::MidSearch(
         config_.enable_fast_capture_ordering
             ? BuildNodeTacticalContext(pos, context)
             : NodeTacticalContext{};
+    const SteadyClock::time_point gl0 =
+        prof ? SteadyClock::now() : SteadyClock::time_point{};
+    if (prof) stage_profile_.frontier_tctx_ns += ElapsedNs(tc0, gl0);
+
     std::vector<int16_t> legal_moves = pos.GenerateLegalMoves(region_hint);
+    const SteadyClock::time_point ce0 =
+        prof ? SteadyClock::now() : SteadyClock::time_point{};
+    if (prof) {
+      stage_profile_.frontier_gen_legal_ns += ElapsedNs(gl0, ce0);
+      stage_profile_.candidates_generated +=
+          static_cast<uint64_t>(legal_moves.size());
+    }
+    const uint64_t prev_benson_cand_ns =
+        prof ? stage_profile_.benson_cand_ns : 0ULL;
 
     std::vector<std::pair<int16_t, MoveEvalMeta>> scored;
     scored.reserve(legal_moves.size());
@@ -1150,6 +1639,15 @@ void DfpnSolver<N>::MidSearch(
                                      parent_eye_like_count);
       }
       scored.emplace_back(mv, meta);
+    }
+    const SteadyClock::time_point fs0 =
+        prof ? SteadyClock::now() : SteadyClock::time_point{};
+    if (prof) {
+      const uint64_t loop_ns = ElapsedNs(ce0, fs0);
+      const uint64_t b_delta =
+          stage_profile_.benson_cand_ns - prev_benson_cand_ns;
+      stage_profile_.cand_eval_exclusive_ns +=
+          (loop_ns > b_delta) ? (loop_ns - b_delta) : 0ULL;
     }
     if (config_.enable_fast_capture_ordering) {
       std::stable_sort(
@@ -1175,6 +1673,13 @@ void DfpnSolver<N>::MidSearch(
       fresh.children.push_back(ch);
     }
     node_frontier_cache_.emplace(node_path_id, std::move(fresh));
+    if (prof) {
+      stage_profile_.frontier_sort_init_ns += ElapsedNs(fs0, SteadyClock::now());
+      const uint64_t cur_f = static_cast<uint64_t>(node_frontier_cache_.size());
+      if (cur_f > stage_profile_.peak_frontiers) {
+        stage_profile_.peak_frontiers = cur_f;
+      }
+    }
   }
 
   in_path_hashes.insert(pos.ZobristHash());
@@ -1226,13 +1731,25 @@ void DfpnSolver<N>::MidSearch(
                                            frontier.active_null_move_rz)) {
         return false;
       }
+      if (prof) ++stage_profile_.outside_rz_candidates_tested;
       Position<N> next_pos = pos;
       bool is_ko_cap = false;
-      if (!next_pos.PlayMove(ch.move, &is_ko_cap) ||
-          (is_ko_cap && restricted_side) ||
+      bool play_ok = false;
+      if (prof) {
+        ++stage_profile_.main_search_play_moves;
+        const auto pm0 = SteadyClock::now();
+        play_ok = next_pos.PlayMove(ch.move, &is_ko_cap) &&
+                  !(is_ko_cap && restricted_side);
+        stage_profile_.outside_rz_play_move_ns +=
+            ElapsedNs(pm0, SteadyClock::now());
+      } else {
+        play_ok = next_pos.PlayMove(ch.move, &is_ko_cap) &&
+                  !(is_ko_cap && restricted_side);
+      }
+      if (!play_ok ||
           !RevalidateSourceProofOnQueryState(
               next_pos, context, region_hint, frontier.representative_dag_id,
-              frontier.representative_outcome)) {
+              frontier.representative_outcome, 0, RevalCaller::kOutsideRz)) {
         return false;
       }
       const bool did_cap =
@@ -1511,12 +2028,17 @@ void DfpnSolver<N>::MidSearch(
         }
         const auto& w = children[static_cast<size_t>(witness_idx)];
         node_has_capture = w.move_captured || w.subtree_has_capture;
+        const SteadyClock::time_point rz0 =
+            prof ? SteadyClock::now() : SteadyClock::time_point{};
         if (is_or_node) {
           *out_proof_rz =
               rz_engine_.ComputeSingleWitnessRZ(pos, w.move, w.proof_rz);
         } else {
           *out_disproof_rz =
               rz_engine_.ComputeSingleWitnessRZ(pos, w.move, w.disproof_rz);
+        }
+        if (prof) {
+          stage_profile_.rz_compute_ns += ElapsedNs(rz0, SteadyClock::now());
         }
         if (depth == 0) report_.best_move = w.move;
         proven_child_ids.push_back(w.dag_node_id);
@@ -1548,11 +2070,16 @@ void DfpnSolver<N>::MidSearch(
           *out_dag_node_id = kInvalidDagNodeId;
           break;
         }
+        const SteadyClock::time_point rz0 =
+            prof ? SteadyClock::now() : SteadyClock::time_point{};
         if (is_or_node) {
           *out_disproof_rz =
               rz_engine_.ComputeAllChildrenUnionRZ(pos, child_rzs);
         } else {
           *out_proof_rz = rz_engine_.ComputeAllChildrenUnionRZ(pos, child_rzs);
+        }
+        if (prof) {
+          stage_profile_.rz_compute_ns += ElapsedNs(rz0, SteadyClock::now());
         }
         // Guarantee a verified root bestMove on universal proven roots (LP-R02).
         if (depth == 0 && !proven_child_moves.empty()) {
@@ -1601,6 +2128,11 @@ void DfpnSolver<N>::MidSearch(
                                  node_has_capture);
       }
       // Once proven, free the frontier entry to reclaim memory immediately.
+      if (trace_on && watched_idx >= 0) {
+        FinalizeObservedFrontier(
+            frontier, is_or_node, depth, region_hint, true,
+            &convergence_trace_.watched_paths[static_cast<size_t>(watched_idx)]);
+      }
       node_frontier_cache_.erase(node_path_id);
       break;
     }
@@ -1730,7 +2262,16 @@ void DfpnSolver<N>::MidSearch(
     const int prev_opp_stones =
         pos.Stones(OppositeColor(pos.ToPlay())).Count();
     bool is_ko_capture = false;
-    if (!pos.PlayMove(chosen_move, &is_ko_capture)) {
+    bool main_play_ok = false;
+    if (prof) {
+      ++stage_profile_.main_search_play_moves;
+      const auto mp0 = SteadyClock::now();
+      main_play_ok = pos.PlayMove(chosen_move, &is_ko_capture);
+      stage_profile_.main_play_undo_ns += ElapsedNs(mp0, SteadyClock::now());
+    } else {
+      main_play_ok = pos.PlayMove(chosen_move, &is_ko_capture);
+    }
+    if (!main_play_ok) {
       *out_pn = 1;
       *out_dn = 1;
       *out_outcome = ProofOutcome::kUnknown;
@@ -1753,7 +2294,13 @@ void DfpnSolver<N>::MidSearch(
               chosen_path_id, in_path_hashes, &c_pn, &c_dn, &c_outcome,
               &child_ko_dep, &child_has_capture, &c_proof_rz, &c_disproof_rz,
               &c_dag_id, chosen_move);
-    pos.UndoMove();
+    if (prof) {
+      const auto mu0 = SteadyClock::now();
+      pos.UndoMove();
+      stage_profile_.main_play_undo_ns += ElapsedNs(mu0, SteadyClock::now());
+    } else {
+      pos.UndoMove();
+    }
 
     // Re-fetch frontier & child reference safely after recursive MidSearch.
     CachedNodeFrontier& post_frontier = node_frontier_cache_.at(node_path_id);
@@ -1788,6 +2335,29 @@ void DfpnSolver<N>::MidSearch(
                               mpc.dag_node_id != kInvalidDagNodeId);
     }
 
+    const bool was_has_null_rz = post_frontier.has_null_move_rz;
+    if (trace_on && mpc.has_decisive_dag && !mpc.ko_dependent) {
+      if (convergence_trace_.first_proven_subproof_node == 0ULL) {
+        convergence_trace_.first_proven_subproof_node = report_.num_nodes;
+        convergence_trace_.first_proven_subproof_outcome = mpc.outcome;
+        convergence_trace_.first_proven_subproof_dag_id = mpc.dag_node_id;
+        const std::string mv_sgf = FormatMoveSgfForTrace<N>(mpc.move);
+        convergence_trace_.first_proven_subproof_path =
+            cur_trace_path.empty() ? mv_sgf : (cur_trace_path + "/" + mv_sgf);
+      }
+      if (watched_idx >= 0) {
+        ObservedPathTrace& wt =
+            convergence_trace_.watched_paths[static_cast<size_t>(watched_idx)];
+        if (wt.first_decisive_child_node == 0ULL) {
+          wt.first_decisive_child_node = report_.num_nodes;
+          wt.first_decisive_child_move = mpc.move;
+          wt.first_decisive_child_move_sgf =
+              FormatMoveSgfForTrace<N>(mpc.move);
+          wt.first_decisive_child_outcome = mpc.outcome;
+        }
+      }
+    }
+
     // Record compact sibling certificate RZ for OutsideRZRevalidated pruning (FR-5.5).
     // Prefer PASS_MOVE (Null-Move) representative at AND nodes because no stone
     // is added on sourcePos, guaranteeing queryLegalMoves <= sourceLegalMoves.
@@ -1815,6 +2385,21 @@ void DfpnSolver<N>::MidSearch(
       post_frontier.representative_move = mpc.move;
       post_frontier.representative_dag_id = mpc.dag_node_id;
       post_frontier.representative_outcome = ProofOutcome::kProvenLoss;
+    }
+    if (trace_on && watched_idx >= 0 && !was_has_null_rz &&
+        post_frontier.has_null_move_rz) {
+      ObservedPathTrace& wt =
+          convergence_trace_.watched_paths[static_cast<size_t>(watched_idx)];
+      if (wt.first_active_rz_source_node == 0ULL) {
+        wt.first_active_rz_source_node = report_.num_nodes;
+        wt.first_active_rz_source_move = post_frontier.representative_move;
+        wt.first_active_rz_source_move_sgf =
+            FormatMoveSgfForTrace<N>(post_frontier.representative_move);
+        wt.first_active_rz_source_dag_id =
+            post_frontier.representative_dag_id;
+        wt.first_active_rz_source_size =
+            post_frontier.active_null_move_rz.Size();
+      }
     }
   }
 

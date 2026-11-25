@@ -20,18 +20,21 @@ import {
   ProofArtifactManager,
   sha256Hex,
 } from '../src/engine/proofChecker';
+import { ProofCertificateRZ } from '../src/engine/relevanceZone';
 import {
   parseStudyLdRzJsonToProblemSpec,
   RawStudyLdRzProblemJson,
   validateStudyLdRzContract,
 } from '../src/engine/studyLdRzCatalog';
 import {
+  Color,
   KoRule,
   ProofContext,
   ProofOutcome,
   SearchGoal,
   SolverConfig,
   TsumegoProblemSpec,
+  UnknownReason,
 } from '../src/engine/types';
 
 let totalAssertions = 0;
@@ -3500,6 +3503,855 @@ runSection('Section 15: R18 Proven-Root Export Boundary & UNKNOWN Diagnostic Pre
       parsedUnknownEmpty.nodes.length === 0,
     'R18 §1: UNKNOWN partial searches (both partial DAG and empty diagnostic DAG with rootDagNodeId=-1) remain exportable',
     `partialNodes=${parsedUnknownPartial.nodes?.length}, emptyNodes=${parsedUnknownEmpty.nodes?.length}, root=${parsedUnknownEmpty.rootNode}`
+  );
+});
+
+runSection('Section 16: R20 Shared Empty ProofCertificateRZ & Opt-in Residual Sibling Replay', () => {
+  // 16.1 Immutable empty RZ singleton invariants
+  check(
+    ProofCertificateRZ.EMPTY.size === 0 && !ProofCertificateRZ.EMPTY.has(0),
+    'R20 §1: ProofCertificateRZ.EMPTY has size 0 and contains no coordinates'
+  );
+  const arr = ProofCertificateRZ.EMPTY.toArray();
+  arr.push(42);
+  check(
+    ProofCertificateRZ.EMPTY.size === 0 && ProofCertificateRZ.EMPTY.toArray().length === 0,
+    'R20 §1: mutating array returned by ProofCertificateRZ.EMPTY.toArray() does not affect EMPTY'
+  );
+  const mergedNonEmpty = ProofCertificateRZ.EMPTY.unionWith(new ProofCertificateRZ([10, 20]));
+  const mergedEmpty = ProofCertificateRZ.EMPTY.unionWith(new ProofCertificateRZ([]));
+  check(
+    ProofCertificateRZ.EMPTY.size === 0 &&
+      mergedNonEmpty.size === 2 &&
+      mergedEmpty === ProofCertificateRZ.EMPTY,
+    'R20 §1: unionWith preserves EMPTY immutability and returns EMPTY when merging two empty RZs'
+  );
+  let threwOnMutate = false;
+  try {
+    (ProofCertificateRZ.EMPTY as unknown as { bits: Set<number> }).bits.add(1);
+  } catch (e) {
+    threwOnMutate = e instanceof TypeError;
+  }
+  check(
+    threwOnMutate && ProofCertificateRZ.EMPTY.size === 0,
+    'R20 §1: attempting to mutate ProofCertificateRZ.EMPTY internal Set throws TypeError'
+  );
+
+  // 16.2 Frontier shared empty-RZ invariant + default 070d082 byte-parity
+  const cfgDefault: SolverConfig = {
+    ...defaultConfig(3500),
+    maxDepth: 48,
+    memoryBudgetMb: 512,
+    enableRzPruning: true,
+    useProblemDefaultKo: true,
+  };
+  for (const pid of ['p004_outside_rz_pruning', 'chao_vol1_p042']) {
+    const spec = getSpec(pid);
+    const solver = new DfpnSolver(cfgDefault);
+    const rep = solver.solveProblem(spec);
+    const memDiag = solver.getFrontierMemoryDiagnostics();
+    const resDiag = solver.getResidualReplayDiagnostics();
+    check(
+      memDiag.emptyRzRefs > 0 && memDiag.uniqueEmptyRzInstances === 1,
+      `R20 §1: ${pid} shares exactly 1 unique empty RZ instance across ${memDiag.emptyRzRefs} empty refs`,
+      `unique=${memDiag.uniqueEmptyRzInstances}, emptyRefs=${memDiag.emptyRzRefs}`
+    );
+    check(
+      resDiag.mode === 'off',
+      `R20 §2: ${pid} default config keeps residual sibling replay mode='off'`,
+      `mode=${resDiag.mode}`
+    );
+    if (pid === 'chao_vol1_p042') {
+      const ctx = DfpnSolver.buildProofContext(spec, cfgDefault);
+      const v = checker.verifySerializedLProofJson(rep.lproofJson, {
+        problem: spec,
+        context: ctx,
+        scope: 'original_root',
+      });
+      check(
+        rep.numNodes === 331 &&
+          v.passed &&
+          v.canonicalDagChecksum ===
+            'sha256-jcs:879d82fa63abb4f6fc76cb8e16adc14e4f6f671d89af630f18b62bd91fa29c16',
+        'R20 §1: p042 default run preserves exact 331 nodes and canonicalDagChecksum',
+        `nodes=${rep.numNodes}, passed=${v.passed}, checksum=${v.canonicalDagChecksum}`
+      );
+    }
+  }
+
+  // 16.3 Opt-in enableResidualSiblingReplay soundness on p042 original_root
+  const p042 = getSpec('chao_vol1_p042');
+  const cfgReplayFilter: SolverConfig = {
+    ...cfgDefault,
+    enableResidualSiblingReplay: 'grouped-1ply-filter',
+  };
+  const solver042Replay = new DfpnSolver(cfgReplayFilter);
+  const rep042Replay = solver042Replay.solveProblem(p042);
+  const ctx042 = DfpnSolver.buildProofContext(p042, cfgReplayFilter);
+  const v042Replay = checker.verifySerializedLProofJson(rep042Replay.lproofJson, {
+    problem: p042,
+    context: ctx042,
+    scope: 'original_root',
+  });
+  check(
+    rep042Replay.rootStatus === ProofOutcome.ProvenWin &&
+      rep042Replay.numNodes < 331 &&
+      v042Replay.passed &&
+      v042Replay.replayedTtHits > 0,
+    'R20 §2: p042 opt-in grouped-1ply-filter proves PROVEN_WIN in < 331 nodes with TT sibling replay & original_root PASS',
+    `status=${rep042Replay.rootStatus}, nodes=${rep042Replay.numNodes}, passed=${v042Replay.passed}, replayedTt=${v042Replay.replayedTtHits}`
+  );
+
+  // 16.4 Paired conditional subroot verification on p162 B[sr] and p060 B[rs]
+  const p162 = getSpec('chao_vol2_p162');
+  const ctx162 = DfpnSolver.buildProofContext(p162, cfgReplayFilter);
+  const pos162Sr = DfpnSolver.buildInitialPosition(p162, ctx162);
+  pos162Sr.playMove(sgfToCoord('sr', 19));
+
+  const rep162Base = new DfpnSolver(cfgDefault).solveFromPosition(
+    p162,
+    pos162Sr.clone(),
+    ctx162
+  );
+  const snap162Base = rep162Base.branchCoverageSnapshots?.[0];
+  const solver162Filter = new DfpnSolver(cfgReplayFilter);
+  const rep162Filter = solver162Filter.solveFromPosition(
+    p162,
+    pos162Sr.clone(),
+    ctx162
+  );
+  const snap162Filter = rep162Filter.branchCoverageSnapshots?.[0];
+  const diag162Filter = solver162Filter.getResidualReplayDiagnostics();
+  const partitionSum162 = snap162Filter
+    ? snap162Filter.closedCount +
+      snap162Filter.deferredOutsideRzCount +
+      snap162Filter.expandedUnresolvedCount +
+      snap162Filter.unexpandedCount +
+      snap162Filter.koBarrierCount
+    : -1;
+  check(
+    Boolean(snap162Base && snap162Filter) &&
+      snap162Filter!.totalLegalMoves === 130 &&
+      partitionSum162 === snap162Filter!.totalLegalMoves &&
+      snap162Base!.closedCount === 4 &&
+      snap162Filter!.closedCount === 6 &&
+      snap162Filter!.deferredOutsideRzCount === 119 &&
+      snap162Filter!.ttReplayedCount > 0 &&
+      snap162Filter!.closedCount > snap162Base!.closedCount &&
+      diag162Filter.prefilterSkips > 0,
+    'R20 §2.2: p162 B[sr] subroot under grouped-1ply-filter strictly grows closedCount (4 -> 6 of 130, 119 deferred) with exact category partition',
+    `baseClosed=${snap162Base?.closedCount}, filterClosed=${snap162Filter?.closedCount}, defRz=${snap162Filter?.deferredOutsideRzCount}, total=${snap162Filter?.totalLegalMoves}, partSum=${partitionSum162}, tt=${snap162Filter?.ttReplayedCount}, skips=${diag162Filter.prefilterSkips}`
+  );
+
+  const p060 = getSpec('chao_vol1_p060');
+  const ctx060 = DfpnSolver.buildProofContext(p060, cfgReplayFilter);
+  const pos060Rs = DfpnSolver.buildInitialPosition(p060, ctx060);
+  pos060Rs.playMove(sgfToCoord('rs', 19));
+
+  const solver060Base = new DfpnSolver(cfgDefault);
+  const rep060Base = solver060Base.solveFromPosition(p060, pos060Rs.clone(), ctx060);
+  const snap060Base = rep060Base.branchCoverageSnapshots?.[0];
+
+  const solver060NoFilter = new DfpnSolver({
+    ...cfgDefault,
+    enableResidualSiblingReplay: 'grouped-no-prefilter',
+  });
+  solver060NoFilter.solveFromPosition(p060, pos060Rs.clone(), ctx060);
+  const diag060NoFilter = solver060NoFilter.getResidualReplayDiagnostics();
+
+  const solver060Filter = new DfpnSolver(cfgReplayFilter);
+  const rep060Filter = solver060Filter.solveFromPosition(p060, pos060Rs.clone(), ctx060);
+  const snap060Filter = rep060Filter.branchCoverageSnapshots?.[0];
+  const diag060Filter = solver060Filter.getResidualReplayDiagnostics();
+  const partitionSum060 = snap060Filter
+    ? snap060Filter.closedCount +
+      snap060Filter.deferredOutsideRzCount +
+      snap060Filter.expandedUnresolvedCount +
+      snap060Filter.unexpandedCount +
+      snap060Filter.koBarrierCount
+    : -1;
+  check(
+    Boolean(snap060Base && snap060Filter) &&
+      snap060Filter!.totalLegalMoves === 144 &&
+      partitionSum060 === snap060Filter!.totalLegalMoves &&
+      snap060Base!.closedCount === 5 &&
+      snap060Filter!.closedCount === 6 &&
+      snap060Filter!.deferredOutsideRzCount === 134 &&
+      snap060Filter!.closedCount > snap060Base!.closedCount &&
+      diag060NoFilter.replayFailures > 0 &&
+      diag060Filter.prefilterSkips > 0 &&
+      diag060Filter.replayFailures < diag060NoFilter.replayFailures &&
+      diag060Filter.replayAttempts < diag060NoFilter.replayAttempts &&
+      diag060Filter.replaySuccesses === diag060NoFilter.replaySuccesses,
+    'R20 §2.2: p060 B[rs] strictly grows closedCount (5 -> 6 of 144, 134 deferred) and grouped-1ply-filter deterministically reduces replayFailures/replayAttempts',
+    `baseClosed=${snap060Base?.closedCount}, filterClosed=${snap060Filter?.closedCount}, defRz=${snap060Filter?.deferredOutsideRzCount}, total=${snap060Filter?.totalLegalMoves}, partSum=${partitionSum060}, noFilter(att=${diag060NoFilter.replayAttempts}, fail=${diag060NoFilter.replayFailures}), filter(att=${diag060Filter.replayAttempts}, fail=${diag060Filter.replayFailures}, skips=${diag060Filter.prefilterSkips})`
+  );
+
+  // 16.5 R20 §2.1 P2 + R21 §2 P1 Fix:
+  // (a) 1-ply prefilter preserves early-terminal completeness on p003 (W[pass], B[aa/ca] -> W[pass], B[pass]);
+  // (b) calling public evaluateSiblingReplayCandidate across closed/prefilter_skip/failed/already_tried
+  //     is strictly read-only and never mutates an already-returned SolveReport (tables, bytes, or verification).
+  const p003 = getSpec('p003');
+  const ctx003 = DfpnSolver.buildProofContext(p003, cfgReplayFilter);
+  const pos003Pass = DfpnSolver.buildInitialPosition(p003, ctx003);
+  pos003Pass.playMove(PASS_MOVE);
+
+  for (const wSgf of ['aa', 'ca']) {
+    const wMove = sgfToCoord(wSgf, p003.boardSize);
+    const posSrc = pos003Pass.clone();
+    posSrc.playMove(wMove);
+    const solverSrc = new DfpnSolver(cfgReplayFilter);
+    const repSrc = solverSrc.solveFromPosition(p003, posSrc, ctx003);
+
+    const dagLenBefore = repSrc.proofDagNodes.length;
+    const stateLenBefore = repSrc.stateTable.length;
+    const histLenBefore = repSrc.historyTable.length;
+    const dagJsonBefore = JSON.stringify(repSrc.proofDagNodes);
+    const stateJsonBefore = JSON.stringify(repSrc.stateTable);
+    const histJsonBefore = JSON.stringify(repSrc.historyTable);
+    const embeddedJsonBefore = repSrc.lproofJson;
+    const reExportedBefore = checker.serializeLProofJson(posSrc, ctx003, repSrc).json;
+
+    const fragCheck = checker.verifySubproofFragment({
+      problem: p003,
+      context: ctx003,
+      report: repSrc,
+      targetPathMoves: [PASS_MOVE, wMove],
+      targetDagNodeId: repSrc.rootDagNodeId,
+      queryPathMoves: [PASS_MOVE, PASS_MOVE],
+    });
+    const srcNode = repSrc.proofDagNodes[repSrc.rootDagNodeId];
+    const srcRz = new ProofCertificateRZ(srcNode.proofRzCoords);
+    const noFilterRes = solverSrc.evaluateSiblingReplayCandidate({
+      parentPos: pos003Pass.clone(),
+      sourceMove: wMove,
+      sourceDagId: repSrc.rootDagNodeId,
+      sourceRz: srcRz,
+      queryMove: PASS_MOVE,
+      mode: 'grouped-no-prefilter',
+      context: ctx003,
+      regionCoords: p003.regionCoords,
+    });
+    const filterRes = solverSrc.evaluateSiblingReplayCandidate({
+      parentPos: pos003Pass.clone(),
+      sourceMove: wMove,
+      sourceDagId: repSrc.rootDagNodeId,
+      sourceRz: srcRz,
+      queryMove: PASS_MOVE,
+      mode: 'grouped-1ply-filter',
+      context: ctx003,
+      regionCoords: p003.regionCoords,
+    });
+    const failRes = solverSrc.evaluateSiblingReplayCandidate({
+      parentPos: pos003Pass.clone(),
+      sourceMove: wMove,
+      sourceDagId: repSrc.rootDagNodeId,
+      sourceRz: srcRz,
+      queryMove: sgfToCoord('ba', p003.boardSize),
+      mode: 'grouped-1ply-filter',
+      context: ctx003,
+      regionCoords: p003.regionCoords,
+    });
+    const alreadyRes = solverSrc.evaluateSiblingReplayCandidate({
+      parentPos: pos003Pass.clone(),
+      sourceMove: wMove,
+      sourceDagId: repSrc.rootDagNodeId,
+      sourceRz: srcRz,
+      queryMove: sgfToCoord('db', p003.boardSize),
+      mode: 'grouped-1ply-filter',
+      context: ctx003,
+      regionCoords: p003.regionCoords,
+    });
+
+    const reExportedAfter = checker.serializeLProofJson(posSrc, ctx003, repSrc).json;
+    const postMemVer = checker.verifyProofDag(posSrc, ctx003, repSrc, {
+      verifiedScope: 'traced_within_rules',
+    });
+    const postFileVer = checker.verifySerializedLProofJson(reExportedAfter, {
+      problem: p003,
+      context: ctx003,
+      scope: 'traced_within_rules',
+    });
+    const postOrigEmbeddedVer = checker.verifySerializedLProofJson(repSrc.lproofJson, {
+      problem: p003,
+      context: ctx003,
+      scope: 'traced_within_rules',
+    });
+
+    check(
+      repSrc.rootStatus === ProofOutcome.ProvenWin &&
+        dagLenBefore === 4 &&
+        stateLenBefore === 4 &&
+        histLenBefore === 4 &&
+        fragCheck.sourceReceipt.passed &&
+        fragCheck.queryReplayReceipt.passed &&
+        noFilterRes === 'closed' &&
+        filterRes === 'closed' &&
+        failRes === 'failed' &&
+        alreadyRes === 'already_tried' &&
+        repSrc.proofDagNodes.length === dagLenBefore &&
+        repSrc.stateTable.length === stateLenBefore &&
+        repSrc.historyTable.length === histLenBefore &&
+        JSON.stringify(repSrc.proofDagNodes) === dagJsonBefore &&
+        JSON.stringify(repSrc.stateTable) === stateJsonBefore &&
+        JSON.stringify(repSrc.historyTable) === histJsonBefore &&
+        repSrc.lproofJson === embeddedJsonBefore &&
+        reExportedAfter === reExportedBefore &&
+        postMemVer.passed &&
+        postFileVer.passed &&
+        postOrigEmbeddedVer.passed,
+      `R20 §2.1 P2 + R21 P1: p003 W[pass],B[${wSgf}] closed/failed/already_tried calls leave SolveReport (4/4/4 tables, lproofJson, re-export, PASS verification) completely invariant`,
+      `status=${repSrc.rootStatus}, tablesBefore=${dagLenBefore}/${stateLenBefore}/${histLenBefore}, tablesAfter=${repSrc.proofDagNodes.length}/${repSrc.stateTable.length}/${repSrc.historyTable.length}, res=${noFilterRes}/${filterRes}/${failRes}/${alreadyRes}, mem=${postMemVer.errorCode}, file=${postFileVer.errorCode}`
+    );
+  }
+
+  // R21 P1 post-diagnostic report invariance under prefilter_skip + failed on p042 original-root report
+  const p042DagBefore = JSON.stringify(rep042Replay.proofDagNodes);
+  const p042StateBefore = JSON.stringify(rep042Replay.stateTable);
+  const p042HistBefore = JSON.stringify(rep042Replay.historyTable);
+  const p042JsonBefore = rep042Replay.lproofJson;
+  const pos042Init = DfpnSolver.buildInitialPosition(p042, ctx042);
+  const pos042Rs = pos042Init.clone();
+  pos042Rs.playMove(sgfToCoord('rs', 19));
+  const p042SqEv = solver042Replay
+    .getResidualReplayDiagnostics()
+    .sourceClosureEvents.find((ev) => ev.sourceMoveSgf === 'sq');
+  const p042ReExportBefore = checker.serializeLProofJson(
+    pos042Init,
+    ctx042,
+    rep042Replay
+  ).json;
+  const p042SkipRes = p042SqEv
+    ? solver042Replay.evaluateSiblingReplayCandidate({
+        parentPos: pos042Rs,
+        sourceMove: sgfToCoord('sq', 19),
+        sourceDagId: p042SqEv.sourceDagId,
+        sourceRz: ProofCertificateRZ.EMPTY,
+        queryMove: sgfToCoord('ps', 19),
+        mode: 'grouped-1ply-filter',
+        context: ctx042,
+        regionCoords: p042.regionCoords,
+      })
+    : 'failed';
+  const p042FailRes = p042SqEv
+    ? solver042Replay.evaluateSiblingReplayCandidate({
+        parentPos: pos042Rs,
+        sourceMove: sgfToCoord('sq', 19),
+        sourceDagId: p042SqEv.sourceDagId,
+        sourceRz: ProofCertificateRZ.EMPTY,
+        queryMove: sgfToCoord('ps', 19),
+        mode: 'grouped-no-prefilter',
+        context: ctx042,
+        regionCoords: p042.regionCoords,
+      })
+    : 'closed';
+  const p042ReExportAfter = checker.serializeLProofJson(
+    pos042Init,
+    ctx042,
+    rep042Replay
+  ).json;
+  const p042MemAfter = checker.verifyProofDag(pos042Init, ctx042, rep042Replay, {
+    verifiedScope: 'original_root',
+  });
+  const p042FileAfter = checker.verifySerializedLProofJson(p042ReExportAfter, {
+    problem: p042,
+    context: ctx042,
+    scope: 'original_root',
+  });
+  check(
+    Boolean(p042SqEv) &&
+      p042SkipRes === 'prefilter_skip' &&
+      p042FailRes === 'failed' &&
+      JSON.stringify(rep042Replay.proofDagNodes) === p042DagBefore &&
+      JSON.stringify(rep042Replay.stateTable) === p042StateBefore &&
+      JSON.stringify(rep042Replay.historyTable) === p042HistBefore &&
+      rep042Replay.lproofJson === p042JsonBefore &&
+      p042ReExportAfter === p042ReExportBefore &&
+      p042MemAfter.passed &&
+      p042FileAfter.passed,
+    'R21 P1: prefilter_skip + failed calls on p042 leave solved original_root report tables, bytes & verifiers completely invariant',
+    `skip=${p042SkipRes}, fail=${p042FailRes}, mem=${p042MemAfter.errorCode}, file=${p042FileAfter.errorCode}`
+  );
+
+  // 16.6 R20 §2.3 P2 Fix: sourceClosureEvents preserve exact stateTable-derived parentPath even when onPathTrace is OFF
+  const p031 = getSpec('chao_vol1_p031');
+  const solver031NoTrace = new DfpnSolver(cfgReplayFilter);
+  const rep031NoTrace = solver031NoTrace.solveProblem(p031);
+  const diag031NoTrace = solver031NoTrace.getResidualReplayDiagnostics();
+  const diag042NoTrace = solver042Replay.getResidualReplayDiagnostics();
+
+  const traceStateChain = (rep: typeof rep042Replay, dagId: number): string => {
+    const srcStId = rep.proofDagNodes[dagId].stateId;
+    const parStId = rep.proofDagNodes[dagId].parentStateId;
+    const moves: string[] = [];
+    let cur = parStId;
+    while (cur > 0) {
+      const st = rep.stateTable[cur];
+      moves.push(st.moveFromParent === PASS_MOVE ? 'pass' : String.fromCharCode(97 + (st.moveFromParent % 19)) + String.fromCharCode(97 + Math.floor(st.moveFromParent / 19)));
+      cur = st.parentStateId;
+    }
+    moves.reverse();
+    return srcStId >= 0 ? moves.join('/') : '';
+  };
+
+  check(
+    diag031NoTrace.sourceClosureEvents.length > 0 &&
+      diag031NoTrace.sourceClosureEvents.every(
+        (ev) => ev.parentPath === 'sr' && ev.parentPath === traceStateChain(rep031NoTrace, ev.sourceDagId)
+      ) &&
+      diag042NoTrace.sourceClosureEvents.length > 0 &&
+      diag042NoTrace.sourceClosureEvents.every(
+        (ev) => ev.parentPath === 'rs' && ev.parentPath === traceStateChain(rep042Replay, ev.sourceDagId)
+      ) &&
+      diag042NoTrace.prefilterTimeMs >= 0 &&
+      diag042NoTrace.divergenceClassifyTimeMs >= 0,
+    'R20 §2.3 P2: original-root sourceClosureEvents preserve parentPath ("sr" for p031, "rs" for p042) with onPathTrace OFF',
+    `p031Events=${diag031NoTrace.sourceClosureEvents.length}/${diag031NoTrace.sourceClosureEvents.map((e) => e.parentPath).join(',')}, p042Events=${diag042NoTrace.sourceClosureEvents.length}/${diag042NoTrace.sourceClosureEvents.map((e) => e.parentPath).join(',')}`
+  );
+
+  // 16.7 R22 §3 P2 Fix: evaluateSiblingReplayCandidate binds context/region and isolates cache (hot == cold across valid/only_ns/minus_ns)
+  const solver042Cold = new DfpnSolver(cfgReplayFilter);
+  const rep042Cold = solver042Cold.solveProblem(p042);
+  (solver042Cold as unknown as { revalCache: Map<string, boolean> }).revalCache.clear();
+  const passEv042 = diag042NoTrace.sourceClosureEvents.find(
+    (ev) => ev.sourceMoveSgf === 'pass'
+  );
+  const nsMove = sgfToCoord('ns', p042.boardSize);
+  const regionFull = [...p042.regionCoords];
+  const regionOnlyNs = [nsMove];
+  const regionMinusNs = p042.regionCoords.filter((c) => c !== nsMove);
+  const mismatchedCtx: ProofContext = {
+    ...ctx042,
+    attackerAllowKo: !ctx042.attackerAllowKo,
+  };
+  const passDagId042 = passEv042 ? passEv042.sourceDagId : -1;
+  const hotBoundFull = solver042Replay.evaluateSiblingReplayCandidate({
+    parentPos: pos042Rs.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: passDagId042,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: ctx042,
+    regionCoords: regionFull,
+  });
+  const coldBoundFull = solver042Cold.evaluateSiblingReplayCandidate({
+    parentPos: pos042Rs.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: passDagId042,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: ctx042,
+    regionCoords: regionFull,
+  });
+  const hotBoundOnlyNs = solver042Replay.evaluateSiblingReplayCandidate({
+    parentPos: pos042Rs.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: passDagId042,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: ctx042,
+    regionCoords: regionOnlyNs,
+  });
+  const coldBoundOnlyNs = solver042Cold.evaluateSiblingReplayCandidate({
+    parentPos: pos042Rs.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: passDagId042,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: ctx042,
+    regionCoords: regionOnlyNs,
+  });
+  const hotCounterOnlyNs = solver042Replay.evaluateSiblingReplayCandidate({
+    parentPos: pos042Rs.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: passDagId042,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: ctx042,
+    regionCoords: regionOnlyNs,
+    regionPolicy: 'counterfactual',
+  });
+  const coldCounterOnlyNs = solver042Cold.evaluateSiblingReplayCandidate({
+    parentPos: pos042Rs.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: passDagId042,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: ctx042,
+    regionCoords: regionOnlyNs,
+    regionPolicy: 'counterfactual',
+  });
+  const hotBoundMinusNs = solver042Replay.evaluateSiblingReplayCandidate({
+    parentPos: pos042Rs.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: passDagId042,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: ctx042,
+    regionCoords: regionMinusNs,
+  });
+  const coldCounterMinusNs = solver042Cold.evaluateSiblingReplayCandidate({
+    parentPos: pos042Rs.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: passDagId042,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: ctx042,
+    regionCoords: regionMinusNs,
+    regionPolicy: 'counterfactual',
+  });
+  const badCtxRes = solver042Replay.evaluateSiblingReplayCandidate({
+    parentPos: pos042Rs.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: passDagId042,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: mismatchedCtx,
+    regionCoords: regionFull,
+    regionPolicy: 'counterfactual',
+  });
+  const postHotCheck = checker.verifySerializedLProofJson(rep042Replay.lproofJson, {
+    problem: p042,
+    context: ctx042,
+    scope: 'original_root',
+  });
+  const postColdCheck = checker.verifySerializedLProofJson(rep042Cold.lproofJson, {
+    problem: p042,
+    context: ctx042,
+    scope: 'original_root',
+  });
+  check(
+    Boolean(passEv042) &&
+      rep042Replay.lproofJson === rep042Cold.lproofJson &&
+      hotBoundFull === 'closed' &&
+      coldBoundFull === 'closed' &&
+      hotBoundOnlyNs === 'failed' &&
+      coldBoundOnlyNs === 'failed' &&
+      hotCounterOnlyNs === 'failed' &&
+      coldCounterOnlyNs === 'failed' &&
+      hotBoundMinusNs === 'failed' &&
+      coldCounterMinusNs === 'failed' &&
+      badCtxRes === 'failed' &&
+      postHotCheck.passed &&
+      postColdCheck.passed,
+    'R22 §3 P2: evaluateSiblingReplayCandidate matches hot vs cold across full/[ns]/minus_ns (no stale revalCache or out-of-region leak) and rejects mismatched context',
+    `full=${hotBoundFull}/${coldBoundFull}, boundOnlyNs=${hotBoundOnlyNs}/${coldBoundOnlyNs}, counterOnlyNs=${hotCounterOnlyNs}/${coldCounterOnlyNs}, minusNs=${hotBoundMinusNs}/${coldCounterMinusNs}, badCtx=${badCtxRes}`
+  );
+
+  // 16.8 R23 §4 P2 Fix: solveFromPosition snapshots context deeply (scalars + initialTokens) and validates parentPos.context
+  const solver042Snap = new DfpnSolver(cfgReplayFilter);
+  const mutableCtx042: ProofContext = {
+    ...ctx042,
+    initialTokens: ctx042.initialTokens.map((t) => ({ ...t })),
+  };
+  const trueCtxCopy: ProofContext = {
+    ...ctx042,
+    initialTokens: ctx042.initialTokens.map((t) => ({ ...t })),
+  };
+  const initPosMutable = DfpnSolver.buildInitialPosition(p042, mutableCtx042);
+  const rep042Snap = solver042Snap.solveFromPosition(
+    p042,
+    initPosMutable,
+    mutableCtx042
+  );
+  const snapPassEv = solver042Snap
+    .getResidualReplayDiagnostics()
+    .sourceClosureEvents.find((ev) => ev.sourceMoveSgf === 'pass');
+  const snapDagId = snapPassEv ? snapPassEv.sourceDagId : -1;
+
+  const parentPosMutable = initPosMutable.clone();
+  parentPosMutable.playMove(sgfToCoord('rs', p042.boardSize));
+  const parentPosTrue = DfpnSolver.buildInitialPosition(p042, trueCtxCopy);
+  parentPosTrue.playMove(sgfToCoord('rs', p042.boardSize));
+
+  const baselineSnapRes = solver042Snap.evaluateSiblingReplayCandidate({
+    parentPos: parentPosTrue.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: snapDagId,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: trueCtxCopy,
+    regionCoords: regionFull,
+  });
+
+  // In-place scalar mutation on caller's mutableCtx042
+  const origAttackerAllowKo = mutableCtx042.attackerAllowKo;
+  mutableCtx042.attackerAllowKo = !origAttackerAllowKo;
+  const scalarMutatedWrongRes = solver042Snap.evaluateSiblingReplayCandidate({
+    parentPos: parentPosMutable.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: snapDagId,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: mutableCtx042,
+    regionCoords: regionFull,
+  });
+  const scalarMutatedCtxOnlyRes = solver042Snap.evaluateSiblingReplayCandidate({
+    parentPos: parentPosTrue.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: snapDagId,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: mutableCtx042,
+    regionCoords: regionFull,
+  });
+  const scalarMutatedParentOnlyRes = solver042Snap.evaluateSiblingReplayCandidate({
+    parentPos: parentPosMutable.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: snapDagId,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: trueCtxCopy,
+    regionCoords: regionFull,
+  });
+  const scalarMutatedTrueRes = solver042Snap.evaluateSiblingReplayCandidate({
+    parentPos: parentPosTrue.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: snapDagId,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: trueCtxCopy,
+    regionCoords: regionFull,
+  });
+  mutableCtx042.attackerAllowKo = origAttackerAllowKo;
+
+  // In-place nested initialTokens element mutation + extra token push
+  const origTok0Coord = mutableCtx042.initialTokens[0].initialCoord;
+  mutableCtx042.initialTokens[0].initialCoord = (origTok0Coord + 1) % (19 * 19);
+  const tokenElemMutWrongRes = solver042Snap.evaluateSiblingReplayCandidate({
+    parentPos: parentPosMutable.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: snapDagId,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: mutableCtx042,
+    regionCoords: regionFull,
+  });
+  const tokenElemMutCtxOnlyRes = solver042Snap.evaluateSiblingReplayCandidate({
+    parentPos: parentPosTrue.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: snapDagId,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: mutableCtx042,
+    regionCoords: regionFull,
+  });
+  mutableCtx042.initialTokens[0].initialCoord = origTok0Coord;
+  mutableCtx042.initialTokens.push({
+    tokenId: 999,
+    initialCoord: 0,
+    groupIndex: 0,
+    stoneColor: Color.White,
+  });
+  const tokenPushMutWrongRes = solver042Snap.evaluateSiblingReplayCandidate({
+    parentPos: parentPosMutable.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: snapDagId,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: mutableCtx042,
+    regionCoords: regionFull,
+  });
+  mutableCtx042.initialTokens.pop();
+  const tokenMutTrueRes = solver042Snap.evaluateSiblingReplayCandidate({
+    parentPos: parentPosTrue.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: snapDagId,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: trueCtxCopy,
+    regionCoords: regionFull,
+  });
+
+  // Mismatched parentPos.context (PSK) while explicit params.context matches saved SSK
+  const pskCtx042: ProofContext = {
+    ...trueCtxCopy,
+    koRule: KoRule.PositionalSuperko,
+    initialTokens: trueCtxCopy.initialTokens.map((t) => ({ ...t })),
+  };
+  const parentPosPsk = DfpnSolver.buildInitialPosition(p042, pskCtx042);
+  parentPosPsk.playMove(sgfToCoord('rs', p042.boardSize));
+  const pskParentBoundRes = solver042Snap.evaluateSiblingReplayCandidate({
+    parentPos: parentPosPsk.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: snapDagId,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: trueCtxCopy,
+    regionCoords: regionFull,
+    regionPolicy: 'bound',
+  });
+  const pskParentCounterRes = solver042Snap.evaluateSiblingReplayCandidate({
+    parentPos: parentPosPsk.clone(),
+    sourceMove: PASS_MOVE,
+    sourceDagId: snapDagId,
+    sourceRz: ProofCertificateRZ.EMPTY,
+    queryMove: nsMove,
+    mode: 'grouped-no-prefilter',
+    context: trueCtxCopy,
+    regionCoords: regionFull,
+    regionPolicy: 'counterfactual',
+  });
+
+  const postSnapVer = checker.verifySerializedLProofJson(rep042Snap.lproofJson, {
+    problem: p042,
+    context: trueCtxCopy,
+    scope: 'original_root',
+  });
+  check(
+    Boolean(snapPassEv) &&
+      baselineSnapRes === 'closed' &&
+      scalarMutatedWrongRes === 'failed' &&
+      scalarMutatedCtxOnlyRes === 'failed' &&
+      scalarMutatedParentOnlyRes === 'failed' &&
+      scalarMutatedTrueRes === 'closed' &&
+      tokenElemMutWrongRes === 'failed' &&
+      tokenElemMutCtxOnlyRes === 'failed' &&
+      tokenPushMutWrongRes === 'failed' &&
+      tokenMutTrueRes === 'closed' &&
+      pskParentBoundRes === 'failed' &&
+      pskParentCounterRes === 'failed' &&
+      postSnapVer.passed,
+    'R23 §4 P2: solveFromPosition deep-clones context (scalar & initialTokens) and rejects mismatched parentPos.context',
+    `base=${baselineSnapRes}, scalar=${scalarMutatedWrongRes}/${scalarMutatedCtxOnlyRes}/${scalarMutatedParentOnlyRes}/${scalarMutatedTrueRes}, tok=${tokenElemMutWrongRes}/${tokenElemMutCtxOnlyRes}/${tokenPushMutWrongRes}/${tokenMutTrueRes}, pskParent=${pskParentBoundRes}/${pskParentCounterRes}, ver=${postSnapVer.errorCode}`
+  );
+});
+
+runSection('Section 17: R21 Zero-Leaf OR Short Tactical Probe (Default OFF Experiment)', () => {
+  const cfgBase: SolverConfig = {
+    ...defaultConfig(3500),
+    maxDepth: 48,
+    memoryBudgetMb: 512,
+    enableRzPruning: true,
+    useProblemDefaultKo: true,
+  };
+
+  // 17.1 Default config keeps short tactical probe disabled
+  const defaultSolver = new DfpnSolver(cfgBase);
+  const p090 = getSpec('chao_vol1_p090');
+  const rep090Base = defaultSolver.solveProblem(p090);
+  const probeDiagBase = defaultSolver.getShortTacticalProbeDiagnostics();
+  check(
+    !probeDiagBase.enabled &&
+      probeDiagBase.probesTriggered === 0 &&
+      rep090Base.numNodes === 3500,
+    'R21 §1: default SolverConfig keeps OR short tactical probe disabled',
+    `enabled=${probeDiagBase.enabled}, triggered=${probeDiagBase.probesTriggered}`
+  );
+
+  // 17.2 p090 with frozen short tactical probe accounts all calls inside 3500 budget and promotes B[rr] into top-3 root window (<300 calls vs 2750)
+  let rootTopAtEnter: string[] = [];
+  let rrEnterCallIndex = 999999;
+  const cfgProbe: SolverConfig = {
+    ...cfgBase,
+    enableOrShortTacticalProbe: true,
+    tracePathFilters: ['', 'rr'],
+    onPathTrace: (ev) => {
+      if (ev.kind === 'enter' && ev.path === '' && ev.topCandidates && rootTopAtEnter.length === 0) {
+        rootTopAtEnter = ev.topCandidates.slice(0, 3).map((c) => c.moveSgf);
+      }
+      if (ev.kind === 'enter' && ev.path === 'rr' && ev.callIndex < rrEnterCallIndex) {
+        rrEnterCallIndex = ev.callIndex;
+      }
+    },
+  };
+  const solver090Probe = new DfpnSolver(cfgProbe);
+  const rep090Probe = solver090Probe.solveProblem(p090);
+  const probeDiag090 = solver090Probe.getShortTacticalProbeDiagnostics();
+  check(
+    probeDiag090.enabled &&
+      rep090Probe.numNodes === 3500 &&
+      probeDiag090.probeNodesUsed > 0 &&
+      probeDiag090.probeNodesUsed <= probeDiag090.maxTotalProbeNodes &&
+      probeDiag090.mainSearchNodesUsed + probeDiag090.probeNodesUsed === rep090Probe.numNodes &&
+      rootTopAtEnter.includes('rr') &&
+      rrEnterCallIndex < 300,
+    'R21 §2: p090 short tactical probe accounts calls in 3500 budget and promotes B[rr] into top-3 root window (entered <300 vs 2750)',
+    `nodes=${rep090Probe.numNodes}, probeUsed=${probeDiag090.probeNodesUsed}, mainUsed=${probeDiag090.mainSearchNodesUsed}, top3=${rootTopAtEnter.join(',')}, rrCall=${rrEnterCallIndex}`
+  );
+
+  // 17.3 Baseline non-regression under enableOrShortTacticalProbe: true (p031, p042, p005, p007)
+  for (const [pid, expectedOutcome] of [
+    ['chao_vol1_p031', ProofOutcome.ProvenWin],
+    ['chao_vol1_p042', ProofOutcome.ProvenWin],
+    ['p007_cramped_corner_proven_loss', ProofOutcome.ProvenLoss],
+  ] as const) {
+    const spec = getSpec(pid);
+    const ctx = DfpnSolver.buildProofContext(spec, { ...cfgBase, enableOrShortTacticalProbe: true });
+    const s = new DfpnSolver({ ...cfgBase, enableOrShortTacticalProbe: true });
+    const r = s.solveProblem(spec);
+    const v = checker.verifySerializedLProofJson(r.lproofJson, {
+      problem: spec,
+      context: ctx,
+      scope: 'original_root',
+    });
+    check(
+      r.rootStatus === expectedOutcome && v.passed,
+      `R21 §3 baseline invariance: ${pid} proves ${expectedOutcome} & original_root PASS under short tactical probe`,
+      `status=${r.rootStatus}, nodes=${r.numNodes}, check=${v.errorCode}`
+    );
+  }
+  const p005 = getSpec('p005_ko_dependent_barrier');
+  const rep005Probe = new DfpnSolver({ ...cfgBase, enableOrShortTacticalProbe: true }).solveProblem(p005);
+  check(
+    rep005Probe.rootStatus === ProofOutcome.Unknown &&
+      rep005Probe.unknownReason === UnknownReason.KoDependent,
+    'R21 §3 baseline invariance: p005 remains UNKNOWN(ko_dependent) under short tactical probe',
+    `status=${rep005Probe.rootStatus}, reason=${rep005Probe.unknownReason}`
+  );
+
+  // 17.4 R21 §3.2 p090 11-ply BENSON_UCA trajectory verification (replaces old 13-15 ply depth hypothesis)
+  const ctx090 = DfpnSolver.buildProofContext(p090, cfgBase);
+  const pos090End = DfpnSolver.buildInitialPosition(p090, ctx090);
+  const line090 = ['rr', 'rp', 'or', 'nr', 'qs', 'pass', 'pr', 'ns', 'rq', 'sr', 'os'];
+  let all090InRegionLegal = true;
+  for (const mvSgf of line090) {
+    const mv = mvSgf === 'pass' ? PASS_MOVE : sgfToCoord(mvSgf, p090.boardSize);
+    const inRegion = mv === PASS_MOVE || p090.regionCoords.includes(mv);
+    const pr = pos090End.playMove(mv);
+    if (!inRegion || !pr.legal) {
+      all090InRegionLegal = false;
+      break;
+    }
+  }
+  const rep090End = new DfpnSolver(cfgBase).solveFromPosition(p090, pos090End, ctx090);
+  const rootEndNode = rep090End.proofDagNodes[rep090End.rootDagNodeId];
+  const mem090End = checker.verifyProofDag(pos090End, ctx090, rep090End, {
+    verifiedScope: 'traced_within_rules',
+  });
+  const file090End = checker.verifySerializedLProofJson(rep090End.lproofJson, {
+    problem: p090,
+    context: ctx090,
+    scope: 'traced_within_rules',
+  });
+  check(
+    all090InRegionLegal &&
+      rep090End.rootStatus === ProofOutcome.ProvenWin &&
+      rep090End.numNodes === 1 &&
+      rootEndNode?.terminalEvidence === 'BENSON_UCA' &&
+      mem090End.passed &&
+      file090End.passed,
+    'R21 §3.2 / R22: p090 11-ply legal in-region trajectory reaches BENSON_UCA / PROVEN_WIN in 1 node and passes traced_within_rules verification',
+    `legal=${all090InRegionLegal}, status=${rep090End.rootStatus}, nodes=${rep090End.numNodes}, ev=${rootEndNode?.terminalEvidence}, mem=${mem090End.errorCode}, file=${file090End.errorCode}`
   );
 });
 

@@ -271,6 +271,87 @@ export interface SubproofFragmentVerificationResult {
   queryReplayReceipt: SubproofQueryReplayReceipt;
 }
 
+export interface FrontierMemoryDiagnostics {
+  frontiers: number;
+  candidateSlots: number;
+  expandedSlots: number;
+  emptyRzRefs: number;
+  nonEmptyRzRefs: number;
+  uniqueEmptyRzInstances: number;
+  engineEstimatedBytes: number;
+  stateTableEntries: number;
+  historyTableEntries: number;
+  dagNodes: number;
+  revalCacheEntries: number;
+  ttEntries: number;
+}
+
+export type ResidualDivergenceKind =
+  | 'WITNESS_OCCUPIED'
+  | 'DESCENDANT_LEGAL_CHANGED'
+  | 'LEAF_TERMINAL_FAILED';
+
+export type ResidualSiblingReplayMode =
+  | 'off'
+  | 'grouped-no-prefilter'
+  | 'grouped-1ply-filter';
+
+export interface ResidualSourceClosureEvent {
+  parentPath: string;
+  sourceMoveSgf: string;
+  sourceDagId: number;
+  closedMovesSgf: string[];
+  failedMovesSgf: string[];
+  prefilterSkippedMovesSgf: string[];
+}
+
+export interface ResidualReplayDiagnostics {
+  mode: ResidualSiblingReplayMode;
+  sourcesRecorded: number;
+  prefilterSkips: number;
+  replayAttempts: number;
+  replaySuccesses: number;
+  replayFailures: number;
+  replayTimeMs: number;
+  divergenceClassifyTimeMs: number;
+  prefilterTimeMs: number;
+  replaySuccessTimeMs: number;
+  replayFailureTimeMs: number;
+  divergenceCounts: Record<ResidualDivergenceKind, number>;
+  rootFirstSourceCallIndex: number | null;
+  sourceClosureEvents: ResidualSourceClosureEvent[];
+}
+
+export interface ShortTacticalProbeConfig {
+  maxProbeSearchDepth?: number;
+  maxCandidatesPerFrontier?: number;
+  defenderBranchFactor?: number;
+  maxTotalProbeNodes?: number;
+}
+
+export interface ParentUsableSubproofEvent {
+  callIndex: number;
+  parentPath: string;
+  closedMoveSgf: string;
+  outcome: ProofOutcome;
+  dagNodeId: number;
+}
+
+export interface ShortTacticalProbeDiagnostics {
+  enabled: boolean;
+  maxProbeSearchDepth: number;
+  maxCandidatesPerFrontier: number;
+  defenderBranchFactor: number;
+  maxTotalProbeNodes: number;
+  probesTriggered: number;
+  candidatesProbed: number;
+  probeNodesUsed: number;
+  mainSearchNodesUsed: number;
+  probeTimeMs: number;
+  rankPromotions: number;
+  firstParentUsableSubproof: ParentUsableSubproofEvent | null;
+}
+
 export interface SolverConfig {
   maxNodes: number;
   maxDepth: number;
@@ -291,6 +372,10 @@ export interface SolverConfig {
   onPathTrace?: (event: SearchPathTraceEvent) => void;
   /** Optional extra paths (e.g. ["sr/pass", "rr/rp"]) to include in branchCoverageSnapshots. */
   coveragePathFilters?: string[];
+  /** Default-off R20 experiment: residual defense first-divergence grouping & sibling proof replay. */
+  enableResidualSiblingReplay?: boolean | ResidualSiblingReplayMode;
+  /** Default-off R21 experiment: bounded 2-ply OR short tactical probe for eye/connection candidates. */
+  enableOrShortTacticalProbe?: boolean | ShortTacticalProbeConfig;
 }
 
 export interface PrunedCertificateRecord {

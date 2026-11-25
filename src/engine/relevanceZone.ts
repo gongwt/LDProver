@@ -20,11 +20,33 @@ export class NNAttentionMask {
   }
 }
 
-export class ProofCertificateRZ {
-  private readonly bits: Set<number>;
+function createLockedEmptySet(): ReadonlySet<number> {
+  const s = new Set<number>();
+  const throwImmutable = (): never => {
+    throw new TypeError('ProofCertificateRZ.EMPTY is immutable');
+  };
+  Object.defineProperty(s, 'add', { value: throwImmutable });
+  Object.defineProperty(s, 'delete', { value: throwImmutable });
+  Object.defineProperty(s, 'clear', { value: throwImmutable });
+  return Object.freeze(s);
+}
 
-  constructor(coords: Iterable<number> = []) {
-    this.bits = new Set(coords);
+export class ProofCertificateRZ {
+  private static readonly LOCKED_EMPTY_SET: ReadonlySet<number> =
+    createLockedEmptySet();
+  public static readonly EMPTY: ProofCertificateRZ = Object.freeze(
+    new ProofCertificateRZ()
+  ) as ProofCertificateRZ;
+
+  private readonly bits: ReadonlySet<number>;
+
+  constructor(coords?: Iterable<number>) {
+    if (coords === undefined) {
+      this.bits = ProofCertificateRZ.LOCKED_EMPTY_SET;
+    } else {
+      const s = new Set<number>(coords);
+      this.bits = s.size === 0 ? ProofCertificateRZ.LOCKED_EMPTY_SET : s;
+    }
   }
 
   public has(coord: number): boolean {
@@ -36,10 +58,14 @@ export class ProofCertificateRZ {
   }
 
   public toArray(): number[] {
+    if (this.bits.size === 0) return [];
     return Array.from(this.bits).sort((a, b) => a - b);
   }
 
   public unionWith(other: ProofCertificateRZ): ProofCertificateRZ {
+    if (this.bits.size === 0 && other.bits.size === 0) {
+      return ProofCertificateRZ.EMPTY;
+    }
     const merged = new Set<number>(this.bits);
     for (const c of other.bits) merged.add(c);
     return new ProofCertificateRZ(merged);

@@ -75,12 +75,46 @@ struct RadixPatternRecord {
   uint64_t last_touch_seq = 0;
 };
 
+struct TTProfileStats {
+  uint64_t board_queries = 0;
+  uint64_t board_bucket_hits = 0;
+  uint64_t board_entries_scanned = 0;
+  uint64_t board_exact_or_monotonic_hits = 0;
+  uint64_t board_reval_entered = 0;
+  uint64_t board_reval_succeeded = 0;
+  uint64_t board_lookup_exclusive_ns = 0;
+  uint64_t board_store_calls = 0;
+  uint64_t board_store_ns = 0;
+
+  uint64_t pattern_queries = 0;
+  uint64_t pattern_entries_scanned = 0;
+  uint64_t pattern_context_matched = 0;
+  uint64_t pattern_geom_matched = 0;
+  uint64_t pattern_direct_exact_hits = 0;
+  uint64_t pattern_heuristic_hits = 0;
+  uint64_t pattern_reval_entered = 0;
+  uint64_t pattern_reval_succeeded = 0;
+  uint64_t pattern_scan_exclusive_ns = 0;
+  uint64_t pattern_store_calls = 0;
+  uint64_t pattern_store_ns = 0;
+
+  uint64_t board_bucket_count = 0;
+  uint64_t board_total_entries = 0;
+  uint64_t pattern_entry_count = 0;
+};
+
 template <int N = kDefaultBoardSize>
 class TranspositionStore {
  public:
   using RevalidateFn = std::function<bool(uint32_t, ProofOutcome)>;
 
   TranspositionStore() = default;
+
+  void SetProfilingEnabled(bool enabled) noexcept {
+    profiling_enabled_ = enabled;
+  }
+  bool ProfilingEnabled() const noexcept { return profiling_enabled_; }
+  TTProfileStats ProfileStats() const noexcept;
 
   // FR-6.2: Clear both tables at the start of every problem (no cross-problem TT).
   void ClearAll() noexcept;
@@ -135,6 +169,8 @@ class TranspositionStore {
   uint64_t pattern_hits_ = 0;
   uint64_t pattern_proof_reusable_hits_ = 0;
   uint64_t ghi_rejected_count_ = 0;
+  bool profiling_enabled_ = false;
+  TTProfileStats profile_stats_{};
 };
 
 }  // namespace ldprover

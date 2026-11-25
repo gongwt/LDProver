@@ -10,10 +10,12 @@
 //   3. R5 §3 P1: Full-state-table cross-table DAG-to-state binding (LP-N10 on
 //      p001 ba leaf pointing to root stateId=0; PASS on valid full_state_table).
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "ldprover/core/position.h"
@@ -736,6 +738,56 @@ void TestSection6RealProblemSolverBreakthrough() {
           "Native C++20 p031 passes memory & external-bound original_root verification",
           "mem=" + mem.error_code + ", file=" + file.error_code);
 
+    std::string lproof_off_cs;
+    std::string lproof_on_cs;
+    (void)checker.SerializeLProofJson(
+        p031.initial_position, p031.proof_context, rep, &lproof_off_cs);
+
+    SolverConfig prof_cfg = real_cfg;
+    prof_cfg.enable_stage_profiling = true;
+    DfpnSolver<19> prof_solver(prof_cfg);
+    const SolveReport<19> prof_rep = prof_solver.Solve(
+        p031.initial_position, p031.proof_context, p031.region_search_mask,
+        p031.problem_id);
+    (void)checker.SerializeLProofJson(
+        p031.initial_position, p031.proof_context, prof_rep, &lproof_on_cs);
+
+    const auto& st = prof_solver.StageProfile();
+    const uint64_t reval_ns =
+        st.reval_by_caller[0].inclusive_ns +
+        st.reval_by_caller[1].inclusive_ns +
+        st.reval_by_caller[2].inclusive_ns;
+    const uint64_t accounted_ns =
+        st.benson_main_ns + st.tt.board_lookup_exclusive_ns +
+        st.tt.pattern_scan_exclusive_ns + reval_ns +
+        st.outside_rz_play_move_ns + st.frontier_tctx_ns +
+        st.frontier_gen_legal_ns + st.cand_eval_exclusive_ns + st.benson_cand_ns +
+        st.frontier_sort_init_ns + st.main_play_undo_ns + st.rz_compute_ns +
+        st.tt.board_store_ns + st.tt.pattern_store_ns;
+    const uint64_t reval_leaf_ns =
+        st.reval_cache_lookup_ns + st.benson_replay_ns +
+        st.reval_witness_play_move_ns + st.reval_universal_gen_legal_ns +
+        st.reval_universal_edge_scan_ns + st.reval_universal_play_move_ns;
+    Check(prof_rep.num_nodes == rep.num_nodes &&
+              prof_rep.root_status == rep.root_status &&
+              prof_rep.best_move == rep.best_move &&
+              prof_rep.pruned_outside_rz_count == rep.pruned_outside_rz_count &&
+              !lproof_off_cs.empty() && lproof_off_cs == lproof_on_cs,
+          "R22 stage profiling ON/OFF preserves exact p031 node count, status & proof checksum",
+          "nodes=" + std::to_string(prof_rep.num_nodes) + "/" +
+              std::to_string(rep.num_nodes) + ", csMatch=" +
+              std::string(lproof_off_cs == lproof_on_cs ? "1" : "0"));
+    Check(st.enabled && st.benson_main_calls == prof_rep.num_nodes &&
+              st.new_frontiers > 0U &&
+              st.candidates_generated >= st.candidates_scored &&
+              st.solve_total_ns > 0U && accounted_ns <= st.solve_total_ns &&
+              reval_leaf_ns <= reval_ns,
+          "R22 stage profiling records exact exclusive stage sums <= solve_total_ns & reval_leaf_ns <= reval_ns",
+          "bensonMain=" + std::to_string(st.benson_main_calls) +
+              ", nodes=" + std::to_string(prof_rep.num_nodes) +
+              ", accounted=" + std::to_string(accounted_ns) +
+              ", total=" + std::to_string(st.solve_total_ns));
+
     // Real p031 defensive line: B[sr] -> W[pass] -> B[qs] forms two tiger's mouths (rs, ss)
     Position<19> p31_pos = p031.initial_position;
     const int16_t kMoveQs =
@@ -843,6 +895,636 @@ void TestSection7R9EyeLikePassParity() {
   }
 }
 
+template <int N>
+void AssertGenerateLegalMovesMatchesReference(
+    const Position<N>& pos,
+    const std::type_identity_t<std::optional<BitBoard<N>>>& region_hint,
+    const std::string& label) {
+  const BitBoard<N> b_before = pos.Stones(ldprover::Color::kBlack);
+  const BitBoard<N> w_before = pos.Stones(ldprover::Color::kWhite);
+  const BitBoard<N> wall_before = pos.ImmortalWall();
+  const ldprover::Color to_play_before = pos.ToPlay();
+  const int16_t ko_before = pos.KoPoint();
+  const uint8_t passes_before = pos.ConsecutivePasses();
+  const uint64_t tok_before = pos.SurvivingTargetTokensMask();
+  const uint64_t hash_before = pos.ZobristHash();
+  const auto hist_before = pos.HistorySnapshots();
+  const auto trace_before = pos.PlayedMoveTrace();
+
+  const std::vector<int16_t> actual = pos.GenerateLegalMoves(region_hint);
+
+  std::vector<int16_t> expected;
+  if (!pos.IsAtDoublePass()) {
+    for (int coord = 0; coord < N * N; ++coord) {
+      if (region_hint.has_value() && !region_hint->Get(coord)) continue;
+      if (pos.IsLegalMove(static_cast<int16_t>(coord))) {
+        expected.push_back(static_cast<int16_t>(coord));
+      }
+    }
+    expected.push_back(ldprover::kPassMove);
+  }
+
+  bool hist_unchanged = (hist_before.size() == pos.HistorySnapshots().size());
+  if (hist_unchanged) {
+    for (size_t i = 0; i < hist_before.size(); ++i) {
+      const auto& a = hist_before[i];
+      const auto& b = pos.HistorySnapshots()[i];
+      if (a.black_stones != b.black_stones || a.white_stones != b.white_stones ||
+          a.to_play != b.to_play || a.zobrist_hash != b.zobrist_hash) {
+        hist_unchanged = false;
+        break;
+      }
+    }
+  }
+  const bool pos_unchanged =
+      (pos.Stones(ldprover::Color::kBlack) == b_before) &&
+      (pos.Stones(ldprover::Color::kWhite) == w_before) &&
+      (pos.ImmortalWall() == wall_before) &&
+      (pos.ToPlay() == to_play_before) && (pos.KoPoint() == ko_before) &&
+      (pos.ConsecutivePasses() == passes_before) &&
+      (pos.SurvivingTargetTokensMask() == tok_before) &&
+      (pos.ZobristHash() == hash_before) && hist_unchanged &&
+      (pos.PlayedMoveTrace() == trace_before);
+
+  Check(actual == expected && pos_unchanged,
+        "GenerateLegalMoves matches reference IsLegalMove order & mutates zero state: " +
+            label,
+        "actualSize=" + std::to_string(actual.size()) +
+            ", expectedSize=" + std::to_string(expected.size()) +
+            ", posUnchanged=" + std::string(pos_unchanged ? "1" : "0"));
+}
+
+template <int N>
+void RunSuperko18CellForSize() {
+  const int c_aa = Position<N>::CoordFromRowCol(0, 0);
+  const int c_ab = Position<N>::CoordFromRowCol(1, 0);
+  const int c_ba = Position<N>::CoordFromRowCol(0, 1);
+  const int c_bb = Position<N>::CoordFromRowCol(1, 1);
+  const int c_ca = Position<N>::CoordFromRowCol(0, 2);
+  const int c_cb = Position<N>::CoordFromRowCol(1, 2);
+  const int c_da = Position<N>::CoordFromRowCol(0, 3);
+
+  for (const ldprover::KoRule rule :
+       {ldprover::KoRule::kSituationalSuperko,
+        ldprover::KoRule::kPositionalSuperko,
+        ldprover::KoRule::kSimpleKoOnly}) {
+    ldprover::ProofContext ctx;
+    ctx.context_id = 0x515253ULL + static_cast<uint64_t>(N);
+    ctx.root_attacker = ldprover::Color::kBlack;
+    ctx.attacker_goal = ldprover::SearchGoal::kToLive;
+    ctx.ko_rule = rule;
+    ctx.attacker_allow_ko = true;
+    ctx.defender_allow_ko = true;
+
+    // Path 1: AB[bb][cb][da] AW[ab][ba][ca], PL[B] -> B[aa], W[ba], B[pass]
+    Position<N> pos1(ctx);
+    pos1.SetupInitialStone(c_bb, ldprover::Color::kBlack);
+    pos1.SetupInitialStone(c_cb, ldprover::Color::kBlack);
+    pos1.SetupInitialStone(c_da, ldprover::Color::kBlack);
+    pos1.SetupInitialStone(c_ab, ldprover::Color::kWhite);
+    pos1.SetupInitialStone(c_ba, ldprover::Color::kWhite);
+    pos1.SetupInitialStone(c_ca, ldprover::Color::kWhite);
+    pos1.FinalizeInitialPosition(ldprover::Color::kBlack);
+    const bool p1_m1 = pos1.PlayMove(static_cast<int16_t>(c_aa));
+    const bool p1_m2 = pos1.PlayMove(static_cast<int16_t>(c_ba));
+    const bool p1_m3 = pos1.PlayMove(ldprover::kPassMove);
+
+    // Path 2: AB[bb][cb][da] AW[ab][ba], PL[B] -> B[pass]
+    Position<N> pos2(ctx);
+    pos2.SetupInitialStone(c_bb, ldprover::Color::kBlack);
+    pos2.SetupInitialStone(c_cb, ldprover::Color::kBlack);
+    pos2.SetupInitialStone(c_da, ldprover::Color::kBlack);
+    pos2.SetupInitialStone(c_ab, ldprover::Color::kWhite);
+    pos2.SetupInitialStone(c_ba, ldprover::Color::kWhite);
+    pos2.FinalizeInitialPosition(ldprover::Color::kBlack);
+    const bool p2_m1 = pos2.PlayMove(ldprover::kPassMove);
+
+    const bool expected_ca_legal_p1 = (rule == ldprover::KoRule::kSimpleKoOnly);
+    const bool expected_ca_legal_p2 = true;
+
+    const bool same_board_hash =
+        (pos1.Stones(ldprover::Color::kBlack) ==
+         pos2.Stones(ldprover::Color::kBlack)) &&
+        (pos1.Stones(ldprover::Color::kWhite) ==
+         pos2.Stones(ldprover::Color::kWhite)) &&
+        (pos1.ToPlay() == pos2.ToPlay()) &&
+        (pos1.KoPoint() == pos2.KoPoint()) &&
+        (pos1.ConsecutivePasses() == pos2.ConsecutivePasses()) &&
+        (pos1.ZobristHash() == pos2.ZobristHash()) &&
+        (N != 19 || pos1.ZobristHash() == 6044147128762452085ULL);
+
+    const std::string tag =
+        "N=" + std::to_string(N) + ",rule=" + std::to_string(static_cast<int>(rule));
+    AssertGenerateLegalMovesMatchesReference(pos1, std::nullopt, "p1_" + tag);
+    AssertGenerateLegalMovesMatchesReference(pos2, std::nullopt, "p2_" + tag);
+
+    const auto moves1 = pos1.GenerateLegalMoves(std::nullopt);
+    const auto moves2 = pos2.GenerateLegalMoves(std::nullopt);
+    const bool gen_ca_p1 =
+        std::find(moves1.begin(), moves1.end(), static_cast<int16_t>(c_ca)) !=
+        moves1.end();
+    const bool gen_ca_p2 =
+        std::find(moves2.begin(), moves2.end(), static_cast<int16_t>(c_ca)) !=
+        moves2.end();
+    Position<N> try1 = pos1;
+    Position<N> try2 = pos2;
+    const bool play_ca_p1 = try1.PlayMove(static_cast<int16_t>(c_ca));
+    const bool play_ca_p2 = try2.PlayMove(static_cast<int16_t>(c_ca));
+
+    Check(p1_m1 && p1_m2 && p1_m3 && p2_m1 && same_board_hash &&
+              gen_ca_p1 == expected_ca_legal_p1 &&
+              pos1.IsLegalMove(static_cast<int16_t>(c_ca)) == expected_ca_legal_p1 &&
+              play_ca_p1 == expected_ca_legal_p1 &&
+              gen_ca_p2 == expected_ca_legal_p2 &&
+              pos2.IsLegalMove(static_cast<int16_t>(c_ca)) == expected_ca_legal_p2 &&
+              play_ca_p2 == expected_ca_legal_p2,
+          "R22 §4 18-cell superko equivalence check (" + tag + ")",
+          "hash=" + std::to_string(pos1.ZobristHash()) +
+              ", gen1=" + std::to_string(gen_ca_p1) +
+              ", gen2=" + std::to_string(gen_ca_p2));
+  }
+}
+
+void TestSection8GenerateLegalMovesSemantics() {
+  std::cout << "\n=== 8. R22 §4/§5 GenerateLegalMoves Semantic Guard (18-Cell Superko & Edge Cases) ===\n";
+  RunSuperko18CellForSize<5>();
+  RunSuperko18CellForSize<7>();
+  RunSuperko18CellForSize<19>();
+
+  // Edge Case A: Suicide, Crucial-Token Capture, and Immortal Wall on 5x5
+  {
+    ldprover::ProofContext ctx;
+    ctx.context_id = 0xAA01ULL;
+    ctx.root_attacker = ldprover::Color::kBlack;
+    ctx.attacker_goal = ldprover::SearchGoal::kToKill;
+    ctx.ko_rule = ldprover::KoRule::kSituationalSuperko;
+    ctx.attacker_allow_ko = true;
+    ctx.defender_allow_ko = true;
+    ctx.initial_tokens.push_back(
+        {0U, static_cast<int16_t>(Position<5>::CoordFromRowCol(0, 1)), 0U,
+         ldprover::Color::kWhite});
+
+    // W[ba] in atari on aa; W[ea,db] is immortal wall with single empty point da.
+    Position<5> edge_pos(ctx);
+    edge_pos.SetupInitialStone(Position<5>::CoordFromRowCol(1, 0),
+                               ldprover::Color::kBlack);
+    edge_pos.SetupInitialStone(Position<5>::CoordFromRowCol(1, 1),
+                               ldprover::Color::kBlack);
+    edge_pos.SetupInitialStone(Position<5>::CoordFromRowCol(0, 2),
+                               ldprover::Color::kBlack);
+    edge_pos.SetupInitialStone(Position<5>::CoordFromRowCol(0, 1),
+                               ldprover::Color::kWhite);
+    edge_pos.SetupInitialStone(Position<5>::CoordFromRowCol(0, 4),
+                               ldprover::Color::kWhite);
+    edge_pos.SetupInitialStone(Position<5>::CoordFromRowCol(1, 3),
+                               ldprover::Color::kBlack);
+    edge_pos.SetupInitialStone(Position<5>::CoordFromRowCol(1, 4),
+                               ldprover::Color::kBlack);
+    BitBoard<5> wall;
+    wall.Set(Position<5>::CoordFromRowCol(0, 4), true);
+    edge_pos.SetImmortalWall(wall);
+    edge_pos.FinalizeInitialPosition(ldprover::Color::kBlack);
+
+    AssertGenerateLegalMovesMatchesReference(edge_pos, std::nullopt,
+                                             "5x5_capture_suicide_wall");
+    const auto all_m = edge_pos.GenerateLegalMoves(std::nullopt);
+    const int c_aa = Position<5>::CoordFromRowCol(0, 0);
+    const int c_da = Position<5>::CoordFromRowCol(0, 3);
+    Check(std::find(all_m.begin(), all_m.end(), static_cast<int16_t>(c_aa)) !=
+              all_m.end(),
+          "5x5 capturing crucial token at aa is legal even with 1 eye point",
+          "");
+    // Now test White suicide on aa when B[ab,bb,ca] and W[da] wall:
+    // After B[pass], White at aa is suicide (cannot capture B[ab,bb,ca]),
+    // whereas B[da] cannot capture immortal wall W[ea] -> Wait, B[da] connects to B[db], legal.
+    Position<5> sui_pos = edge_pos;
+    sui_pos.SetupInitialStone(Position<5>::CoordFromRowCol(0, 1),
+                              ldprover::Color::kEmpty);
+    sui_pos.SetupInitialStone(Position<5>::CoordFromRowCol(0, 1),
+                              ldprover::Color::kBlack);
+    // Surround (0,0) with B[(0,1), (1,0)]: W playing at (0,0) is pure suicide.
+    Position<5> pure_sui(ctx);
+    pure_sui.SetupInitialStone(Position<5>::CoordFromRowCol(0, 1),
+                               ldprover::Color::kBlack);
+    pure_sui.SetupInitialStone(Position<5>::CoordFromRowCol(1, 0),
+                               ldprover::Color::kBlack);
+    pure_sui.FinalizeInitialPosition(ldprover::Color::kWhite);
+    AssertGenerateLegalMovesMatchesReference(pure_sui, std::nullopt,
+                                             "5x5_white_suicide_at_aa");
+    const auto sui_m = pure_sui.GenerateLegalMoves(std::nullopt);
+    Check(std::find(sui_m.begin(), sui_m.end(), static_cast<int16_t>(c_aa)) ==
+              sui_m.end(),
+          "5x5 suicide move W[aa] is excluded by GenerateLegalMoves", "");
+    (void)c_da;
+
+    // Crucial token mask & immortal wall check: Play W[ca] inside W[ba]? Wait:
+    // White[ea] surrounded by B[(0,3),(1,4)] is immortal wall -> Black cannot
+    // capture W[ea], and White cannot capture non-empty. Put B[(0,3)] wall
+    // protection: surround W[ea] at (0,4) except (0,3)=da occupied -> even with
+    // (0,3) empty: B at (0,3) has neighbors (0,2)=B, (1,3)=B, (0,4)=W(wall)
+    // Test opposite: surround B[(0,4)] (immortal) by W[(0,3)=empty, (1,4)=W]
+    // -> W[(0,3)] surrounded by W[(1,3),(0,2)]? Place W[(0,3)] surrounded by
+    // B[(0,2),(1,3)] -> W[(0,3)] cannot capture B, and B[(0,4)] wouldn't be
+    // captured if W had wall. Put B at (0,4) WITH wall, W surrounds at (1,4),
+    // and only empty point is (0,3) surrounded by B[(0,2),(1,3)] -> wait: put
+    // B[(1,4)] immortal wall, surrounded by W[(2,4),(1,3),(0,4)=empty] ->
+    // W[(0,4)] fails suicide because immortal B[(1,4)] cannot be captured!
+    // B[(1,4)] is immortal wall surrounded by W[(2,4),(1,3)] and empty (0,4);
+    // B[(0,3)] has liberty (0,2), so W[(0,4)] cannot capture B[(1,4)] (wall)
+    // nor B[(0,3)] -> W[ea] is suicide and excluded.
+    Position<5> wall_pos(ctx);
+    wall_pos.SetupInitialStone(Position<5>::CoordFromRowCol(1, 4),
+                               ldprover::Color::kBlack);
+    wall_pos.SetupInitialStone(Position<5>::CoordFromRowCol(0, 3),
+                               ldprover::Color::kBlack);
+    wall_pos.SetupInitialStone(Position<5>::CoordFromRowCol(2, 4),
+                               ldprover::Color::kWhite);
+    wall_pos.SetupInitialStone(Position<5>::CoordFromRowCol(1, 3),
+                               ldprover::Color::kWhite);
+    BitBoard<5> wall_b;
+    wall_b.Set(Position<5>::CoordFromRowCol(1, 4), true);
+    wall_pos.SetImmortalWall(wall_b);
+    wall_pos.FinalizeInitialPosition(ldprover::Color::kWhite);
+    AssertGenerateLegalMovesMatchesReference(wall_pos, std::nullopt,
+                                             "5x5_immortal_wall_no_capture");
+    const auto wm = wall_pos.GenerateLegalMoves(std::nullopt);
+    const int c_ea = Position<5>::CoordFromRowCol(0, 4);
+    Check(std::find(wm.begin(), wm.end(), static_cast<int16_t>(c_ea)) ==
+              wm.end(),
+          "5x5 W[ea] cannot capture immortal wall B[eb] -> suicide excluded", "");
+  }
+
+  // Edge Case B: Explicit Empty Region & Double PASS on 19x19 (p042 context)
+  {
+    const ParsedProblem<19> p001 = BuildP001();
+    const std::optional<BitBoard<19>> empty_reg = BitBoard<19>{};
+    AssertGenerateLegalMovesMatchesReference(p001.initial_position, empty_reg,
+                                             "19x19_explicit_empty_region");
+    const auto em = p001.initial_position.GenerateLegalMoves(empty_reg);
+    Check(em.size() == 1U && em[0] == ldprover::kPassMove,
+          "19x19 explicit empty region returns [kPassMove] only",
+          "size=" + std::to_string(em.size()));
+
+    Position<19> dp = p001.initial_position;
+    const bool p1 = dp.PlayMove(ldprover::kPassMove);
+    const bool p2 = dp.PlayMove(ldprover::kPassMove);
+    AssertGenerateLegalMovesMatchesReference(dp, std::nullopt,
+                                             "19x19_double_pass_unbounded");
+    AssertGenerateLegalMovesMatchesReference(dp, p001.region_search_mask,
+                                             "19x19_double_pass_region");
+    Check(p1 && p2 && dp.GenerateLegalMoves(std::nullopt).empty() &&
+              dp.GenerateLegalMoves(p001.region_search_mask).empty(),
+          "19x19 double PASS yields empty legal move vector", "");
+  }
+
+  // Edge Case C: p003/p005 Ko & Capture States
+  {
+    const ParsedProblem<19> p003 = BuildP003();
+    AssertGenerateLegalMovesMatchesReference(p003.initial_position,
+                                             p003.region_search_mask,
+                                             "19x19_p003_root");
+    const ParsedProblem<19> p005 = BuildP005(true);
+    Position<19> ko_state = p005.initial_position;
+    // Play B[ca] (ko capture of W[ba])? Wait: in p005 B plays ca to test ko state
+    const int16_t kCa =
+        static_cast<int16_t>(Position<19>::CoordFromRowCol(0, 2));
+    if (ko_state.PlayMove(kCa)) {
+      AssertGenerateLegalMovesMatchesReference(ko_state,
+                                               p005.region_search_mask,
+                                               "19x19_p005_after_ko_capture");
+    }
+  }
+}
+
+template <int N>
+void AssertZobristSynced(const Position<N>& pos, const std::string& label) {
+  const uint64_t expected = pos.RecomputeZobristForTest();
+  const bool snap_ok = !pos.HistorySnapshots().empty() &&
+                       pos.HistorySnapshots().back().zobrist_hash == expected;
+  Check(pos.ZobristHash() == expected && snap_ok, label,
+        "hash=" + std::to_string(pos.ZobristHash()) +
+            " recomputed=" + std::to_string(expected) +
+            " snaps=" + std::to_string(pos.HistorySnapshots().size()));
+}
+
+void TestSection9IncrementalZobristParity() {
+  std::cout << "\n=== 9. R24 Incremental Zobrist Step-by-Step Parity ===\n";
+
+  // 9.1 Multi-chain simultaneous capture (including U-chain touched twice),
+  // suicide rollback, immortal-wall suicide rollback, PASS, and full Undo on 5x5
+  {
+    ldprover::ProofContext ctx{};
+    ctx.ko_rule = ldprover::KoRule::kSituationalSuperko;
+    Position<5> pos(ctx);
+    Check(pos.ZobristHash() == pos.RecomputeZobristForTest(),
+          "5x5 empty Clear() hash matches ComputeZobrist", "");
+
+    // Setup U-shaped W[(0,0),(0,1),(1,0)] + isolated W[(1,2)] whose sole
+    // common liberty is (1,1); surrounders B[(0,2),(1,3),(2,0),(2,2)] and (2,1)?
+    // Check liberties of (0,0),(0,1),(1,0):
+    //   (0,0)->(0,1)=W,(1,0)=W
+    //   (0,1)->(0,0)=W,(0,2)=B,(1,1)=empty
+    //   (1,0)->(0,0)=W,(2,0)=B,(1,1)=empty
+    // Check liberties of W[(1,2)]: (0,2)=B,(1,3)=B,(2,2)=B,(1,1)=empty!
+    pos.SetupInitialStone(Position<5>::CoordFromRowCol(0, 0),
+                          ldprover::Color::kWhite);
+    pos.SetupInitialStone(Position<5>::CoordFromRowCol(0, 1),
+                          ldprover::Color::kWhite);
+    pos.SetupInitialStone(Position<5>::CoordFromRowCol(1, 0),
+                          ldprover::Color::kWhite);
+    pos.SetupInitialStone(Position<5>::CoordFromRowCol(1, 2),
+                          ldprover::Color::kWhite);
+    pos.SetupInitialStone(Position<5>::CoordFromRowCol(0, 2),
+                          ldprover::Color::kBlack);
+    pos.SetupInitialStone(Position<5>::CoordFromRowCol(1, 3),
+                          ldprover::Color::kBlack);
+    pos.SetupInitialStone(Position<5>::CoordFromRowCol(2, 0),
+                          ldprover::Color::kBlack);
+    pos.SetupInitialStone(Position<5>::CoordFromRowCol(2, 2),
+                          ldprover::Color::kBlack);
+    // Also isolate (4,4) with W[(4,3),(3,4)] so Black playing (4,4) is suicide
+    pos.SetupInitialStone(Position<5>::CoordFromRowCol(4, 3),
+                          ldprover::Color::kWhite);
+    pos.SetupInitialStone(Position<5>::CoordFromRowCol(3, 4),
+                          ldprover::Color::kWhite);
+    pos.FinalizeInitialPosition(ldprover::Color::kBlack);
+    AssertZobristSynced(pos, "5x5 initial setup");
+    const uint64_t h_init = pos.ZobristHash();
+
+    // Suicide attempt at (4,4) must fail and preserve hash/history identically
+    const bool sui_ok =
+        pos.PlayMove(static_cast<int16_t>(Position<5>::CoordFromRowCol(4, 4)));
+    Check(!sui_ok, "5x5 suicide rejected", "");
+    AssertZobristSynced(pos, "5x5 post-suicide-rollback");
+    Check(pos.ZobristHash() == h_init, "5x5 hash unchanged after suicide", "");
+
+    // Multi-chain multi-stone capture at (1,1) captures 4 W stones (3+1)
+    const bool cap_ok =
+        pos.PlayMove(static_cast<int16_t>(Position<5>::CoordFromRowCol(1, 1)));
+    Check(cap_ok && pos.StoneAt(Position<5>::CoordFromRowCol(0, 0)) ==
+                        ldprover::Color::kEmpty &&
+              pos.StoneAt(Position<5>::CoordFromRowCol(1, 2)) ==
+                  ldprover::Color::kEmpty,
+          "5x5 simultaneous U-chain + singleton capture succeeds", "");
+    AssertZobristSynced(pos, "5x5 after multi-chain capture");
+
+    // Normal alternating moves & PASS & double-PASS + Undo unwind
+    Check(pos.PlayMove(static_cast<int16_t>(Position<5>::CoordFromRowCol(0, 0))),
+          "5x5 normal W move", "");
+    AssertZobristSynced(pos, "5x5 after normal W move");
+    Check(pos.PlayMove(ldprover::kPassMove), "5x5 B pass", "");
+    AssertZobristSynced(pos, "5x5 after B pass");
+    Check(pos.PlayMove(ldprover::kPassMove), "5x5 W double-pass", "");
+    AssertZobristSynced(pos, "5x5 after W double-pass");
+    Check(!pos.PlayMove(ldprover::kPassMove), "5x5 triple-pass rejected", "");
+    AssertZobristSynced(pos, "5x5 after rejected move post-double-pass");
+
+    while (!pos.PlayedMoveTrace().empty()) {
+      pos.UndoMove();
+      AssertZobristSynced(pos, "5x5 during UndoMove unwind");
+    }
+    Check(pos.ZobristHash() == h_init, "5x5 UndoMove restores exact init hash",
+          "");
+
+    // Immortal-wall suicide rollback
+    Position<5> wall_pos(ctx);
+    wall_pos.SetupInitialStone(Position<5>::CoordFromRowCol(1, 4),
+                               ldprover::Color::kBlack);
+    wall_pos.SetupInitialStone(Position<5>::CoordFromRowCol(0, 3),
+                               ldprover::Color::kBlack);
+    wall_pos.SetupInitialStone(Position<5>::CoordFromRowCol(2, 4),
+                               ldprover::Color::kWhite);
+    wall_pos.SetupInitialStone(Position<5>::CoordFromRowCol(1, 3),
+                               ldprover::Color::kWhite);
+    BitBoard<5> wall_b;
+    wall_b.Set(Position<5>::CoordFromRowCol(1, 4), true);
+    wall_pos.SetImmortalWall(wall_b);
+    wall_pos.FinalizeInitialPosition(ldprover::Color::kWhite);
+    AssertZobristSynced(wall_pos, "5x5 immortal wall init");
+    const bool wall_sui = wall_pos.PlayMove(
+        static_cast<int16_t>(Position<5>::CoordFromRowCol(0, 4)));
+    Check(!wall_sui, "5x5 immortal-wall capture suicide rejected", "");
+    AssertZobristSynced(wall_pos, "5x5 post-immortal-wall-suicide rollback");
+  }
+
+  // 9.2 Simple ko creation, simple ko rejection, ko clearing via non-ko move
+  // and PASS, SSK + PSK superko rollbacks, and GenerateLegalMoves on 7x7 & 19x19
+  auto run_ko_and_superko_suite = []<int N>(const std::string& tag) {
+    ldprover::ProofContext ssk_ctx{};
+    ssk_ctx.ko_rule = ldprover::KoRule::kSituationalSuperko;
+    Position<N> pos(ssk_ctx);
+    // Standard corner/edge simple ko around (0,1) captured vs (0,2):
+    // B: (0,0), (1,1), (0,3)? Wait: simpler centered ko on >=5x5:
+    //   B at (1,2), (2,1), (2,3), (3,2) captures W[(2,2)] when W surrounds (1,2)?
+    //   Classic 4-stone ko at row 2:
+    //   B[(1,1),(2,0),(3,1)], W[(1,2),(2,3),(3,2),(2,1)], empty=(2,2)
+    pos.SetupInitialStone(Position<N>::CoordFromRowCol(1, 1),
+                          ldprover::Color::kBlack);
+    pos.SetupInitialStone(Position<N>::CoordFromRowCol(2, 0),
+                          ldprover::Color::kBlack);
+    pos.SetupInitialStone(Position<N>::CoordFromRowCol(3, 1),
+                          ldprover::Color::kBlack);
+    pos.SetupInitialStone(Position<N>::CoordFromRowCol(1, 2),
+                          ldprover::Color::kWhite);
+    pos.SetupInitialStone(Position<N>::CoordFromRowCol(2, 3),
+                          ldprover::Color::kWhite);
+    pos.SetupInitialStone(Position<N>::CoordFromRowCol(3, 2),
+                          ldprover::Color::kWhite);
+    pos.SetupInitialStone(Position<N>::CoordFromRowCol(2, 1),
+                          ldprover::Color::kWhite);
+    // Keep extra stones so non-ko moves remain valid without altering ko
+    pos.FinalizeInitialPosition(ldprover::Color::kBlack);
+    AssertZobristSynced(pos, tag + " ko init");
+
+    const int16_t kKoCaptureB =
+        static_cast<int16_t>(Position<N>::CoordFromRowCol(2, 2));
+    const int16_t kKoRecapW =
+        static_cast<int16_t>(Position<N>::CoordFromRowCol(2, 1));
+    bool is_ko = false;
+    Check(pos.PlayMove(kKoCaptureB, &is_ko) && is_ko &&
+              pos.KoPoint() == kKoRecapW,
+          tag + " simple ko created at (2,1)", "");
+    AssertZobristSynced(pos, tag + " after simple ko capture");
+
+    // Immediate ko recapture rejected
+    Check(!pos.PlayMove(kKoRecapW), tag + " immediate ko recapture rejected",
+          "");
+    AssertZobristSynced(pos, tag + " after rejected ko recapture");
+
+    // GenerateLegalMoves keeps parent hash/history untouched
+    const uint64_t pre_gen_hash = pos.ZobristHash();
+    const size_t pre_gen_snaps = pos.HistorySnapshots().size();
+    const auto gl = pos.GenerateLegalMoves(std::nullopt);
+    Check(!gl.empty() && pos.ZobristHash() == pre_gen_hash &&
+              pos.HistorySnapshots().size() == pre_gen_snaps,
+          tag + " GenerateLegalMoves leaves hash & history invariant", "");
+    AssertZobristSynced(pos, tag + " after GenerateLegalMoves");
+
+    // Ko cleared by PASS
+    {
+      Position<N> pass_clear = pos;
+      Check(pass_clear.PlayMove(ldprover::kPassMove) &&
+                pass_clear.KoPoint() == ldprover::kNullMove,
+            tag + " PASS clears ko_point_", "");
+      AssertZobristSynced(pass_clear, tag + " after PASS clears ko");
+      pass_clear.UndoMove();
+      AssertZobristSynced(pass_clear, tag + " after Undo PASS restores ko");
+    }
+
+    // Ko cleared by non-ko move, then SSK superko test via recapture
+    const int16_t w_else =
+        static_cast<int16_t>(Position<N>::CoordFromRowCol(N - 1, N - 1));
+    const int16_t b_else =
+        static_cast<int16_t>(Position<N>::CoordFromRowCol(N - 1, N - 2));
+    Check(pos.PlayMove(w_else) && pos.KoPoint() == ldprover::kNullMove,
+          tag + " non-ko move clears ko_point_", "");
+    AssertZobristSynced(pos, tag + " after non-ko W move clears ko");
+    Check(pos.PlayMove(b_else), tag + " non-ko B move", "");
+    AssertZobristSynced(pos, tag + " after non-ko B move");
+    Check(pos.PlayMove(kKoRecapW, &is_ko) && is_ko &&
+              pos.KoPoint() == kKoCaptureB,
+          tag + " W recaptures ko after ko threat", "");
+    AssertZobristSynced(pos, tag + " after W ko recapture");
+
+    // Exact SSK & PSK superko violation rollback (using R22 18-cell superko
+    // gadget: AB[bb][cb][da] AW[ab][ba][ca], B[aa], W[ba], B[pass] -> W[ca])
+    for (auto rule : {ldprover::KoRule::kSituationalSuperko,
+                      ldprover::KoRule::kPositionalSuperko}) {
+      ldprover::ProofContext rctx{};
+      rctx.ko_rule = rule;
+      Position<N> rpos(rctx);
+      const int16_t c_aa =
+          static_cast<int16_t>(Position<N>::CoordFromRowCol(0, 0));
+      const int16_t c_ba =
+          static_cast<int16_t>(Position<N>::CoordFromRowCol(0, 1));
+      const int16_t c_ca =
+          static_cast<int16_t>(Position<N>::CoordFromRowCol(0, 2));
+      const int16_t c_ab =
+          static_cast<int16_t>(Position<N>::CoordFromRowCol(1, 0));
+      const int16_t c_bb =
+          static_cast<int16_t>(Position<N>::CoordFromRowCol(1, 1));
+      const int16_t c_cb =
+          static_cast<int16_t>(Position<N>::CoordFromRowCol(1, 2));
+      const int16_t c_da =
+          static_cast<int16_t>(Position<N>::CoordFromRowCol(0, 3));
+      rpos.SetupInitialStone(c_bb, ldprover::Color::kBlack);
+      rpos.SetupInitialStone(c_cb, ldprover::Color::kBlack);
+      rpos.SetupInitialStone(c_da, ldprover::Color::kBlack);
+      rpos.SetupInitialStone(c_ab, ldprover::Color::kWhite);
+      rpos.SetupInitialStone(c_ba, ldprover::Color::kWhite);
+      rpos.SetupInitialStone(c_ca, ldprover::Color::kWhite);
+      rpos.FinalizeInitialPosition(ldprover::Color::kBlack);
+      AssertZobristSynced(rpos, tag + " superko init");
+
+      Check(rpos.PlayMove(c_aa), tag + " superko setup B[aa]", "");
+      AssertZobristSynced(rpos, tag + " after superko setup B[aa]");
+      Check(rpos.PlayMove(c_ba), tag + " superko setup W[ba]", "");
+      AssertZobristSynced(rpos, tag + " after superko setup W[ba]");
+      Check(rpos.PlayMove(ldprover::kPassMove), tag + " superko setup B[pass]",
+            "");
+      AssertZobristSynced(rpos, tag + " after superko setup B[pass]");
+
+      const uint64_t pre_superko_hash = rpos.ZobristHash();
+      const size_t pre_superko_snaps = rpos.HistorySnapshots().size();
+      const bool rejected_ca = !rpos.PlayMove(c_ca);
+      Check(rejected_ca && rpos.ZobristHash() == pre_superko_hash &&
+                rpos.HistorySnapshots().size() == pre_superko_snaps,
+            tag + " superko rollback preserves exact Zobrist & history",
+            "rule=" + std::to_string(static_cast<int>(rule)));
+      AssertZobristSynced(rpos, tag + " post-superko-rollback");
+    }
+  };
+  run_ko_and_superko_suite.template operator()<5>("5x5");
+  run_ko_and_superko_suite.template operator()<7>("7x7");
+  run_ko_and_superko_suite.template operator()<19>("19x19");
+}
+
+template <int N>
+void VerifyOrthoTableForSize(const std::string& tag) {
+  Position<N> pos;
+  int corners = 0;
+  int edges = 0;
+  int interiors = 0;
+  bool all_exact = true;
+  for (int coord = 0; coord < N * N; ++coord) {
+    const auto ref = pos.OrthogonalNeighbors(coord);
+    const auto tbl = Position<N>::PrecomputedOrthogonalNeighborsForTest(coord);
+    if (static_cast<size_t>(tbl.count) != ref.size()) {
+      all_exact = false;
+      break;
+    }
+    for (size_t i = 0; i < ref.size(); ++i) {
+      if (tbl.coords[i] != ref[i]) {
+        all_exact = false;
+        break;
+      }
+    }
+    if (!all_exact) break;
+    if (tbl.count == 2) ++corners;
+    else if (tbl.count == 3) ++edges;
+    else if (tbl.count == 4) ++interiors;
+    else all_exact = false;
+  }
+  const auto neg = Position<N>::PrecomputedOrthogonalNeighborsForTest(-1);
+  const auto oob =
+      Position<N>::PrecomputedOrthogonalNeighborsForTest(N * N);
+  Check(all_exact && corners == 4 && edges == 4 * (N - 2) &&
+            interiors == (N - 2) * (N - 2) && neg.count == 0 && oob.count == 0,
+        "R25 " + tag + " precomputed ortho table matches OrthogonalNeighbors in exact sequence & counts",
+        "exact=" + std::to_string(all_exact) + " c/e/i=" +
+            std::to_string(corners) + "/" + std::to_string(edges) + "/" +
+            std::to_string(interiors));
+}
+
+void TestSection10OrthoNeighborTableParity() {
+  std::cout << "\n=== 10. R25 Precomputed Orthogonal Neighbor Table Exhaustive Parity ===\n";
+  VerifyOrthoTableForSize<5>("5x5");
+  VerifyOrthoTableForSize<7>("7x7");
+  VerifyOrthoTableForSize<19>("19x19");
+}
+
+void TestSection11ConvergenceObserverParity() {
+  std::cout << "\n=== 11. R26 Opt-In Read-Only Convergence Observer Parity ===\n";
+  const ParsedProblem<19> p003 = BuildP003();
+  SolverConfig cfg_off = DefaultConfig(3500U);
+  SolverConfig cfg_on = DefaultConfig(3500U);
+  cfg_on.enable_convergence_trace = true;
+  cfg_on.observed_paths = {"", "pass", "nonexistent"};
+
+  DfpnSolver<19> s_off(cfg_off);
+  DfpnSolver<19> s_on(cfg_on);
+  const auto r_off = s_off.Solve(p003.initial_position, p003.proof_context,
+                                 p003.region_search_mask, "p003");
+  const auto r_on = s_on.Solve(p003.initial_position, p003.proof_context,
+                               p003.region_search_mask, "p003");
+
+  ProofArtifactManager<19> mgr;
+  std::string cs_off, cs_on;
+  const std::string j_off = mgr.SerializeLProofJson(
+      p003.initial_position, p003.proof_context, r_off, &cs_off);
+  const std::string j_on = mgr.SerializeLProofJson(
+      p003.initial_position, p003.proof_context, r_on, &cs_on);
+  const auto& tr = s_on.ConvergenceTrace();
+  bool root_partition_ok = false;
+  if (tr.watched_paths.size() == 3U && tr.watched_paths[0].frontier_exists) {
+    const auto& w0 = tr.watched_paths[0];
+    const uint32_t sum =
+        w0.closed_proven_win_direct + w0.closed_proven_win_outside_rz +
+        w0.closed_proven_loss_direct + w0.closed_proven_loss_outside_rz +
+        w0.ko_barrier_count + w0.deferred_outside_rz_count +
+        w0.expanded_unknown_count + w0.unexpanded_unknown_count;
+    root_partition_ok = (sum == w0.total_legal_moves && w0.total_legal_moves > 0);
+  }
+  Check(j_off == j_on && cs_off == cs_on && !s_off.ConvergenceTrace().enabled &&
+            tr.enabled && tr.first_terminal_leaf_node > 0 &&
+            tr.first_proven_subproof_node > 0 && root_partition_ok &&
+            tr.watched_paths.size() == 3U &&
+            tr.watched_paths[2].first_enter_node == 0,
+        "R26 convergence observer leaves p003 LProof bytes invariant and partitions legal moves cleanly",
+        "leaf=" + std::to_string(tr.first_terminal_leaf_node) +
+            " partition=" + std::to_string(root_partition_ok));
+}
+
 }  // namespace
 
 int main() {
@@ -853,6 +1535,10 @@ int main() {
   TestSection5R8ProblemContractAndConsistency();
   TestSection6RealProblemSolverBreakthrough();
   TestSection7R9EyeLikePassParity();
+  TestSection8GenerateLegalMovesSemantics();
+  TestSection9IncrementalZobristParity();
+  TestSection10OrthoNeighborTableParity();
+  TestSection11ConvergenceObserverParity();
 
   const int failed = g_total - g_passed;
   std::cout << "\n========================================\n"
