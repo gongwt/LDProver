@@ -27,6 +27,12 @@ enum class VerificationScope : uint8_t {
   kFreeExploration = 2,
 };
 
+enum class SubproofBindingPolicy : uint8_t {
+  kStrictWhenRootProven = 0,
+  kRequireBoundRootEdge = 1,
+  kSemanticReplayOnly = 2,
+};
+
 struct VerificationReport {
   bool passed = false;
   std::string schema_version = "lproof/1";
@@ -35,6 +41,13 @@ struct VerificationReport {
   std::string encoding_mode;
   std::string verified_scope;
   std::string verified_root_kind;
+  std::string edge_binding_status = "not_applicable";
+  bool edge_bound_to_root_dag = false;
+  int32_t recorded_edge_dag_node_id = -1;
+  std::string source_edge_binding_status = "not_applicable";
+  bool source_edge_bound_to_root_dag = false;
+  int32_t source_recorded_edge_dag_node_id = -1;
+  bool semantic_replay_passed = false;
   bool trace_outside_region = false;
   bool trace_has_restricted_ko_capture = false;
   uint32_t verified_nodes = 0;
@@ -85,6 +98,45 @@ class ProofArtifactManager {
       const std::string& json_text,
       const ParsedProblem<N>* expected_problem = nullptr,
       std::optional<VerificationScope> scope_override = std::nullopt) const;
+
+  // Read-only zero-trust verification of subproof `target_dag_node_id` at
+  // `rel_path_moves` from `solve_root_pos`. Does not mutate `report`.
+  // Distinguishes original root-DAG edge ownership (`edge_bound_to_root_dag`,
+  // `recorded_edge_dag_node_id`) from query-position semantic replay
+  // (`semantic_replay_passed`):
+  // - `kStrictWhenRootProven` (default): enforces recorded root-DAG edge
+  //   identity when `report.root_status != kUnknown`; allows unbound semantic
+  //   replay (`edge_binding_status = "unbound_unknown_root"`) on UNKNOWN roots.
+  // - `kRequireBoundRootEdge`: fails if the original root DAG cannot bind the
+  //   exact edge (`LP-U01` on UNKNOWN root, `LP-R02` on missing/mismatched edge).
+  // - `kSemanticReplayOnly`: skips root-edge ownership enforcement to test
+  //   whether `target_dag_node_id` proves `sub_pos`, setting
+  //   `edge_bound_to_root_dag = false` and `"unbound_replay_only"`.
+  VerificationReport VerifySubproofAtPath(
+      const Position<N>& solve_root_pos, const ProofContext& context,
+      const SolveReport<N>& report,
+      const std::vector<int16_t>& rel_path_moves, uint32_t target_dag_node_id,
+      SubproofBindingPolicy binding_policy =
+          SubproofBindingPolicy::kStrictWhenRootProven) const;
+
+  // Read-only verification of sibling RZ reuse: validates source proof at
+  // `parent_rel_moves + source_move` (`source_dag_node_id`) according to
+  // `source_binding_policy`, then replays `source_dag_node_id` semantically
+  // against sibling `parent_rel_moves + query_move`.
+  // Preserves source provenance separately (`source_edge_binding_status`,
+  // `source_edge_bound_to_root_dag`, `source_recorded_edge_dag_node_id`) from
+  // query-side replay (`edge_bound_to_root_dag = false`, `"unbound_replay_only"`):
+  // - `kRequireBoundRootEdge` (default): requires proven root-DAG ownership
+  //   of `source_move -> source_dag_node_id` (returns `LP-U01` on UNKNOWN root).
+  // - `kStrictWhenRootProven` / `kSemanticReplayOnly`: allows explicit semantic
+  //   diagnostics on UNKNOWN roots while keeping source provenance unbound.
+  VerificationReport VerifySiblingQueryReplay(
+      const Position<N>& solve_root_pos, const ProofContext& context,
+      const SolveReport<N>& report,
+      const std::vector<int16_t>& parent_rel_moves, int16_t source_move,
+      uint32_t source_dag_node_id, int16_t query_move,
+      SubproofBindingPolicy source_binding_policy =
+          SubproofBindingPolicy::kRequireBoundRootEdge) const;
 };
 
 }  // namespace ldprover

@@ -43,6 +43,10 @@ struct SolverConfig {
   bool enable_stage_profiling = false;
   bool enable_convergence_trace = false;
   std::vector<std::string> observed_paths;
+  bool enable_near_pn_continuation = false;
+  // A zero budget disables near-pn continuation (0 claims, 0 extra calls,
+  // byte-identical to `enable_near_pn_continuation = false`).
+  uint32_t near_pn_continuation_max_calls = 64U;
 };
 
 struct ObservedChildSummary {
@@ -52,6 +56,7 @@ struct ObservedChildSummary {
   int32_t tactical_score = 0;
   uint32_t pn = 1;
   uint32_t dn = 1;
+  uint32_t dag_node_id = kInvalidDagNodeId;
   bool probed = false;
   bool ko_dependent = false;
   bool in_window = false;
@@ -95,22 +100,62 @@ struct ObservedPathTrace {
   uint32_t ko_barrier_count = 0;
   uint32_t expanded_unknown_count = 0;
   uint32_t unexpanded_unknown_count = 0;
+  std::vector<ObservedChildSummary> closed_children;
   std::vector<ObservedChildSummary> top_unclosed_children;
   std::vector<ObservedChildSummary> watched_next_moves;
 };
 
+struct RootChildCallStat {
+  std::string move_sgf;
+  int16_t move = kPassMove;
+  uint32_t select_count = 0;
+  uint64_t calls_spent = 0;
+  uint32_t final_pn = 1;
+  uint32_t final_dn = 1;
+  ProofOutcome final_outcome = ProofOutcome::kUnknown;
+};
+
+struct NearPnContinuationTrace {
+  bool enabled = false;
+  uint32_t max_extra_calls = 64;
+  bool claimed = false;
+  std::string claimed_path;
+  int16_t claimed_move = kNullMove;
+  uint64_t trigger_node = 0;
+  uint64_t exit_node = 0;
+  uint64_t extra_calls_spent = 0;
+  uint32_t orig_th_pn = 0;
+  uint32_t boosted_th_pn = 0;
+  uint32_t th_dn = 0;
+  uint32_t pre_pn = 0;
+  uint32_t pre_dn = 0;
+  uint32_t return_pn = 0;
+  uint32_t return_dn = 0;
+  ProofOutcome return_outcome = ProofOutcome::kUnknown;
+  uint32_t return_dag_id = kInvalidDagNodeId;
+  bool acquired_active_rz_source = false;
+  int16_t active_rz_source_move = kNullMove;
+  std::string active_rz_source_move_sgf;
+  uint32_t active_rz_source_dag_id = kInvalidDagNodeId;
+  int active_rz_source_size = 0;
+};
+
 struct ConvergenceTraceReport {
   bool enabled = false;
+  std::string path_basis = "solve_root_relative";
+  std::string initial_trace_path;
   uint64_t first_terminal_leaf_node = 0;
   EvidenceKind first_terminal_leaf_kind = EvidenceKind::kNone;
   std::string first_terminal_leaf_path;
-  uint64_t first_proven_subproof_node = 0;
-  ProofOutcome first_proven_subproof_outcome = ProofOutcome::kUnknown;
-  uint32_t first_proven_subproof_dag_id = kInvalidDagNodeId;
-  std::string first_proven_subproof_path;
+  uint64_t first_non_terminal_subproof_node = 0;
+  ProofOutcome first_non_terminal_subproof_outcome = ProofOutcome::kUnknown;
+  uint32_t first_non_terminal_subproof_dag_id = kInvalidDagNodeId;
+  std::string first_non_terminal_subproof_path;
   uint32_t max_depth_reached = 0;
   std::string deepest_path;
   std::vector<ObservedPathTrace> watched_paths;
+  std::vector<RootChildCallStat> root_child_calls;
+  NearPnContinuationTrace near_pn_continuation{};
 };
 
 enum class RevalCaller : uint8_t {
@@ -367,6 +412,9 @@ class DfpnSolver {
   std::unordered_map<uint64_t, CachedNodeFrontier> node_frontier_cache_;
   mutable std::unordered_map<std::string, bool> reval_cache_;
   uint64_t next_path_id_ = 1ULL;
+  size_t base_trace_len_ = 0;
+  bool near_pn_continuation_claimed_ = false;
+  uint64_t active_continuation_cap_nodes_ = 0ULL;
   mutable SolverStageProfile stage_profile_{};
   mutable ConvergenceTraceReport convergence_trace_{};
 };

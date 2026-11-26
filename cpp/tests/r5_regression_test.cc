@@ -130,6 +130,29 @@ ParsedProblem<19> BuildP005(bool attacker_allow_ko) {
   return prob;
 }
 
+const std::string& CommonChaoRegion19() {
+  static const std::string kCommonRegion =
+      "as,bs,cs,ds,es,fs,gs,hs,is,js,ks,ls,ms,ns,os,ps,qs,rs,ss,"
+      "ar,br,cr,dr,er,fr,gr,hr,ir,jr,kr,lr,mr,nr,or,pr,qr,rr,sr,"
+      "aq,bq,cq,dq,eq,fq,gq,hq,iq,jq,kq,lq,mq,nq,oq,pq,qq,rq,sq,"
+      "jp,kp,lp,mp,np,op,pp,qp,rp,sp,jo,ko,lo,mo,no,oo,po,qo,ro,so,"
+      "jn,kn,ln,mn,nn,on,pn,qn,rn,sn,jm,km,lm,mm,nm,om,pm,qm,rm,sm,"
+      "jl,kl,ll,ml,nl,ol,pl,ql,rl,sl,jk,kk,lk,mk,nk,ok,pk,qk,rk,sk,"
+      "kj,lj,mj,nj,oj,pj,qj,rj,sj,qi,ri,si,qh,rh,sh,qg,rg,sg,qf,rf,sf,"
+      "qe,re,se,qd,rd,sd,qc,rc,sc,qb,rb,sb,qa,ra,sa";
+  return kCommonRegion;
+}
+
+ParsedProblem<19> BuildP031() {
+  ProblemContractParser<19> parser;
+  const std::string p031_json =
+      std::string(
+          R"json({"masked_sgf_str":"(;FF[4]CA[UTF-8]SZ[19]KM[14]AB[or][pr][qr][rr][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[lq][mq][nq][oq][pq][qq][rq][ap][bp][cp][dp][ep][fp][gp][hp][ip][io][ro][in][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[or]MA[as][bs][cs][ds][es][fs][gs][hs][is][js][ks][ls][ms][ns][os][ps][qs][rs][ss][ar][br][cr][dr][er][fr][gr][hr][ir][jr][kr][lr][mr][nr][or][pr][qr][rr][sr][aq][bq][cq][dq][eq][fq][gq][hq][iq][jq][kq][lq][mq][nq][oq][pq][qq][rq][sq][jp][kp][lp][mp][np][op][pp][qp][rp][sp][jo][ko][lo][mo][no][oo][po][qo][ro][so][jn][kn][ln][mn][nn][on][pn][qn][rn][sn][jm][km][lm][mm][nm][om][pm][qm][rm][sm][jl][kl][ll][ml][nl][ol][pl][ql][rl][sl][jk][kk][lk][mk][nk][ok][pk][qk][rk][sk][kj][lj][mj][nj][oj][pj][qj][rj][sj][qi][ri][si][qh][rh][sh][qg][rg][sg][qf][rf][sf][qe][re][se][qd][rd][sd][qc][rc][sc][qb][rb][sb][qa][ra][sa])","winning_color":"b","turn_color":"b","black_crucial_stone":"or","white_crucial_stone":"","black_search_goal":"TOLIVE","white_search_goal":"TOKILL","black_ko_rule":"disallow_ko","white_ko_rule":"allow_ko","region":")json") +
+      CommonChaoRegion19() + "\"}";
+  return parser.ParseTsumegoJsonObject("chao_vol1_p031", p031_json,
+                                       TurnConflictPolicy::kRejectStrict);
+}
+
 void VerifyTracedScenario(const std::string& label,
                           const ParsedProblem<19>& prob,
                           const std::vector<int16_t>& trace_moves,
@@ -655,24 +678,11 @@ void TestSection6RealProblemSolverBreakthrough() {
   ProblemContractParser<19> parser;
   ProofArtifactManager<19> checker;
 
-  static const std::string kCommonRegion =
-      "as,bs,cs,ds,es,fs,gs,hs,is,js,ks,ls,ms,ns,os,ps,qs,rs,ss,"
-      "ar,br,cr,dr,er,fr,gr,hr,ir,jr,kr,lr,mr,nr,or,pr,qr,rr,sr,"
-      "aq,bq,cq,dq,eq,fq,gq,hq,iq,jq,kq,lq,mq,nq,oq,pq,qq,rq,sq,"
-      "jp,kp,lp,mp,np,op,pp,qp,rp,sp,jo,ko,lo,mo,no,oo,po,qo,ro,so,"
-      "jn,kn,ln,mn,nn,on,pn,qn,rn,sn,jm,km,lm,mm,nm,om,pm,qm,rm,sm,"
-      "jl,kl,ll,ml,nl,ol,pl,ql,rl,sl,jk,kk,lk,mk,nk,ok,pk,qk,rk,sk,"
-      "kj,lj,mj,nj,oj,pj,qj,rj,sj,qi,ri,si,qh,rh,sh,qg,rg,sg,qf,rf,sf,"
-      "qe,re,se,qd,rd,sd,qc,rc,sc,qb,rb,sb,qa,ra,sa";
+  const std::string& kCommonRegion = CommonChaoRegion19();
 
   const std::string p042_json =
       std::string(
           R"json({"masked_sgf_str":"(;FF[4]CA[UTF-8]SZ[19]KM[6]AB[or][pr][qr][rr][rq][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[lr][nr][nq][oq][pq][qq][ap][bp][cp][dp][ep][fp][gp][hp][ip][rp][io][qo][in][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[or]MA[as][bs][cs][ds][es][fs][gs][hs][is][js][ks][ls][ms][ns][os][ps][qs][rs][ss][ar][br][cr][dr][er][fr][gr][hr][ir][jr][kr][lr][mr][nr][or][pr][qr][rr][sr][aq][bq][cq][dq][eq][fq][gq][hq][iq][jq][kq][lq][mq][nq][oq][pq][qq][rq][sq][jp][kp][lp][mp][np][op][pp][qp][rp][sp][jo][ko][lo][mo][no][oo][po][qo][ro][so][jn][kn][ln][mn][nn][on][pn][qn][rn][sn][jm][km][lm][mm][nm][om][pm][qm][rm][sm][jl][kl][ll][ml][nl][ol][pl][ql][rl][sl][jk][kk][lk][mk][nk][ok][pk][qk][rk][sk][kj][lj][mj][nj][oj][pj][qj][rj][sj][qi][ri][si][qh][rh][sh][qg][rg][sg][qf][rf][sf][qe][re][se][qd][rd][sd][qc][rc][sc][qb][rb][sb][qa][ra][sa])","winning_color":"b","turn_color":"b","black_crucial_stone":"or","white_crucial_stone":"","black_search_goal":"TOLIVE","white_search_goal":"TOKILL","black_ko_rule":"disallow_ko","white_ko_rule":"allow_ko","region":")json") +
-      kCommonRegion + "\"}";
-
-  const std::string p031_json =
-      std::string(
-          R"json({"masked_sgf_str":"(;FF[4]CA[UTF-8]SZ[19]KM[14]AB[or][pr][qr][rr][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[lq][mq][nq][oq][pq][qq][rq][ap][bp][cp][dp][ep][fp][gp][hp][ip][io][ro][in][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[or]MA[as][bs][cs][ds][es][fs][gs][hs][is][js][ks][ls][ms][ns][os][ps][qs][rs][ss][ar][br][cr][dr][er][fr][gr][hr][ir][jr][kr][lr][mr][nr][or][pr][qr][rr][sr][aq][bq][cq][dq][eq][fq][gq][hq][iq][jq][kq][lq][mq][nq][oq][pq][qq][rq][sq][jp][kp][lp][mp][np][op][pp][qp][rp][sp][jo][ko][lo][mo][no][oo][po][qo][ro][so][jn][kn][ln][mn][nn][on][pn][qn][rn][sn][jm][km][lm][mm][nm][om][pm][qm][rm][sm][jl][kl][ll][ml][nl][ol][pl][ql][rl][sl][jk][kk][lk][mk][nk][ok][pk][qk][rk][sk][kj][lj][mj][nj][oj][pj][qj][rj][sj][qi][ri][si][qh][rh][sh][qg][rg][sg][qf][rf][sf][qe][re][se][qd][rd][sd][qc][rc][sc][qb][rb][sb][qa][ra][sa])","winning_color":"b","turn_color":"b","black_crucial_stone":"or","white_crucial_stone":"","black_search_goal":"TOLIVE","white_search_goal":"TOKILL","black_ko_rule":"disallow_ko","white_ko_rule":"allow_ko","region":")json") +
       kCommonRegion + "\"}";
 
   SolverConfig real_cfg = DefaultConfig(3500U);
@@ -708,8 +718,7 @@ void TestSection6RealProblemSolverBreakthrough() {
   }
 
   // 2. chao_vol1_p031: must prove PROVEN_WIN with B[sr] under 3500-node budget
-  const ParsedProblem<19> p031 = parser.ParseTsumegoJsonObject(
-      "chao_vol1_p031", p031_json, TurnConflictPolicy::kRejectStrict);
+  const ParsedProblem<19> p031 = BuildP031();
   Check(p031.valid && p031.region_search_mask.has_value(),
         "Real-problem p031 parses cleanly with full region");
   if (p031.valid) {
@@ -1517,12 +1526,493 @@ void TestSection11ConvergenceObserverParity() {
   }
   Check(j_off == j_on && cs_off == cs_on && !s_off.ConvergenceTrace().enabled &&
             tr.enabled && tr.first_terminal_leaf_node > 0 &&
-            tr.first_proven_subproof_node > 0 && root_partition_ok &&
+            tr.first_non_terminal_subproof_node >= tr.first_terminal_leaf_node &&
+            tr.first_non_terminal_subproof_dag_id != ldprover::kInvalidDagNodeId &&
+            tr.first_non_terminal_subproof_dag_id > 0U &&
+            tr.first_non_terminal_subproof_path != tr.first_terminal_leaf_path &&
+            tr.path_basis == "solve_root_relative" &&
+            tr.initial_trace_path.empty() && root_partition_ok &&
             tr.watched_paths.size() == 3U &&
             tr.watched_paths[2].first_enter_node == 0,
         "R26 convergence observer leaves p003 LProof bytes invariant and partitions legal moves cleanly",
         "leaf=" + std::to_string(tr.first_terminal_leaf_node) +
+            " nonTerm=" + std::to_string(tr.first_non_terminal_subproof_node) +
+            " nonTermDag=" + std::to_string(tr.first_non_terminal_subproof_dag_id) +
             " partition=" + std::to_string(root_partition_ok));
+}
+
+void TestSection12R27ObserverAndNearPnContinuation() {
+  std::cout << "\n=== 12. R27 Observer Path-Basis, Subproof Binding & Near-PN Continuation ===\n";
+  ProblemContractParser<19> parser;
+  const std::string& region_p060 = CommonChaoRegion19();
+  const std::string p060_json =
+      std::string(
+          R"json({"masked_sgf_str":"(;FF[4]CA[UTF-8]SZ[19]KM[30]AB[pr][qr][rq][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[or][oq][pq][qq][ap][bp][cp][dp][ep][fp][gp][hp][ip][qp][io][in][qn][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[pr][rq]MA[as][bs][cs][ds][es][fs][gs][hs][is][js][ks][ls][ms][ns][os][ps][qs][rs][ss][ar][br][cr][dr][er][fr][gr][hr][ir][jr][kr][lr][mr][nr][or][pr][qr][rr][sr][aq][bq][cq][dq][eq][fq][gq][hq][iq][jq][kq][lq][mq][nq][oq][pq][qq][rq][sq][jp][kp][lp][mp][np][op][pp][qp][rp][sp][jo][ko][lo][mo][no][oo][po][qo][ro][so][jn][kn][ln][mn][nn][on][pn][qn][rn][sn][jm][km][lm][mm][nm][om][pm][qm][rm][sm][jl][kl][ll][ml][nl][ol][pl][ql][rl][sl][jk][kk][lk][mk][nk][ok][pk][qk][rk][sk][kj][lj][mj][nj][oj][pj][qj][rj][sj][qi][ri][si][qh][rh][sh][qg][rg][sg][qf][rf][sf][qe][re][se][qd][rd][sd][qc][rc][sc][qb][rb][sb][qa][ra][sa])","winning_color":"b","turn_color":"b","black_crucial_stone":"pr,rq","white_crucial_stone":"","black_search_goal":"TOLIVE","white_search_goal":"TOKILL","black_ko_rule":"disallow_ko","white_ko_rule":"allow_ko","region":")json") +
+      region_p060 + "\"}";
+  const ParsedProblem<19> p060 = parser.ParseTsumegoJsonObject(
+      "chao_vol1_p060", p060_json, TurnConflictPolicy::kRejectStrict);
+  Check(p060.valid, "Inline p060 parses cleanly for R27 checks");
+
+  // 1. Subposition start path alignment (R26 §3 P2 #1).
+  {
+    Position<19> sub_rs = p060.initial_position;
+    const int16_t kMoveRs =
+        static_cast<int16_t>(Position<19>::CoordFromRowCol(18, 17));
+    Check(sub_rs.PlayMove(kMoveRs), "Playing B[rs] on p060 succeeds");
+    SolverConfig cfg = DefaultConfig(256U);
+    cfg.enable_convergence_trace = true;
+    cfg.observed_paths = {"", "rs", "rs/pass", "pass"};
+    DfpnSolver<19> solver(cfg);
+    (void)solver.Solve(sub_rs, p060.proof_context, p060.region_search_mask,
+                       "chao_vol1_p060_rs");
+    const auto& tr = solver.ConvergenceTrace();
+    const bool paths_ok =
+        tr.path_basis == "solve_root_relative" &&
+        tr.initial_trace_path == "rs" &&
+        tr.watched_paths.size() == 4U &&
+        tr.watched_paths[0].first_enter_node == 1U &&
+        tr.watched_paths[0].visit_count >= 1U &&
+        tr.watched_paths[0].frontier_exists &&
+        tr.watched_paths[0].total_legal_moves == 144U &&
+        tr.watched_paths[1].first_enter_node == 0U &&
+        tr.watched_paths[1].visit_count == 0U &&
+        !tr.watched_paths[1].frontier_exists &&
+        tr.watched_paths[2].first_enter_node == 0U &&
+        tr.watched_paths[2].visit_count == 0U &&
+        !tr.watched_paths[2].frontier_exists &&
+        tr.watched_paths[3].first_enter_node > 1U &&
+        tr.watched_paths[3].visit_count >= 1U &&
+        tr.watched_paths[3].frontier_exists &&
+        tr.watched_paths[3].total_legal_moves == 144U;
+    Check(paths_ok,
+          "Subposition Solve uses solve_root_relative paths for both counters and frontier snapshots");
+  }
+
+  // 2. Non-terminal subproof separation + read-only edge-binding & precheck verifiers.
+  ProofArtifactManager<19> mgr;
+  {
+    SolverConfig cfg_off = DefaultConfig(500U);
+    SolverConfig cfg_on = DefaultConfig(500U);
+    cfg_on.enable_convergence_trace = true;
+    cfg_on.observed_paths = {""};
+    DfpnSolver<19> s_off(cfg_off);
+    DfpnSolver<19> s_on(cfg_on);
+    const auto r_off = s_off.Solve(p060.initial_position, p060.proof_context,
+                                   p060.region_search_mask, "p060_500");
+    const auto r_on = s_on.Solve(p060.initial_position, p060.proof_context,
+                                 p060.region_search_mask, "p060_500");
+    const std::string j_off = mgr.SerializeLProofJson(
+        p060.initial_position, p060.proof_context, r_off);
+    const std::string j_on = mgr.SerializeLProofJson(
+        p060.initial_position, p060.proof_context, r_on);
+    const auto& tr = s_on.ConvergenceTrace();
+    Check(j_off == j_on && tr.first_terminal_leaf_node == 337U &&
+              tr.first_non_terminal_subproof_node >= 337U &&
+              tr.first_non_terminal_subproof_dag_id != ldprover::kInvalidDagNodeId &&
+              tr.first_non_terminal_subproof_dag_id > 0U &&
+              tr.first_non_terminal_subproof_path != tr.first_terminal_leaf_path,
+          "p060@500 separates first terminal leaf (dag=0) from non-terminal subproofs (dag>0, distinct path)",
+          "leaf=" + std::to_string(tr.first_terminal_leaf_node) +
+              " nonTerm=" + std::to_string(tr.first_non_terminal_subproof_node) +
+              " nonTermDag=" + std::to_string(tr.first_non_terminal_subproof_dag_id) +
+              " nonTermPath=" + tr.first_non_terminal_subproof_path);
+
+    // UNKNOWN root p060@500 non-terminal subproof ("qs/pass/sq/pass/rr/os"):
+    // default mode allows unbound semantic replay, while kRequireBoundRootEdge rejects LP-U01.
+    const std::vector<int16_t> p60_rel = {
+        static_cast<int16_t>(Position<19>::CoordFromRowCol(18, 16)),
+        ldprover::kPassMove,
+        static_cast<int16_t>(Position<19>::CoordFromRowCol(16, 18)),
+        ldprover::kPassMove,
+        static_cast<int16_t>(Position<19>::CoordFromRowCol(17, 17)),
+        static_cast<int16_t>(Position<19>::CoordFromRowCol(18, 14)),
+    };
+    const auto v60_default = mgr.VerifySubproofAtPath(
+        p060.initial_position, p060.proof_context, r_on, p60_rel,
+        tr.first_non_terminal_subproof_dag_id);
+    const auto v60_strict = mgr.VerifySubproofAtPath(
+        p060.initial_position, p060.proof_context, r_on, p60_rel,
+        tr.first_non_terminal_subproof_dag_id,
+        ldprover::SubproofBindingPolicy::kRequireBoundRootEdge);
+    Check(v60_default.passed && v60_default.error_code == "PASS" &&
+              !v60_default.edge_bound_to_root_dag &&
+              v60_default.edge_binding_status == "unbound_unknown_root" &&
+              v60_default.recorded_edge_dag_node_id == -1 &&
+              v60_default.semantic_replay_passed && !v60_strict.passed &&
+              v60_strict.error_code == "LP-U01" &&
+              v60_strict.edge_binding_status == "unbound_unknown_root" &&
+              !v60_strict.semantic_replay_passed,
+          "UNKNOWN-root subproof distinguishes unbound_unknown_root PASS from kRequireBoundRootEdge LP-U01");
+
+    // Proven root p004: edge ownership vs semantic replay & structural prechecks (R27 P1 #1/#2).
+    const ParsedProblem<19> p004 = BuildP004();
+    const auto rp4 =
+        DfpnSolver<19>(DefaultConfig(3500U))
+            .Solve(p004.initial_position, p004.proof_context,
+                   p004.region_search_mask, "p004");
+    const std::string pre_p4 =
+        mgr.SerializeLProofJson(p004.initial_position, p004.proof_context, rp4);
+    uint32_t pass_child_id = ldprover::kInvalidDagNodeId;
+    uint32_t move_21_id = ldprover::kInvalidDagNodeId;
+    const auto& root_dn = rp4.proof_dag_nodes[rp4.root_dag_node_id];
+    for (size_t k = 0; k < root_dn.child_moves.size(); ++k) {
+      if (root_dn.child_moves[k] == ldprover::kPassMove) {
+        pass_child_id = root_dn.child_node_ids[k];
+      } else if (root_dn.child_moves[k] == 21) {
+        move_21_id = root_dn.child_node_ids[k];
+      }
+    }
+    Check(pass_child_id != ldprover::kInvalidDagNodeId &&
+              move_21_id != ldprover::kInvalidDagNodeId &&
+              pass_child_id != move_21_id,
+          "p004 proven root exposes distinct PASS and move-21 child DAG edges",
+          "pass_id=" + std::to_string(pass_child_id) +
+              " move21_id=" + std::to_string(move_21_id));
+
+    const auto v_root = mgr.VerifySubproofAtPath(
+        p004.initial_position, p004.proof_context, rp4, {},
+        rp4.root_dag_node_id);
+    const auto v_pass_edge = mgr.VerifySubproofAtPath(
+        p004.initial_position, p004.proof_context, rp4, {ldprover::kPassMove},
+        pass_child_id);
+    const auto v_21_edge = mgr.VerifySubproofAtPath(
+        p004.initial_position, p004.proof_context, rp4, {21}, move_21_id);
+    Check(v_root.passed && v_root.edge_bound_to_root_dag &&
+              v_root.edge_binding_status == "bound_to_root_dag" &&
+              v_root.recorded_edge_dag_node_id ==
+                  static_cast<int32_t>(rp4.root_dag_node_id) &&
+              v_root.semantic_replay_passed &&
+              v_pass_edge.passed && v_pass_edge.edge_bound_to_root_dag &&
+              v_pass_edge.edge_binding_status == "bound_to_root_dag" &&
+              v_pass_edge.recorded_edge_dag_node_id ==
+                  static_cast<int32_t>(pass_child_id) &&
+              v_21_edge.passed && v_21_edge.edge_bound_to_root_dag &&
+              v_21_edge.edge_binding_status == "bound_to_root_dag" &&
+              v_21_edge.recorded_edge_dag_node_id ==
+                  static_cast<int32_t>(move_21_id),
+          "p004 original root edges verify PASS with bound_to_root_dag receipts");
+
+    // Asking VerifySubproofAtPath on path {21} with PASS's DAG (`pass_child_id`):
+    // default strict ownership rejects LP-R02 (`edge_mismatch`, recorded=move_21_id),
+    // while explicit `kSemanticReplayOnly` and `VerifySiblingQueryReplay` verify semantic PASS.
+    const auto v_mismatch = mgr.VerifySubproofAtPath(
+        p004.initial_position, p004.proof_context, rp4, {21}, pass_child_id);
+    const auto v_sem_21 = mgr.VerifySubproofAtPath(
+        p004.initial_position, p004.proof_context, rp4, {21}, pass_child_id,
+        ldprover::SubproofBindingPolicy::kSemanticReplayOnly);
+    const auto v_sib_21 = mgr.VerifySiblingQueryReplay(
+        p004.initial_position, p004.proof_context, rp4, {}, ldprover::kPassMove,
+        pass_child_id, 21);
+    Check(!v_mismatch.passed && v_mismatch.error_code == "LP-R02" &&
+              !v_mismatch.edge_bound_to_root_dag &&
+              v_mismatch.edge_binding_status == "edge_mismatch" &&
+              v_mismatch.recorded_edge_dag_node_id ==
+                  static_cast<int32_t>(move_21_id) &&
+              !v_mismatch.semantic_replay_passed &&
+              v_sem_21.passed && v_sem_21.error_code == "PASS" &&
+              !v_sem_21.edge_bound_to_root_dag &&
+              v_sem_21.edge_binding_status == "unbound_replay_only" &&
+              v_sem_21.recorded_edge_dag_node_id ==
+                  static_cast<int32_t>(move_21_id) &&
+              v_sem_21.semantic_replay_passed &&
+              v_sib_21.passed && v_sib_21.error_code == "PASS" &&
+              v_sib_21.source_edge_bound_to_root_dag &&
+              v_sib_21.source_edge_binding_status == "bound_to_root_dag" &&
+              v_sib_21.source_recorded_edge_dag_node_id ==
+                  static_cast<int32_t>(pass_child_id) &&
+              !v_sib_21.edge_bound_to_root_dag &&
+              v_sib_21.edge_binding_status == "unbound_replay_only" &&
+              v_sib_21.recorded_edge_dag_node_id ==
+                  static_cast<int32_t>(move_21_id) &&
+              v_sib_21.semantic_replay_passed,
+          "p004 move 21 + PASS DAG separates LP-R02 edge_mismatch from PASS unbound_replay_only and preserves source binding");
+
+    // Negative controls on p004: move 2 (ca) fails both semantic replay and edge ownership;
+    // spoofed sibling source `{21} -> pass_child_id` fails source edge binding;
+    // non-recorded sub-path `{21, 0}` reports `edge_not_found`.
+    const auto v_neg2_strict = mgr.VerifySubproofAtPath(
+        p004.initial_position, p004.proof_context, rp4, {2}, pass_child_id);
+    const auto v_neg2_sem = mgr.VerifySubproofAtPath(
+        p004.initial_position, p004.proof_context, rp4, {2}, pass_child_id,
+        ldprover::SubproofBindingPolicy::kSemanticReplayOnly);
+    const auto v_neg2_sib = mgr.VerifySiblingQueryReplay(
+        p004.initial_position, p004.proof_context, rp4, {}, ldprover::kPassMove,
+        pass_child_id, 2);
+    const auto v_spoof_src = mgr.VerifySiblingQueryReplay(
+        p004.initial_position, p004.proof_context, rp4, {}, 21,
+        pass_child_id, ldprover::kPassMove);
+    // Legal unrecorded path `{21, 0}` (`W[cb]`, then non-witness `B[aa]`) -> edge_not_found.
+    const auto v_unrecorded = mgr.VerifySubproofAtPath(
+        p004.initial_position, p004.proof_context, rp4, {21, 0},
+        pass_child_id);
+    const std::string post_p4 =
+        mgr.SerializeLProofJson(p004.initial_position, p004.proof_context, rp4);
+    Check(!v_neg2_strict.passed && v_neg2_strict.error_code == "LP-R02" &&
+              !v_neg2_sem.passed && v_neg2_sem.error_code == "LP-R02" &&
+              !v_neg2_sem.semantic_replay_passed &&
+              v_neg2_sem.edge_binding_status == "unbound_replay_only" &&
+              !v_neg2_sib.passed && v_neg2_sib.error_code == "LP-R02" &&
+              !v_neg2_sib.semantic_replay_passed &&
+              !v_spoof_src.passed && v_spoof_src.error_code == "LP-R02" &&
+              !v_spoof_src.source_edge_bound_to_root_dag &&
+              v_spoof_src.source_edge_binding_status == "edge_mismatch" &&
+              v_spoof_src.source_recorded_edge_dag_node_id ==
+                  static_cast<int32_t>(move_21_id) &&
+              v_spoof_src.edge_binding_status == "edge_mismatch" &&
+              !v_unrecorded.passed && v_unrecorded.error_code == "LP-R02" &&
+              v_unrecorded.edge_binding_status == "edge_not_found" &&
+              v_unrecorded.recorded_edge_dag_node_id == -1 && pre_p4 == post_p4,
+          "p004 negative controls & spoofed sibling source reject LP-R02 and keep LProof bytes invariant");
+
+    // R28 P1: UNKNOWN-root sibling replay on p004@6 (`cb` closed at DAG 1, `ed` unvisited).
+    {
+      SolverConfig cfg_p04_6 = DefaultConfig(6U);
+      cfg_p04_6.enable_convergence_trace = true;
+      cfg_p04_6.observed_paths = {"", "ed", "pass", "cb", "ca"};
+      DfpnSolver<19> s_p04_6(cfg_p04_6);
+      const auto rp4_6 = s_p04_6.Solve(
+          p004.initial_position, p004.proof_context, p004.region_search_mask,
+          "p004_6");
+      const auto& tr6 = s_p04_6.ConvergenceTrace();
+      bool cb_closed_dag1 = false;
+      bool ed_closed = false;
+      for (const auto& cc : tr6.watched_paths[0].closed_children) {
+        if (cc.move == 21 && cc.dag_node_id == 1U) cb_closed_dag1 = true;
+        if (cc.move == 61) ed_closed = true;
+      }
+      const std::string pre_p4_6 = mgr.SerializeLProofJson(
+          p004.initial_position, p004.proof_context, rp4_6);
+
+      // Claiming `ed` (61) owns DAG 1 when replaying onto `cb` (21):
+      // default strict mode rejects LP-U01; explicit semantic modes pass while
+      // leaving source provenance unbound.
+      const auto sib6_strict = mgr.VerifySiblingQueryReplay(
+          p004.initial_position, p004.proof_context, rp4_6, {}, 61, 1U, 21);
+      const auto sib6_sem = mgr.VerifySiblingQueryReplay(
+          p004.initial_position, p004.proof_context, rp4_6, {}, 61, 1U, 21,
+          ldprover::SubproofBindingPolicy::kSemanticReplayOnly);
+      const auto sib6_root_when_proven = mgr.VerifySiblingQueryReplay(
+          p004.initial_position, p004.proof_context, rp4_6, {}, 61, 1U, 21,
+          ldprover::SubproofBindingPolicy::kStrictWhenRootProven);
+      const auto sib6_neg_ca = mgr.VerifySiblingQueryReplay(
+          p004.initial_position, p004.proof_context, rp4_6, {}, 2, 1U, 21,
+          ldprover::SubproofBindingPolicy::kSemanticReplayOnly);
+      const std::string post_p4_6 = mgr.SerializeLProofJson(
+          p004.initial_position, p004.proof_context, rp4_6);
+
+      Check(rp4_6.root_status == ProofOutcome::kUnknown &&
+                rp4_6.num_nodes == 6U && rp4_6.proof_dag_nodes.size() == 4U &&
+                cb_closed_dag1 && !ed_closed &&
+                tr6.watched_paths[1].visit_count == 0ULL &&
+                !sib6_strict.passed && sib6_strict.error_code == "LP-U01" &&
+                !sib6_strict.source_edge_bound_to_root_dag &&
+                sib6_strict.source_edge_binding_status ==
+                    "unbound_unknown_root" &&
+                sib6_strict.source_recorded_edge_dag_node_id == -1 &&
+                !sib6_strict.semantic_replay_passed &&
+                sib6_sem.passed && sib6_sem.error_code == "PASS" &&
+                !sib6_sem.source_edge_bound_to_root_dag &&
+                sib6_sem.source_edge_binding_status == "unbound_replay_only" &&
+                sib6_sem.source_recorded_edge_dag_node_id == -1 &&
+                !sib6_sem.edge_bound_to_root_dag &&
+                sib6_sem.edge_binding_status == "unbound_replay_only" &&
+                sib6_sem.recorded_edge_dag_node_id == -1 &&
+                sib6_sem.semantic_replay_passed &&
+                sib6_root_when_proven.passed &&
+                !sib6_root_when_proven.source_edge_bound_to_root_dag &&
+                sib6_root_when_proven.source_edge_binding_status ==
+                    "unbound_unknown_root" &&
+                sib6_root_when_proven.edge_binding_status ==
+                    "unbound_replay_only" &&
+                sib6_root_when_proven.semantic_replay_passed &&
+                !sib6_neg_ca.passed && sib6_neg_ca.error_code == "LP-R02" &&
+                !sib6_neg_ca.source_edge_bound_to_root_dag &&
+                !sib6_neg_ca.semantic_replay_passed && pre_p4_6 == post_p4_6,
+            "R28 p004@6 separates strict LP-U01 from explicit semantic PASS (unbound source provenance)");
+    }
+
+    // R27 P1 #2: Structural pre-checks run BEFORE any vector indexing across both entries.
+    {
+      auto corrupt_target = rp4;
+      corrupt_target.proof_dag_nodes[pass_child_id].child_moves.push_back(0);
+      const auto ct_def = mgr.VerifySubproofAtPath(
+          p004.initial_position, p004.proof_context, corrupt_target,
+          {ldprover::kPassMove}, pass_child_id);
+      const auto ct_sem = mgr.VerifySubproofAtPath(
+          p004.initial_position, p004.proof_context, corrupt_target, {21},
+          pass_child_id, ldprover::SubproofBindingPolicy::kSemanticReplayOnly);
+      const auto ct_sib = mgr.VerifySiblingQueryReplay(
+          p004.initial_position, p004.proof_context, corrupt_target, {},
+          ldprover::kPassMove, pass_child_id, 21);
+
+      auto corrupt_root = rp4;
+      corrupt_root.proof_dag_nodes[rp4.root_dag_node_id].child_moves.push_back(
+          ldprover::kPassMove);
+      const auto cr_sub = mgr.VerifySubproofAtPath(
+          p004.initial_position, p004.proof_context, corrupt_root,
+          {ldprover::kPassMove}, pass_child_id);
+      const auto cr_sib = mgr.VerifySiblingQueryReplay(
+          p004.initial_position, p004.proof_context, corrupt_root, {},
+          ldprover::kPassMove, pass_child_id, 21);
+
+      auto corrupt_cycle = rp4;
+      if (!corrupt_cycle.proof_dag_nodes[pass_child_id].child_node_ids.empty()) {
+        corrupt_cycle.proof_dag_nodes[pass_child_id].child_node_ids[0] =
+            pass_child_id;
+      }
+      const auto cc_sub = mgr.VerifySubproofAtPath(
+          p004.initial_position, p004.proof_context, corrupt_cycle,
+          {ldprover::kPassMove}, pass_child_id);
+      const auto cc_sib = mgr.VerifySiblingQueryReplay(
+          p004.initial_position, p004.proof_context, corrupt_cycle, {},
+          ldprover::kPassMove, pass_child_id, 21);
+
+      auto corrupt_redir = rp4;
+      corrupt_redir.proof_dag_nodes[pass_child_id].is_pruned_outside_rz = true;
+      corrupt_redir.proof_dag_nodes[pass_child_id].source_proof_node_id =
+          pass_child_id;
+      const auto cp_sub = mgr.VerifySubproofAtPath(
+          p004.initial_position, p004.proof_context, corrupt_redir,
+          {ldprover::kPassMove}, pass_child_id);
+      const auto cp_sib = mgr.VerifySiblingQueryReplay(
+          p004.initial_position, p004.proof_context, corrupt_redir, {},
+          ldprover::kPassMove, pass_child_id, 21);
+
+      auto corrupt_redir_src = rp4;
+      corrupt_redir_src.proof_dag_nodes[pass_child_id].is_pruned_outside_rz =
+          true;
+      corrupt_redir_src.proof_dag_nodes[pass_child_id].source_proof_node_id =
+          move_21_id;
+      corrupt_redir_src.proof_dag_nodes[move_21_id].child_moves.push_back(0);
+      const auto cs_sub = mgr.VerifySubproofAtPath(
+          p004.initial_position, p004.proof_context, corrupt_redir_src,
+          {ldprover::kPassMove}, pass_child_id);
+      const auto cs_sib = mgr.VerifySiblingQueryReplay(
+          p004.initial_position, p004.proof_context, corrupt_redir_src, {},
+          ldprover::kPassMove, pass_child_id, 21);
+
+      Check(!ct_def.passed && ct_def.error_code == "LP-T02" &&
+                ct_def.failed_node_id == static_cast<int32_t>(pass_child_id) &&
+                !ct_sem.passed && ct_sem.error_code == "LP-T02" &&
+                !ct_sib.passed && ct_sib.error_code == "LP-T02" &&
+                !cr_sub.passed && cr_sub.error_code == "LP-T02" &&
+                !cr_sib.passed && cr_sib.error_code == "LP-T02" &&
+                !cc_sub.passed && cc_sub.error_code == "LP-T02" &&
+                !cc_sib.passed && cc_sib.error_code == "LP-T02" &&
+                !cp_sub.passed && cp_sub.error_code == "LP-R02" &&
+                !cp_sib.passed && cp_sib.error_code == "LP-R02" &&
+                !cs_sub.passed && cs_sub.error_code == "LP-T02" &&
+                cs_sub.failed_node_id == static_cast<int32_t>(move_21_id) &&
+                !cs_sib.passed && cs_sib.error_code == "LP-T02",
+            "Structural prechecks catch mismatched parallel arrays, self-loops, and bad redirects before indexing");
+    }
+  }
+
+  // 3. Near-pn continuation zero/one/default budgets (p031@120) & p060@3500 determinism.
+  {
+    const ParsedProblem<19> p031 = BuildP031();
+    Check(p031.valid, "Inline p031 parses cleanly for R27 zero/1/64 checks");
+    auto run_p031 = [&](bool enabled, uint32_t max_calls,
+                        SolveReport<19>* out_rep,
+                        ldprover::ConvergenceTraceReport* out_tr) {
+      SolverConfig cfg = DefaultConfig(120U);
+      cfg.max_depth = 48U;
+      cfg.memory_budget_bytes = 512ULL * 1024ULL * 1024ULL;
+      cfg.enable_near_pn_continuation = enabled;
+      cfg.near_pn_continuation_max_calls = max_calls;
+      cfg.enable_convergence_trace = true;
+      cfg.observed_paths = {"", "ps"};
+      DfpnSolver<19> s(cfg);
+      *out_rep = s.Solve(p031.initial_position, p031.proof_context,
+                         p031.region_search_mask, "p031_120");
+      *out_tr = s.ConvergenceTrace();
+    };
+    SolveReport<19> r_d, r_0, r_1, r_64;
+    ldprover::ConvergenceTraceReport t_d, t_0, t_1, t_64;
+    run_p031(false, 64U, &r_d, &t_d);
+    run_p031(true, 0U, &r_0, &t_0);
+    run_p031(true, 1U, &r_1, &t_1);
+    run_p031(true, 64U, &r_64, &t_64);
+    const std::string j_d = mgr.SerializeLProofJson(
+        p031.initial_position, p031.proof_context, r_d);
+    const std::string j_0 = mgr.SerializeLProofJson(
+        p031.initial_position, p031.proof_context, r_0);
+
+    Check(j_d == j_0 && r_0.num_nodes == 120U && !t_0.near_pn_continuation.enabled &&
+              !t_0.near_pn_continuation.claimed &&
+              t_0.near_pn_continuation.trigger_node == 0ULL &&
+              t_0.near_pn_continuation.exit_node == 0ULL &&
+              t_0.near_pn_continuation.extra_calls_spent == 0ULL,
+          "p031@120 with near_pn_continuation_max_calls=0 disables claims (0 extra calls) and matches Arm D",
+          "claimed=" + std::to_string(t_0.near_pn_continuation.claimed) +
+              " extra=" +
+              std::to_string(t_0.near_pn_continuation.extra_calls_spent));
+    Check(r_1.num_nodes == 120U && t_1.near_pn_continuation.enabled &&
+              t_1.near_pn_continuation.claimed &&
+              t_1.near_pn_continuation.claimed_path == "ps" &&
+              t_1.near_pn_continuation.trigger_node == 74ULL &&
+              t_1.near_pn_continuation.exit_node == 75ULL &&
+              t_1.near_pn_continuation.extra_calls_spent == 1ULL,
+          "p031@120 with max_calls=1 claims at node 74 and stops at node 75 (+1 call)",
+          "trig=" + std::to_string(t_1.near_pn_continuation.trigger_node) +
+              " exit=" + std::to_string(t_1.near_pn_continuation.exit_node) +
+              " extra=" +
+              std::to_string(t_1.near_pn_continuation.extra_calls_spent));
+    Check(r_64.num_nodes == 120U && t_64.near_pn_continuation.enabled &&
+              t_64.near_pn_continuation.claimed &&
+              t_64.near_pn_continuation.claimed_path == "ps" &&
+              t_64.near_pn_continuation.trigger_node == 74ULL &&
+              t_64.near_pn_continuation.exit_node == 83ULL &&
+              t_64.near_pn_continuation.extra_calls_spent == 9ULL,
+          "p031@120 with max_calls=64 claims at node 74 and exits at node 83 (+9 calls)",
+          "trig=" + std::to_string(t_64.near_pn_continuation.trigger_node) +
+              " exit=" + std::to_string(t_64.near_pn_continuation.exit_node) +
+              " extra=" +
+              std::to_string(t_64.near_pn_continuation.extra_calls_spent));
+
+    SolverConfig cfg_d60 = DefaultConfig(3500U);
+    const auto rd60 = DfpnSolver<19>(cfg_d60).Solve(
+        p060.initial_position, p060.proof_context, p060.region_search_mask,
+        "p060_3500");
+    SolverConfig cfg_060 = DefaultConfig(3500U);
+    cfg_060.enable_near_pn_continuation = true;
+    cfg_060.near_pn_continuation_max_calls = 0U;
+    const auto r060 = DfpnSolver<19>(cfg_060).Solve(
+        p060.initial_position, p060.proof_context, p060.region_search_mask,
+        "p060_3500");
+
+    SolverConfig cfg_e_off = DefaultConfig(3500U);
+    cfg_e_off.enable_near_pn_continuation = true;
+    cfg_e_off.near_pn_continuation_max_calls = 64U;
+    SolverConfig cfg_e_on = cfg_e_off;
+    cfg_e_on.enable_convergence_trace = true;
+    cfg_e_on.observed_paths = {"", "rs"};
+
+    const auto re_off = DfpnSolver<19>(cfg_e_off).Solve(
+        p060.initial_position, p060.proof_context, p060.region_search_mask,
+        "p060_e");
+    DfpnSolver<19> se_on(cfg_e_on);
+    const auto re_on =
+        se_on.Solve(p060.initial_position, p060.proof_context,
+                    p060.region_search_mask, "p060_e");
+    const std::string jd60 = mgr.SerializeLProofJson(
+        p060.initial_position, p060.proof_context, rd60);
+    const std::string j060 = mgr.SerializeLProofJson(
+        p060.initial_position, p060.proof_context, r060);
+    const std::string je_off = mgr.SerializeLProofJson(
+        p060.initial_position, p060.proof_context, re_off);
+    const std::string je_on = mgr.SerializeLProofJson(
+        p060.initial_position, p060.proof_context, re_on);
+    const auto& nt = se_on.ConvergenceTrace().near_pn_continuation;
+    Check(jd60 == j060 && re_on.num_nodes == 3500U && je_off == je_on &&
+              nt.enabled && nt.claimed && nt.claimed_path == "rs" &&
+              nt.trigger_node == 2631ULL && nt.exit_node == 2656ULL &&
+              nt.extra_calls_spent == 25ULL,
+          "p060@3500 deterministically claims B[rs] (2631->2656, +25 calls), honors parity, and matches Arm D at max_calls=0",
+          "claimed=" + std::to_string(nt.claimed) +
+              " path=" + nt.claimed_path +
+              " extra=" + std::to_string(nt.extra_calls_spent));
+  }
 }
 
 }  // namespace
@@ -1539,6 +2029,7 @@ int main() {
   TestSection9IncrementalZobristParity();
   TestSection10OrthoNeighborTableParity();
   TestSection11ConvergenceObserverParity();
+  TestSection12R27ObserverAndNearPnContinuation();
 
   const int failed = g_total - g_passed;
   std::cout << "\n========================================\n"

@@ -952,6 +952,38 @@ int main(int argc, char* argv[]) {
               std::to_string(mn22) + " mkeep=" + std::to_string(mkeep));
   }
 
+  // 18. R27 P2 Fix: CLI `--near-pn-continuation-calls` rejects 0 and honors 1
+  {
+    const std::filesystem::path dir = ws.root / "near_pn_calls";
+    std::filesystem::create_directories(dir, ec);
+    const std::filesystem::path bad_out = dir / "zero_proof.json";
+    const auto r_zero = RunCliRaw(
+        tprover_bin,
+        {"solve", "--problem", p031_src.string(), "--out-proof",
+         bad_out.string(), "--node-limit", "120", "--max-depth", "48",
+         "--memory-budget", "512", "--near-pn-continuation",
+         "--near-pn-continuation-calls", "0"});
+    const bool zero_left_file = std::filesystem::exists(bad_out, ec);
+
+    const std::filesystem::path one_out = dir / "one_proof.json";
+    const std::filesystem::path one_conv = dir / "one_conv.json";
+    const auto r_one = RunCliRaw(
+        tprover_bin,
+        {"solve", "--problem", p031_src.string(), "--out-proof",
+         one_out.string(), "--convergence-json", one_conv.string(),
+         "--node-limit", "120", "--max-depth", "48", "--memory-budget", "512",
+         "--near-pn-continuation", "--near-pn-continuation-calls", "1"});
+    std::string conv_bytes;
+    const bool has_conv = ReadBytes(one_conv, &conv_bytes);
+    Check(r_zero.exit_code == 2 && !zero_left_file && r_one.exit_code == 0 &&
+              has_conv &&
+              conv_bytes.find("\"claimed\": true") != std::string::npos &&
+              conv_bytes.find("\"extraCallsSpent\": 1") != std::string::npos,
+          "18. CLI rejects --near-pn-continuation-calls 0 cleanly and caps budget=1 to extraCallsSpent=1 on p031@120",
+          "zeroRc=" + std::to_string(r_zero.exit_code) +
+              " oneRc=" + std::to_string(r_one.exit_code));
+  }
+
   std::cout << "\n========================================\n"
             << "R26 CLI Boundary Summary: " << g_passed << "/" << g_total
             << " passed, " << g_failed << " failed.\n"

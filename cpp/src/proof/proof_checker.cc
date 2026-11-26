@@ -893,13 +893,20 @@ bool ReplaySourceSubgraphOnQueryState(
     }
     seen_redirects.insert(resolved_id);
     const auto& cur = dag_nodes[resolved_id];
+    if (cur.node_id != resolved_id) return false;
     if (!cur.is_pruned_outside_rz && !cur.is_tt_hit) break;
-    if (cur.source_proof_node_id >= cur.node_id) return false;
+    if (cur.source_proof_node_id >= cur.node_id ||
+        cur.source_proof_node_id >= dag_nodes.size()) {
+      return false;
+    }
     resolved_id = cur.source_proof_node_id;
   }
 
   const auto& src = dag_nodes[resolved_id];
   if (src.outcome != expected_outcome) return false;
+  if (src.child_moves.size() != src.child_node_ids.size()) {
+    return false;
+  }
 
   auto check_early_terminal = [&]() -> bool {
     const auto term = terminal_eval.EvaluateTerminal(query_pos, context);
@@ -915,9 +922,6 @@ bool ReplaySourceSubgraphOnQueryState(
   if (src.child_node_ids.empty() || query_pos.IsAtDoublePass()) {
     return check_early_terminal();
   }
-  if (src.child_moves.size() != src.child_node_ids.size()) {
-    return false;
-  }
 
   const bool is_or = (query_pos.ToPlay() == context.root_attacker);
   const bool restricted_side =
@@ -931,7 +935,7 @@ bool ReplaySourceSubgraphOnQueryState(
       (!is_or && expected_outcome == ProofOutcome::kProvenLoss)) {
     for (size_t i = 0; i < src.child_node_ids.size(); ++i) {
       const uint32_t cid = src.child_node_ids[i];
-      if (cid >= src.node_id || cid >= dag_nodes.size()) continue;
+      if (cid >= resolved_id || cid >= dag_nodes.size()) return false;
       if (dag_nodes[cid].outcome != expected_outcome) continue;
       const int16_t mv = src.child_moves[i];
       if (!IsMoveInAllowedRegion<N>(mv, region_hint)) continue;
@@ -2980,6 +2984,499 @@ VerificationReport ProofArtifactManager<N>::VerifyLProofJsonString(
     dag_ver.verified_histories = state_table_verified_count;
   }
   return dag_ver;
+}
+
+namespace {
+
+enum class EdgeWalkStatus : uint8_t {
+  kFound = 0,
+  kNotFound = 1,
+  kAmbiguousDuplicateEdge = 2,
+};
+
+template <int N>
+bool PrecheckProofDagPrefix(const std::vector<ProofDagNode<N>>& nodes,
+                            uint32_t max_inclusive_id,
+                            VerificationReport* ver) {
+  if (max_inclusive_id >= nodes.size()) {
+    ver->passed = false;
+    ver->error_code = "LP-S01";
+    ver->message = "DAG node index is out of ProofDag bounds.";
+    return false;
+  }
+  for (size_t i = 0; i <= static_cast<size_t>(max_inclusive_id); ++i) {
+    const auto& node = nodes[i];
+    if (node.node_id != static_cast<uint32_t>(i)) {
+      ver->passed = false;
+      ver->failed_node_id = static_cast<int32_t>(i);
+      ver->error_code = "LP-T01";
+      ver->message = "ProofDagNode node_id does not match array index.";
+      return false;
+    }
+    if (node.outcome == ProofOutcome::kProvenWin) {
+      if (node.pn != 0 || node.dn != kPnDnSaturation) {
+        ver->passed = false;
+        ver->failed_node_id = static_cast<int32_t>(node.node_id);
+        ver->error_code = "LP-N15";
+        ver->message = "Win node violates (PN=0, DN=SAT) binding.";
+        return false;
+      }
+    } else if (node.outcome == ProofOutcome::kProvenLoss) {
+      if (node.pn != kPnDnSaturation || node.dn != 0) {
+        ver->passed = false;
+        ver->failed_node_id = static_cast<int32_t>(node.node_id);
+        ver->error_code = "LP-N15";
+        ver->message = "Loss node violates (PN=SAT, DN=0) binding.";
+        return false;
+      }
+    } else {
+      ver->passed = false;
+      ver->failed_node_id = static_cast<int32_t>(node.node_id);
+      ver->error_code = "LP-U02";
+      ver->message = "ProofDagNode inside proven DAG carries UNKNOWN outcome.";
+      return false;
+    }
+    if (node.child_moves.size() != node.child_node_ids.size()) {
+      ver->passed = false;
+      ver->failed_node_id = static_cast<int32_t>(node.node_id);
+      ver->error_code = "LP-T02";
+      ver->message = "child_moves and child_node_ids length mismatch.";
+      return false;
+    }
+    for (uint32_t cid : node.child_node_ids) {
+      if (cid >= node.node_id) {
+        ver->passed = false;
+        ver->failed_node_id = static_cast<int32_t>(node.node_id);
+        ver->error_code = "LP-T02";
+        ver->message =
+            "Post-order topological DAG constraint violated (child_id >= "
+            "node_id).";
+        return false;
+      }
+    }
+    if (node.is_pruned_outside_rz || node.is_tt_hit) {
+      if (node.source_proof_node_id >= node.node_id ||
+          node.source_proof_node_id >= nodes.size() ||
+          nodes[node.source_proof_node_id].outcome != node.outcome) {
+        ver->passed = false;
+        ver->failed_node_id = static_cast<int32_t>(node.node_id);
+        ver->error_code = "LP-R02";
+        ver->message =
+            "Pruned/TT node has cyclic, out-of-order, or mismatched "
+            "source_proof_node_id.";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// Requires `PrecheckProofDagPrefix(nodes, root_dag_node_id, ...)` to have passed.
+template <int N>
+EdgeWalkStatus WalkRecordedRootDagEdge(const std::vector<ProofDagNode<N>>& nodes,
+                                       uint32_t root_dag_node_id,
+                                       const std::vector<int16_t>& rel_moves,
+                                       uint32_t* out_recorded_id,
+                                       uint32_t* out_ambiguous_node_id) {
+  uint32_t cur_id = root_dag_node_id;
+  for (int16_t mv : rel_moves) {
+    const auto& cur = nodes[cur_id];
+    if (cur.is_pruned_outside_rz || cur.is_tt_hit) {
+      return EdgeWalkStatus::kNotFound;
+    }
+    if (cur.child_moves.size() != cur.child_node_ids.size()) {
+      *out_ambiguous_node_id = cur_id;
+      return EdgeWalkStatus::kAmbiguousDuplicateEdge;
+    }
+    size_t match_count = 0;
+    uint32_t next_id = kInvalidDagNodeId;
+    for (size_t k = 0; k < cur.child_moves.size(); ++k) {
+      if (cur.child_moves[k] == mv) {
+        ++match_count;
+        next_id = cur.child_node_ids[k];
+      }
+    }
+    if (match_count > 1U) {
+      *out_ambiguous_node_id = cur_id;
+      return EdgeWalkStatus::kAmbiguousDuplicateEdge;
+    }
+    if (match_count == 0U || next_id >= cur_id || next_id >= nodes.size()) {
+      return EdgeWalkStatus::kNotFound;
+    }
+    cur_id = next_id;
+  }
+  *out_recorded_id = cur_id;
+  return EdgeWalkStatus::kFound;
+}
+
+}  // namespace
+
+template <int N>
+VerificationReport ProofArtifactManager<N>::VerifySubproofAtPath(
+    const Position<N>& solve_root_pos, const ProofContext& context,
+    const SolveReport<N>& report, const std::vector<int16_t>& rel_path_moves,
+    uint32_t target_dag_node_id, SubproofBindingPolicy binding_policy) const {
+  VerificationReport ver;
+  ver.verified_scope = solve_root_pos.PlayedMoveTrace().empty() &&
+                               rel_path_moves.empty()
+                           ? "original_root"
+                           : "traced_within_rules";
+  ver.verified_root_kind =
+      (solve_root_pos.PlayedMoveTrace().empty() && rel_path_moves.empty())
+          ? "initial"
+          : "traced_subposition";
+
+  if (target_dag_node_id >= report.proof_dag_nodes.size()) {
+    ver.passed = false;
+    ver.error_code = "LP-S01";
+    ver.message = "target_dag_node_id is out of ProofDag bounds.";
+    return ver;
+  }
+
+  Position<N> sub_pos = solve_root_pos;
+  for (int16_t mv : rel_path_moves) {
+    if (!IsMoveInAllowedRegion<N>(mv, report.region_hint)) {
+      ver.passed = false;
+      ver.error_code = "LP-S11";
+      ver.message = "Subproof path move plays outside declared regionCoords.";
+      return ver;
+    }
+    const bool restricted_side =
+        (sub_pos.ToPlay() == context.root_attacker &&
+         !context.attacker_allow_ko) ||
+        (sub_pos.ToPlay() != context.root_attacker &&
+         !context.defender_allow_ko);
+    bool is_ko_cap = false;
+    if (!sub_pos.PlayMove(mv, &is_ko_cap)) {
+      ver.passed = false;
+      ver.error_code = "LP-S09";
+      ver.message = "Illegal move along rel_path_moves for subproof verification.";
+      return ver;
+    }
+    if (is_ko_cap && restricted_side) {
+      ver.passed = false;
+      ver.error_code = "LP-S12";
+      ver.message =
+          "Subproof path move performs restricted-side ko capture.";
+      return ver;
+    }
+  }
+
+  const auto& target_node = report.proof_dag_nodes[target_dag_node_id];
+  if (target_node.outcome == ProofOutcome::kUnknown) {
+    ver.passed = false;
+    ver.failed_node_id = static_cast<int32_t>(target_dag_node_id);
+    ver.error_code = "LP-U01";
+    ver.message = "Target subproof node outcome is UNKNOWN.";
+    return ver;
+  }
+
+  // Run topological & structural prefix pre-check BEFORE any child_moves,
+  // child_node_ids, or source_proof_node_id indexing!
+  const bool has_proven_root = (report.root_status != ProofOutcome::kUnknown);
+  if (has_proven_root &&
+      binding_policy != SubproofBindingPolicy::kSemanticReplayOnly) {
+    if (report.root_dag_node_id >= report.proof_dag_nodes.size()) {
+      ver.passed = false;
+      ver.error_code = "LP-S01";
+      ver.message = "Missing or out-of-range rootNode in SolveReport DAG.";
+      return ver;
+    }
+    const uint32_t max_precheck_id =
+        std::max(target_dag_node_id, report.root_dag_node_id);
+    if (!PrecheckProofDagPrefix<N>(report.proof_dag_nodes, max_precheck_id,
+                                   &ver)) {
+      return ver;
+    }
+  } else {
+    if (!PrecheckProofDagPrefix<N>(report.proof_dag_nodes, target_dag_node_id,
+                                   &ver)) {
+      return ver;
+    }
+  }
+
+  // Evaluate root-DAG edge ownership separately from query-position semantics.
+  std::string edge_binding_status = "not_applicable";
+  bool edge_bound = false;
+  int32_t recorded_edge_id = -1;
+
+  if (!has_proven_root) {
+    edge_binding_status =
+        (binding_policy == SubproofBindingPolicy::kSemanticReplayOnly)
+            ? "unbound_replay_only"
+            : "unbound_unknown_root";
+    if (binding_policy == SubproofBindingPolicy::kRequireBoundRootEdge) {
+      ver.passed = false;
+      ver.failed_node_id = static_cast<int32_t>(target_dag_node_id);
+      ver.error_code = "LP-U01";
+      ver.edge_binding_status = edge_binding_status;
+      ver.edge_bound_to_root_dag = false;
+      ver.recorded_edge_dag_node_id = -1;
+      ver.semantic_replay_passed = false;
+      ver.message =
+          "Root proposition is UNKNOWN; original root-DAG edge binding is "
+          "unavailable.";
+      return ver;
+    }
+  } else if (binding_policy == SubproofBindingPolicy::kSemanticReplayOnly) {
+    edge_binding_status = "unbound_replay_only";
+    VerificationReport tmp_precheck;
+    if (report.root_dag_node_id < report.proof_dag_nodes.size() &&
+        PrecheckProofDagPrefix<N>(report.proof_dag_nodes,
+                                  report.root_dag_node_id, &tmp_precheck)) {
+      uint32_t walked_id = kInvalidDagNodeId;
+      uint32_t ambig_id = kInvalidDagNodeId;
+      if (WalkRecordedRootDagEdge<N>(
+              report.proof_dag_nodes, report.root_dag_node_id, rel_path_moves,
+              &walked_id, &ambig_id) == EdgeWalkStatus::kFound) {
+        recorded_edge_id = static_cast<int32_t>(walked_id);
+      }
+    }
+  } else {
+    uint32_t walked_id = kInvalidDagNodeId;
+    uint32_t ambig_id = kInvalidDagNodeId;
+    const EdgeWalkStatus walk_status = WalkRecordedRootDagEdge<N>(
+        report.proof_dag_nodes, report.root_dag_node_id, rel_path_moves,
+        &walked_id, &ambig_id);
+    if (walk_status == EdgeWalkStatus::kAmbiguousDuplicateEdge) {
+      ver.passed = false;
+      ver.failed_node_id = static_cast<int32_t>(ambig_id);
+      ver.error_code = "LP-T02";
+      ver.edge_binding_status = "edge_not_found";
+      ver.edge_bound_to_root_dag = false;
+      ver.recorded_edge_dag_node_id = -1;
+      ver.semantic_replay_passed = false;
+      ver.message =
+          "Duplicate child move edge encountered along recorded root DAG path.";
+      return ver;
+    }
+    if (walk_status == EdgeWalkStatus::kNotFound) {
+      ver.passed = false;
+      ver.failed_node_id = static_cast<int32_t>(target_dag_node_id);
+      ver.error_code = "LP-R02";
+      ver.edge_binding_status = "edge_not_found";
+      ver.edge_bound_to_root_dag = false;
+      ver.recorded_edge_dag_node_id = -1;
+      ver.semantic_replay_passed = false;
+      ver.message =
+          "rel_path_moves is not recorded as an explicit path in the proven "
+          "root DAG.";
+      return ver;
+    }
+    recorded_edge_id = static_cast<int32_t>(walked_id);
+    if (walked_id != target_dag_node_id) {
+      ver.passed = false;
+      ver.failed_node_id = static_cast<int32_t>(target_dag_node_id);
+      ver.error_code = "LP-R02";
+      ver.edge_binding_status = "edge_mismatch";
+      ver.edge_bound_to_root_dag = false;
+      ver.recorded_edge_dag_node_id = recorded_edge_id;
+      ver.semantic_replay_passed = false;
+      ver.message =
+          "Recorded root DAG edge along rel_path_moves points to DAG node " +
+          std::to_string(walked_id) + ", not requested target_dag_node_id " +
+          std::to_string(target_dag_node_id) + ".";
+      return ver;
+    }
+    edge_bound = true;
+    edge_binding_status = "bound_to_root_dag";
+  }
+
+  uint32_t eff_id = target_dag_node_id;
+  std::unordered_set<uint32_t> seen_hops;
+  while (eff_id < report.proof_dag_nodes.size() &&
+         (report.proof_dag_nodes[eff_id].is_pruned_outside_rz ||
+          report.proof_dag_nodes[eff_id].is_tt_hit)) {
+    if (seen_hops.count(eff_id) > 0 ||
+        report.proof_dag_nodes[eff_id].source_proof_node_id >= eff_id) {
+      break;
+    }
+    seen_hops.insert(eff_id);
+    eff_id = report.proof_dag_nodes[eff_id].source_proof_node_id;
+  }
+
+  const auto& eff_root = report.proof_dag_nodes[eff_id];
+  int16_t best_move = kNullMove;
+  if (eff_root.child_moves.empty()) {
+    best_move = kPassMove;
+  } else {
+    const bool sub_is_or = (sub_pos.ToPlay() == context.root_attacker);
+    const bool existential_root =
+        (sub_is_or && eff_root.outcome == ProofOutcome::kProvenWin) ||
+        (!sub_is_or && eff_root.outcome == ProofOutcome::kProvenLoss);
+    if (existential_root) {
+      const bool restricted_side =
+          (sub_pos.ToPlay() == context.root_attacker &&
+           !context.attacker_allow_ko) ||
+          (sub_pos.ToPlay() != context.root_attacker &&
+           !context.defender_allow_ko);
+      for (size_t k = 0; k < eff_root.child_moves.size(); ++k) {
+        const int16_t mv = eff_root.child_moves[k];
+        const uint32_t cid = eff_root.child_node_ids[k];
+        if (cid >= report.proof_dag_nodes.size() ||
+            report.proof_dag_nodes[cid].outcome != eff_root.outcome) {
+          continue;
+        }
+        if (!IsMoveInAllowedRegion<N>(mv, report.region_hint)) continue;
+        Position<N> probe = sub_pos;
+        bool is_ko_cap = false;
+        if (probe.PlayMove(mv, &is_ko_cap) &&
+            !(is_ko_cap && restricted_side)) {
+          best_move = mv;
+          break;
+        }
+      }
+    } else {
+      best_move = eff_root.child_moves[0];
+      for (int16_t cmv : eff_root.child_moves) {
+        if (cmv != kPassMove) {
+          best_move = cmv;
+          break;
+        }
+      }
+    }
+  }
+
+  SolveReport<N> sub_report;
+  sub_report.problem_id = report.problem_id;
+  sub_report.input_hash = sub_pos.ZobristHash();
+  sub_report.region_hint = report.region_hint;
+  sub_report.root_status = target_node.outcome;
+  sub_report.root_pn = target_node.pn;
+  sub_report.root_dn = target_node.dn;
+  sub_report.best_move = best_move;
+  sub_report.proof_dag_nodes.assign(
+      report.proof_dag_nodes.begin(),
+      report.proof_dag_nodes.begin() +
+          static_cast<std::ptrdiff_t>(target_dag_node_id + 1U));
+  sub_report.root_dag_node_id = target_dag_node_id;
+
+  const VerificationScope scope =
+      sub_pos.PlayedMoveTrace().empty()
+          ? VerificationScope::kOriginalRoot
+          : VerificationScope::kTracedWithinRules;
+  VerificationReport sub_ver =
+      VerifyProofDag(sub_pos, context, sub_report, scope);
+  sub_ver.edge_binding_status = edge_binding_status;
+  sub_ver.edge_bound_to_root_dag = edge_bound;
+  sub_ver.recorded_edge_dag_node_id = recorded_edge_id;
+  sub_ver.semantic_replay_passed = sub_ver.passed;
+  if (sub_ver.passed && !edge_bound) {
+    if (edge_binding_status == "unbound_unknown_root") {
+      sub_ver.message =
+          "Subproof position semantics verified PASS; root is UNKNOWN so "
+          "original edge ownership is unbound.";
+    } else if (edge_binding_status == "unbound_replay_only") {
+      sub_ver.message =
+          "Subproof position semantics verified PASS under replay-only mode; "
+          "original edge ownership not asserted.";
+    }
+  }
+  return sub_ver;
+}
+
+template <int N>
+VerificationReport ProofArtifactManager<N>::VerifySiblingQueryReplay(
+    const Position<N>& solve_root_pos, const ProofContext& context,
+    const SolveReport<N>& report, const std::vector<int16_t>& parent_rel_moves,
+    int16_t source_move, uint32_t source_dag_node_id, int16_t query_move,
+    SubproofBindingPolicy source_binding_policy) const {
+  std::vector<int16_t> source_rel_moves = parent_rel_moves;
+  source_rel_moves.push_back(source_move);
+  VerificationReport src_ver = VerifySubproofAtPath(
+      solve_root_pos, context, report, source_rel_moves, source_dag_node_id,
+      source_binding_policy);
+  src_ver.source_edge_binding_status = src_ver.edge_binding_status;
+  src_ver.source_edge_bound_to_root_dag = src_ver.edge_bound_to_root_dag;
+  src_ver.source_recorded_edge_dag_node_id = src_ver.recorded_edge_dag_node_id;
+  if (!src_ver.passed) return src_ver;
+
+  VerificationReport ver;
+  ver.verified_scope = "traced_within_rules";
+  ver.verified_root_kind = "traced_subposition";
+  ver.canonical_dag_checksum = src_ver.canonical_dag_checksum;
+  ver.jcs_sha256_checksum = src_ver.jcs_sha256_checksum;
+  ver.edge_binding_status = "unbound_replay_only";
+  ver.edge_bound_to_root_dag = false;
+  ver.recorded_edge_dag_node_id = -1;
+  ver.source_edge_binding_status = src_ver.edge_binding_status;
+  ver.source_edge_bound_to_root_dag = src_ver.edge_bound_to_root_dag;
+  ver.source_recorded_edge_dag_node_id = src_ver.recorded_edge_dag_node_id;
+
+  Position<N> query_pos = solve_root_pos;
+  std::vector<int16_t> query_rel_moves = parent_rel_moves;
+  query_rel_moves.push_back(query_move);
+  for (int16_t mv : query_rel_moves) {
+    if (!IsMoveInAllowedRegion<N>(mv, report.region_hint)) {
+      ver.passed = false;
+      ver.semantic_replay_passed = false;
+      ver.error_code = "LP-S11";
+      ver.message =
+          "Sibling query path move plays outside declared regionCoords.";
+      return ver;
+    }
+    const bool restricted_side =
+        (query_pos.ToPlay() == context.root_attacker &&
+         !context.attacker_allow_ko) ||
+        (query_pos.ToPlay() != context.root_attacker &&
+         !context.defender_allow_ko);
+    bool is_ko_cap = false;
+    if (!query_pos.PlayMove(mv, &is_ko_cap)) {
+      ver.passed = false;
+      ver.semantic_replay_passed = false;
+      ver.error_code = "LP-S09";
+      ver.message = "Illegal move along sibling query path.";
+      return ver;
+    }
+    if (is_ko_cap && restricted_side) {
+      ver.passed = false;
+      ver.semantic_replay_passed = false;
+      ver.error_code = "LP-S12";
+      ver.message =
+          "Sibling query path move performs restricted-side ko capture.";
+      return ver;
+    }
+  }
+
+  if (report.root_status != ProofOutcome::kUnknown &&
+      report.root_dag_node_id < report.proof_dag_nodes.size()) {
+    VerificationReport tmp_precheck;
+    if (PrecheckProofDagPrefix<N>(report.proof_dag_nodes,
+                                  report.root_dag_node_id, &tmp_precheck)) {
+      uint32_t q_recorded_id = kInvalidDagNodeId;
+      uint32_t ambig_id = kInvalidDagNodeId;
+      if (WalkRecordedRootDagEdge<N>(
+              report.proof_dag_nodes, report.root_dag_node_id, query_rel_moves,
+              &q_recorded_id, &ambig_id) == EdgeWalkStatus::kFound) {
+        ver.recorded_edge_dag_node_id = static_cast<int32_t>(q_recorded_id);
+      }
+    }
+  }
+
+  BensonTerminalEvaluator<N> independent_terminal;
+  const ProofOutcome expected_outcome =
+      report.proof_dag_nodes[source_dag_node_id].outcome;
+  const bool ok = ReplaySourceSubgraphOnQueryState<N>(
+      query_pos, context, report.region_hint, report.proof_dag_nodes,
+      source_dag_node_id, expected_outcome, independent_terminal, 0U);
+  ver.passed = ok;
+  ver.semantic_replay_passed = ok;
+  ver.replayed_pruned_certificates = ok ? 1U : 0U;
+  ver.error_code = ok ? "PASS" : "LP-R02";
+  if (!ok) {
+    ver.message = "Independent sibling query replay failed against source DAG.";
+  } else if (ver.source_edge_bound_to_root_dag) {
+    ver.message =
+        "Sibling query semantic replay verified PASS against root-DAG-bound "
+        "source subproof (query edge ownership not asserted).";
+  } else {
+    ver.message =
+        "Sibling query semantic replay verified PASS with unbound source edge "
+        "provenance (" +
+        ver.source_edge_binding_status +
+        "; query edge ownership not asserted).";
+  }
+  return ver;
 }
 
 template class ProofArtifactManager<5>;

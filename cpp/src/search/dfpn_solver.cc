@@ -54,13 +54,19 @@ std::string FormatMoveSgfForTrace(int16_t mv) {
 }
 
 template <int N>
-std::string FormatTracePath(const std::vector<int16_t>& moves) {
+std::string FormatTracePathFrom(const std::vector<int16_t>& moves,
+                                size_t start_idx) {
   std::string out;
-  for (size_t i = 0; i < moves.size(); ++i) {
-    if (i > 0U) out.push_back('/');
+  for (size_t i = start_idx; i < moves.size(); ++i) {
+    if (i > start_idx) out.push_back('/');
     out.append(FormatMoveSgfForTrace<N>(moves[i]));
   }
   return out;
+}
+
+template <int N>
+std::string FormatTracePath(const std::vector<int16_t>& moves) {
+  return FormatTracePathFrom<N>(moves, 0U);
 }
 
 std::string NormalizeObservedPath(std::string raw) {
@@ -121,8 +127,19 @@ SolveReport<N> DfpnSolver<N>::Solve(
   tt_store_.SetProfilingEnabled(config_.enable_stage_profiling);
   stage_profile_ = SolverStageProfile{};
   stage_profile_.enabled = config_.enable_stage_profiling;
+  base_trace_len_ = initial_pos.PlayedMoveTrace().size();
+  near_pn_continuation_claimed_ = false;
+  active_continuation_cap_nodes_ = 0ULL;
   convergence_trace_ = ConvergenceTraceReport{};
   convergence_trace_.enabled = config_.enable_convergence_trace;
+  convergence_trace_.path_basis = "solve_root_relative";
+  convergence_trace_.initial_trace_path =
+      FormatTracePath<N>(initial_pos.PlayedMoveTrace());
+  convergence_trace_.near_pn_continuation.enabled =
+      (config_.enable_near_pn_continuation &&
+       config_.near_pn_continuation_max_calls > 0U);
+  convergence_trace_.near_pn_continuation.max_extra_calls =
+      config_.near_pn_continuation_max_calls;
   if (config_.enable_convergence_trace) {
     for (const std::string& raw_p : config_.observed_paths) {
       const std::string norm = NormalizeObservedPath(raw_p);
@@ -328,6 +345,19 @@ SolveReport<N> DfpnSolver<N>::Solve(
   }
 
   if (config_.enable_convergence_trace) {
+    auto root_fit = node_frontier_cache_.find(root_path_id);
+    if (root_fit != node_frontier_cache_.end()) {
+      for (auto& rc : convergence_trace_.root_child_calls) {
+        for (const auto& ch : root_fit->second.children) {
+          if (ch.move == rc.move) {
+            rc.final_pn = ch.pn;
+            rc.final_dn = ch.dn;
+            rc.final_outcome = ch.outcome;
+            break;
+          }
+        }
+      }
+    }
     for (ObservedPathTrace& wt : convergence_trace_.watched_paths) {
       if (wt.frontier_exists) continue;
       uint64_t cur_pid = root_path_id;
@@ -414,6 +444,7 @@ void DfpnSolver<N>::FinalizeObservedFrontier(
   out->ko_barrier_count = 0;
   out->expanded_unknown_count = 0;
   out->unexpanded_unknown_count = 0;
+  out->closed_children.clear();
   out->top_unclosed_children.clear();
   out->watched_next_moves.clear();
 
@@ -465,6 +496,7 @@ void DfpnSolver<N>::FinalizeObservedFrontier(
     sum.tactical_score = ch.tactical_score;
     sum.pn = ch.pn;
     sum.dn = ch.dn;
+    sum.dag_node_id = ch.dag_node_id;
     sum.probed = ch.probed;
     sum.ko_dependent = ch.ko_dependent;
     sum.in_window = in_win;
@@ -476,6 +508,10 @@ void DfpnSolver<N>::FinalizeObservedFrontier(
     if (std::find(direct_watched_next.begin(), direct_watched_next.end(),
                   mv_sgf) != direct_watched_next.end()) {
       out->watched_next_moves.push_back(sum);
+    }
+    if (ch.has_decisive_dag && (ch.outcome == ProofOutcome::kProvenWin ||
+                                ch.outcome == ProofOutcome::kProvenLoss)) {
+      out->closed_children.push_back(sum);
     }
     if (ch.outcome == ProofOutcome::kUnknown && !ch.ko_dependent && !deferred) {
       unclosed_candidates.push_back(std::move(sum));
@@ -1405,7 +1441,8 @@ void DfpnSolver<N>::MidSearch(
   const bool prof = config_.enable_stage_profiling;
   const bool trace_on = config_.enable_convergence_trace;
   const std::string cur_trace_path =
-      trace_on ? FormatTracePath<N>(pos.PlayedMoveTrace()) : std::string{};
+      trace_on ? FormatTracePathFrom<N>(pos.PlayedMoveTrace(), base_trace_len_)
+               : std::string{};
   int watched_idx = -1;
   if (trace_on) {
     if (depth > convergence_trace_.max_depth_reached) {
@@ -1469,12 +1506,6 @@ void DfpnSolver<N>::MidSearch(
         convergence_trace_.first_terminal_leaf_node = report_.num_nodes;
         convergence_trace_.first_terminal_leaf_kind = term.evidence_kind;
         convergence_trace_.first_terminal_leaf_path = cur_trace_path;
-      }
-      if (convergence_trace_.first_proven_subproof_node == 0ULL) {
-        convergence_trace_.first_proven_subproof_node = report_.num_nodes;
-        convergence_trace_.first_proven_subproof_outcome = *out_outcome;
-        convergence_trace_.first_proven_subproof_dag_id = dag_node.node_id;
-        convergence_trace_.first_proven_subproof_path = cur_trace_path;
       }
     }
     return;
@@ -1683,6 +1714,7 @@ void DfpnSolver<N>::MidSearch(
   }
 
   in_path_hashes.insert(pos.ZobristHash());
+  bool this_call_owns_continuation = false;
 
   while (true) {
     CachedNodeFrontier& frontier = node_frontier_cache_.at(node_path_id);
@@ -2114,6 +2146,17 @@ void DfpnSolver<N>::MidSearch(
       report_.proof_dag_nodes.push_back(dag_node);
       dag_has_capture_.push_back(node_has_capture);
       *out_dag_node_id = dag_node.node_id;
+      if (trace_on && depth == 0U && !(*out_ko_dependent) &&
+          convergence_trace_.first_non_terminal_subproof_node == 0ULL &&
+          dag_node.terminal_evidence == EvidenceKind::kNone &&
+          !dag_node.is_pruned_outside_rz && !dag_node.is_tt_hit &&
+          !dag_node.child_node_ids.empty()) {
+        convergence_trace_.first_non_terminal_subproof_node = report_.num_nodes;
+        convergence_trace_.first_non_terminal_subproof_outcome = *out_outcome;
+        convergence_trace_.first_non_terminal_subproof_dag_id =
+            dag_node.node_id;
+        convergence_trace_.first_non_terminal_subproof_path = cur_trace_path;
+      }
 
       tt_store_.StoreBoardTT(pos, context, *out_pn, *out_dn, *out_outcome,
                              *out_ko_dependent, true, *out_dag_node_id,
@@ -2126,6 +2169,31 @@ void DfpnSolver<N>::MidSearch(
         tt_store_.StorePatternTT(pos, context, active_rz, *out_pn, *out_dn,
                                  *out_outcome, *out_dag_node_id, true,
                                  node_has_capture);
+      }
+      if (this_call_owns_continuation) {
+        if (trace_on) {
+          auto& nt = convergence_trace_.near_pn_continuation;
+          nt.exit_node = report_.num_nodes;
+          nt.extra_calls_spent = (report_.num_nodes >= nt.trigger_node)
+                                     ? (report_.num_nodes - nt.trigger_node)
+                                     : 0ULL;
+          nt.return_pn = *out_pn;
+          nt.return_dn = *out_dn;
+          nt.return_outcome = *out_outcome;
+          nt.return_dag_id = *out_dag_node_id;
+          const bool got_rz =
+              frontier.has_null_move_rz &&
+              frontier.representative_dag_id != kInvalidDagNodeId;
+          nt.acquired_active_rz_source = got_rz;
+          if (got_rz) {
+            nt.active_rz_source_move = frontier.representative_move;
+            nt.active_rz_source_move_sgf =
+                FormatMoveSgfForTrace<N>(frontier.representative_move);
+            nt.active_rz_source_dag_id = frontier.representative_dag_id;
+            nt.active_rz_source_size = frontier.active_null_move_rz.Size();
+          }
+        }
+        active_continuation_cap_nodes_ = 0ULL;
       }
       // Once proven, free the frontier entry to reclaim memory immediately.
       if (trace_on && watched_idx >= 0) {
@@ -2146,9 +2214,53 @@ void DfpnSolver<N>::MidSearch(
       *out_outcome = ProofOutcome::kUnknown;
       break;
     }
-    if (cur_pn >= th_pn || cur_dn >= th_dn ||
-        report_.num_nodes >= config_.max_nodes) {
-      if (report_.num_nodes >= config_.max_nodes) {
+    const bool global_node_limit_hit = (report_.num_nodes >= config_.max_nodes);
+    bool continuation_cap_hit =
+        (active_continuation_cap_nodes_ > 0ULL &&
+         report_.num_nodes >= active_continuation_cap_nodes_);
+    if (config_.enable_near_pn_continuation &&
+        config_.near_pn_continuation_max_calls > 0U &&
+        !near_pn_continuation_claimed_ && !global_node_limit_hit &&
+        !continuation_cap_hit && base_trace_len_ == 0U && depth == 1U &&
+        !is_or_node && !has_active_rz && !frontier.has_null_move_rz &&
+        cur_dn < th_dn && th_pn < kPnDnSaturation && cur_pn > th_pn &&
+        (cur_pn - th_pn) == 1U) {
+      bool any_child_probed = false;
+      for (const auto& ch : children) {
+        if (ch.probed) {
+          any_child_probed = true;
+          break;
+        }
+      }
+      if (any_child_probed) {
+        near_pn_continuation_claimed_ = true;
+        this_call_owns_continuation = true;
+        const uint32_t orig_th_pn = th_pn;
+        th_pn = ClampSat(static_cast<uint64_t>(cur_pn) + 1ULL);
+        active_continuation_cap_nodes_ = std::min<uint64_t>(
+            config_.max_nodes,
+            report_.num_nodes +
+                static_cast<uint64_t>(config_.near_pn_continuation_max_calls));
+        continuation_cap_hit =
+            (active_continuation_cap_nodes_ > 0ULL &&
+             report_.num_nodes >= active_continuation_cap_nodes_);
+        if (trace_on) {
+          auto& nt = convergence_trace_.near_pn_continuation;
+          nt.claimed = true;
+          nt.claimed_path = cur_trace_path;
+          nt.claimed_move = incoming_move;
+          nt.trigger_node = report_.num_nodes;
+          nt.orig_th_pn = orig_th_pn;
+          nt.boosted_th_pn = th_pn;
+          nt.th_dn = th_dn;
+          nt.pre_pn = cur_pn;
+          nt.pre_dn = cur_dn;
+        }
+      }
+    }
+    if (cur_pn >= th_pn || cur_dn >= th_dn || global_node_limit_hit ||
+        continuation_cap_hit) {
+      if (global_node_limit_hit) {
         report_.resource_exhausted = true;
         report_.unknown_reason = UnknownReason::kNodeLimit;
       }
@@ -2290,6 +2402,7 @@ void DfpnSolver<N>::MidSearch(
     ProofCertificateRZ<N> c_disproof_rz{};
     uint32_t c_dag_id = kInvalidDagNodeId;
 
+    const uint64_t before_child_nodes = report_.num_nodes;
     MidSearch(pos, context, region_hint, child_th_pn, child_th_dn, depth + 1U,
               chosen_path_id, in_path_hashes, &c_pn, &c_dn, &c_outcome,
               &child_ko_dep, &child_has_capture, &c_proof_rz, &c_disproof_rz,
@@ -2335,15 +2448,48 @@ void DfpnSolver<N>::MidSearch(
                               mpc.dag_node_id != kInvalidDagNodeId);
     }
 
+    if (trace_on && depth == 0U) {
+      const uint64_t delta_nodes = (report_.num_nodes >= before_child_nodes)
+                                       ? (report_.num_nodes - before_child_nodes)
+                                       : 0ULL;
+      RootChildCallStat* found_stat = nullptr;
+      for (auto& rc : convergence_trace_.root_child_calls) {
+        if (rc.move == chosen_move) {
+          found_stat = &rc;
+          break;
+        }
+      }
+      if (found_stat == nullptr) {
+        RootChildCallStat stat;
+        stat.move = chosen_move;
+        stat.move_sgf = FormatMoveSgfForTrace<N>(chosen_move);
+        convergence_trace_.root_child_calls.push_back(std::move(stat));
+        found_stat = &convergence_trace_.root_child_calls.back();
+      }
+      ++found_stat->select_count;
+      found_stat->calls_spent += delta_nodes;
+      found_stat->final_pn = mpc.pn;
+      found_stat->final_dn = mpc.dn;
+      found_stat->final_outcome = mpc.outcome;
+    }
+
     const bool was_has_null_rz = post_frontier.has_null_move_rz;
     if (trace_on && mpc.has_decisive_dag && !mpc.ko_dependent) {
-      if (convergence_trace_.first_proven_subproof_node == 0ULL) {
-        convergence_trace_.first_proven_subproof_node = report_.num_nodes;
-        convergence_trace_.first_proven_subproof_outcome = mpc.outcome;
-        convergence_trace_.first_proven_subproof_dag_id = mpc.dag_node_id;
-        const std::string mv_sgf = FormatMoveSgfForTrace<N>(mpc.move);
-        convergence_trace_.first_proven_subproof_path =
-            cur_trace_path.empty() ? mv_sgf : (cur_trace_path + "/" + mv_sgf);
+      if (convergence_trace_.first_non_terminal_subproof_node == 0ULL &&
+          mpc.dag_node_id < report_.proof_dag_nodes.size()) {
+        const auto& src_dag = report_.proof_dag_nodes[mpc.dag_node_id];
+        if (src_dag.terminal_evidence == EvidenceKind::kNone &&
+            !src_dag.is_pruned_outside_rz && !src_dag.is_tt_hit &&
+            !src_dag.child_node_ids.empty()) {
+          convergence_trace_.first_non_terminal_subproof_node =
+              report_.num_nodes;
+          convergence_trace_.first_non_terminal_subproof_outcome = mpc.outcome;
+          convergence_trace_.first_non_terminal_subproof_dag_id =
+              mpc.dag_node_id;
+          const std::string mv_sgf = FormatMoveSgfForTrace<N>(mpc.move);
+          convergence_trace_.first_non_terminal_subproof_path =
+              cur_trace_path.empty() ? mv_sgf : (cur_trace_path + "/" + mv_sgf);
+        }
       }
       if (watched_idx >= 0) {
         ObservedPathTrace& wt =
@@ -2401,6 +2547,35 @@ void DfpnSolver<N>::MidSearch(
             post_frontier.active_null_move_rz.Size();
       }
     }
+  }
+
+  if (this_call_owns_continuation) {
+    if (trace_on && convergence_trace_.near_pn_continuation.exit_node == 0ULL) {
+      auto& nt = convergence_trace_.near_pn_continuation;
+      nt.exit_node = report_.num_nodes;
+      nt.extra_calls_spent = (report_.num_nodes >= nt.trigger_node)
+                                 ? (report_.num_nodes - nt.trigger_node)
+                                 : 0ULL;
+      nt.return_pn = *out_pn;
+      nt.return_dn = *out_dn;
+      nt.return_outcome = *out_outcome;
+      nt.return_dag_id = *out_dag_node_id;
+      auto fit = node_frontier_cache_.find(node_path_id);
+      if (fit != node_frontier_cache_.end()) {
+        const bool got_rz =
+            fit->second.has_null_move_rz &&
+            fit->second.representative_dag_id != kInvalidDagNodeId;
+        nt.acquired_active_rz_source = got_rz;
+        if (got_rz) {
+          nt.active_rz_source_move = fit->second.representative_move;
+          nt.active_rz_source_move_sgf =
+              FormatMoveSgfForTrace<N>(fit->second.representative_move);
+          nt.active_rz_source_dag_id = fit->second.representative_dag_id;
+          nt.active_rz_source_size = fit->second.active_null_move_rz.Size();
+        }
+      }
+    }
+    active_continuation_cap_nodes_ = 0ULL;
   }
 
   in_path_hashes.erase(pos.ZobristHash());

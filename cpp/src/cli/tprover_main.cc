@@ -1075,6 +1075,33 @@ std::vector<std::string> ParseCsvListPreserveEmpty(const std::string& raw) {
   return items;
 }
 
+bool ParseSgfTracePath(const std::string& path, int board_size,
+                       std::vector<int16_t>* out_moves) {
+  out_moves->clear();
+  if (path.empty()) return true;
+  size_t start = 0;
+  while (start < path.size()) {
+    const size_t slash = path.find('/', start);
+    const std::string seg =
+        (slash == std::string::npos) ? path.substr(start)
+                                     : path.substr(start, slash - start);
+    if (seg == "pass") {
+      out_moves->push_back(ldprover::kPassMove);
+    } else if (seg.size() == 2U && seg[0] >= 'a' &&
+               seg[0] < static_cast<char>('a' + board_size) && seg[1] >= 'a' &&
+               seg[1] < static_cast<char>('a' + board_size)) {
+      const int c = static_cast<int>(seg[0] - 'a');
+      const int r = static_cast<int>(seg[1] - 'a');
+      out_moves->push_back(static_cast<int16_t>(r * board_size + c));
+    } else {
+      return false;
+    }
+    if (slash == std::string::npos) break;
+    start = slash + 1U;
+  }
+  return true;
+}
+
 std::string UnknownReasonLabel(ldprover::UnknownReason reason) {
   switch (reason) {
     case ldprover::UnknownReason::kNone:
@@ -1147,6 +1174,15 @@ int RunSolveCommand(int argc, char* argv[]) {
       config.enable_convergence_trace = true;
     } else if (arg == "--observe-paths" && i + 1 < argc) {
       config.observed_paths = ParseCsvListPreserveEmpty(argv[++i]);
+    } else if (arg == "--near-pn-continuation") {
+      config.enable_near_pn_continuation = true;
+    } else if (arg == "--near-pn-continuation-calls" && i + 1 < argc) {
+      if (!ParseStrictPositiveU32(argv[++i],
+                                  &config.near_pn_continuation_max_calls)) {
+        std::cerr << "[LDProver] Invalid positive integer for "
+                     "--near-pn-continuation-calls\n";
+        return 2;
+      }
     } else if (arg == "--mode" && i + 1 < argc) {
       const std::string mode = argv[++i];
       if (mode == "board-tt") {
@@ -1486,6 +1522,14 @@ int RunSolveCommand(int argc, char* argv[]) {
 
   if (!out_convergence_path.empty()) {
     const auto& tr = solver.ConvergenceTrace();
+    auto move_to_sgf19 = [](int16_t mv) -> std::string {
+      if (mv == ldprover::kPassMove) return "pass";
+      if (mv < 0 || mv >= 19 * 19) return "";
+      std::string s(2, 'a');
+      s[0] = static_cast<char>('a' + (mv % 19));
+      s[1] = static_cast<char>('a' + (mv / 19));
+      return s;
+    };
     auto emit_child_array =
         [&](std::ostringstream& os,
             const std::vector<ldprover::ObservedChildSummary>& items,
@@ -1499,6 +1543,10 @@ int RunSolveCommand(int argc, char* argv[]) {
                << "\", \"move\": " << c.move << ", \"rank\": " << c.rank
                << ", \"tacticalScore\": " << c.tactical_score
                << ", \"pn\": " << c.pn << ", \"dn\": " << c.dn
+               << ", \"dagNodeId\": "
+               << (c.dag_node_id == ldprover::kInvalidDagNodeId
+                       ? -1
+                       : static_cast<int64_t>(c.dag_node_id))
                << ", \"probed\": " << (c.probed ? "true" : "false")
                << ", \"koDependent\": " << (c.ko_dependent ? "true" : "false")
                << ", \"inWindow\": " << (c.in_window ? "true" : "false")
@@ -1516,6 +1564,111 @@ int RunSolveCommand(int argc, char* argv[]) {
           os << "]";
         };
 
+    bool first_non_term_verified = false;
+    std::string first_non_term_code = "NONE";
+    std::string first_non_term_edge_binding = "not_applicable";
+    bool first_non_term_edge_bound = false;
+    bool first_non_term_semantic_passed = false;
+    if (tr.first_non_terminal_subproof_node > 0ULL &&
+        tr.first_non_terminal_subproof_dag_id != ldprover::kInvalidDagNodeId) {
+      std::vector<int16_t> rel_moves;
+      if (ParseSgfTracePath(tr.first_non_terminal_subproof_path, 19,
+                            &rel_moves)) {
+        const auto vres = artifacts.VerifySubproofAtPath(
+            parsed.initial_position, parsed.proof_context, report, rel_moves,
+            tr.first_non_terminal_subproof_dag_id);
+        first_non_term_verified = vres.passed;
+        first_non_term_code = vres.error_code;
+        first_non_term_edge_binding = vres.edge_binding_status;
+        first_non_term_edge_bound = vres.edge_bound_to_root_dag;
+        first_non_term_semantic_passed = vres.semantic_replay_passed;
+        if (!vres.passed &&
+            (vres.edge_binding_status == "edge_not_found" ||
+             vres.edge_binding_status == "edge_mismatch")) {
+          first_non_term_semantic_passed =
+              artifacts
+                  .VerifySubproofAtPath(
+                      parsed.initial_position, parsed.proof_context, report,
+                      rel_moves, tr.first_non_terminal_subproof_dag_id,
+                      ldprover::SubproofBindingPolicy::kSemanticReplayOnly)
+                  .semantic_replay_passed;
+        }
+      } else {
+        first_non_term_code = "LP-S09";
+      }
+    }
+
+    const auto& nt = tr.near_pn_continuation;
+    bool src_is_non_terminal = false;
+    bool src_ind_verified = false;
+    std::string src_ind_code = "NONE";
+    std::string src_edge_binding = "not_applicable";
+    bool src_edge_bound = false;
+    bool src_semantic_passed = false;
+    std::vector<std::string> verified_replay_moves_sgf;
+    if (nt.acquired_active_rz_source &&
+        nt.active_rz_source_dag_id != ldprover::kInvalidDagNodeId &&
+        nt.active_rz_source_dag_id < report.proof_dag_nodes.size()) {
+      const auto& src_node = report.proof_dag_nodes[nt.active_rz_source_dag_id];
+      src_is_non_terminal =
+          (src_node.terminal_evidence == ldprover::EvidenceKind::kNone &&
+           !src_node.is_pruned_outside_rz && !src_node.is_tt_hit &&
+           !src_node.child_node_ids.empty());
+      std::vector<int16_t> parent_rel_moves;
+      if (ParseSgfTracePath(nt.claimed_path, 19, &parent_rel_moves)) {
+        std::vector<int16_t> src_rel_moves = parent_rel_moves;
+        src_rel_moves.push_back(nt.active_rz_source_move);
+        const auto sver = artifacts.VerifySubproofAtPath(
+            parsed.initial_position, parsed.proof_context, report,
+            src_rel_moves, nt.active_rz_source_dag_id);
+        src_ind_verified = sver.passed;
+        src_ind_code = sver.error_code;
+        src_edge_binding = sver.edge_binding_status;
+        src_edge_bound = sver.edge_bound_to_root_dag;
+        src_semantic_passed = sver.semantic_replay_passed;
+        if (!sver.passed &&
+            (sver.edge_binding_status == "edge_not_found" ||
+             sver.edge_binding_status == "edge_mismatch")) {
+          src_semantic_passed =
+              artifacts
+                  .VerifySubproofAtPath(
+                      parsed.initial_position, parsed.proof_context, report,
+                      src_rel_moves, nt.active_rz_source_dag_id,
+                      ldprover::SubproofBindingPolicy::kSemanticReplayOnly)
+                  .semantic_replay_passed;
+        }
+        if (src_ind_verified) {
+          ldprover::Position<19> claim_pos = parsed.initial_position;
+          bool path_ok = true;
+          for (int16_t mv : parent_rel_moves) {
+            if (!claim_pos.PlayMove(mv)) {
+              path_ok = false;
+              break;
+            }
+          }
+          if (path_ok) {
+            const auto legal =
+                claim_pos.GenerateLegalMoves(parsed.region_search_mask);
+            const auto replay_policy =
+                src_edge_bound
+                    ? ldprover::SubproofBindingPolicy::kRequireBoundRootEdge
+                    : ldprover::SubproofBindingPolicy::kStrictWhenRootProven;
+            for (int16_t qmv : legal) {
+              const auto qver = artifacts.VerifySiblingQueryReplay(
+                  parsed.initial_position, parsed.proof_context, report,
+                  parent_rel_moves, nt.active_rz_source_move,
+                  nt.active_rz_source_dag_id, qmv, replay_policy);
+              if (qver.passed) {
+                verified_replay_moves_sgf.push_back(move_to_sgf19(qmv));
+              }
+            }
+          }
+        }
+      } else {
+        src_ind_code = "LP-S09";
+      }
+    }
+
     std::ostringstream cj;
     cj << "{\n";
     cj << "  \"problemId\": \"" << EscapeJsonString(prob_id) << "\",\n";
@@ -1526,28 +1679,135 @@ int RunSolveCommand(int argc, char* argv[]) {
     cj << "  \"numNodes\": " << report.num_nodes << ",\n";
     cj << "  \"prunedOutsideRz\": " << report.pruned_outside_rz_count << ",\n";
     cj << "  \"proofChecksum\": \"" << EscapeJsonString(checksum) << "\",\n";
+    cj << "  \"pathBasis\": \"" << EscapeJsonString(tr.path_basis) << "\",\n";
+    cj << "  \"initialTracePath\": \""
+       << EscapeJsonString(tr.initial_trace_path) << "\",\n";
     cj << "  \"firstTerminalLeafNode\": " << tr.first_terminal_leaf_node << ",\n";
     cj << "  \"firstTerminalLeafKind\": \""
        << EvidenceKindLabel(tr.first_terminal_leaf_kind) << "\",\n";
     cj << "  \"firstTerminalLeafPath\": \""
        << EscapeJsonString(tr.first_terminal_leaf_path) << "\",\n";
-    cj << "  \"firstProvenSubproofNode\": " << tr.first_proven_subproof_node
-       << ",\n";
-    cj << "  \"firstProvenSubproofOutcome\": \""
-       << OutcomeLabel(tr.first_proven_subproof_outcome) << "\",\n";
-    cj << "  \"firstProvenSubproofDagId\": "
-       << (tr.first_proven_subproof_dag_id == ldprover::kInvalidDagNodeId
+    cj << "  \"firstNonTerminalSubproofNode\": "
+       << tr.first_non_terminal_subproof_node << ",\n";
+    cj << "  \"firstNonTerminalSubproofOutcome\": \""
+       << OutcomeLabel(tr.first_non_terminal_subproof_outcome) << "\",\n";
+    cj << "  \"firstNonTerminalSubproofDagId\": "
+       << (tr.first_non_terminal_subproof_dag_id == ldprover::kInvalidDagNodeId
                ? -1
-               : static_cast<int64_t>(tr.first_proven_subproof_dag_id))
+               : static_cast<int64_t>(tr.first_non_terminal_subproof_dag_id))
        << ",\n";
-    cj << "  \"firstProvenSubproofPath\": \""
-       << EscapeJsonString(tr.first_proven_subproof_path) << "\",\n";
+    cj << "  \"firstNonTerminalSubproofPath\": \""
+       << EscapeJsonString(tr.first_non_terminal_subproof_path) << "\",\n";
+    cj << "  \"firstNonTerminalSubproofVerified\": "
+       << (first_non_term_verified ? "true" : "false") << ",\n";
+    cj << "  \"firstNonTerminalSubproofVerifyCode\": \""
+       << EscapeJsonString(first_non_term_code) << "\",\n";
+    cj << "  \"firstNonTerminalSubproofEdgeBinding\": \""
+       << EscapeJsonString(first_non_term_edge_binding) << "\",\n";
+    cj << "  \"firstNonTerminalSubproofEdgeBound\": "
+       << (first_non_term_edge_bound ? "true" : "false") << ",\n";
+    cj << "  \"firstNonTerminalSubproofSemanticPassed\": "
+       << (first_non_term_semantic_passed ? "true" : "false") << ",\n";
     cj << "  \"maxDepthReached\": " << tr.max_depth_reached << ",\n";
     cj << "  \"deepestPath\": \"" << EscapeJsonString(tr.deepest_path)
        << "\",\n";
+    cj << "  \"nearPnContinuation\": {\n";
+    cj << "    \"enabled\": " << (nt.enabled ? "true" : "false") << ",\n";
+    cj << "    \"maxExtraCalls\": " << nt.max_extra_calls << ",\n";
+    cj << "    \"claimed\": " << (nt.claimed ? "true" : "false") << ",\n";
+    cj << "    \"claimedPath\": \"" << EscapeJsonString(nt.claimed_path)
+       << "\",\n";
+    cj << "    \"claimedMove\": " << nt.claimed_move << ",\n";
+    cj << "    \"claimedMoveSgf\": \""
+       << EscapeJsonString(nt.claimed ? move_to_sgf19(nt.claimed_move) : "")
+       << "\",\n";
+    cj << "    \"triggerNode\": " << nt.trigger_node << ",\n";
+    cj << "    \"exitNode\": " << nt.exit_node << ",\n";
+    cj << "    \"extraCallsSpent\": " << nt.extra_calls_spent << ",\n";
+    cj << "    \"origThPn\": " << nt.orig_th_pn << ",\n";
+    cj << "    \"boostedThPn\": " << nt.boosted_th_pn << ",\n";
+    cj << "    \"thDn\": " << nt.th_dn << ",\n";
+    cj << "    \"prePn\": " << nt.pre_pn << ",\n";
+    cj << "    \"preDn\": " << nt.pre_dn << ",\n";
+    cj << "    \"returnPn\": " << nt.return_pn << ",\n";
+    cj << "    \"returnDn\": " << nt.return_dn << ",\n";
+    cj << "    \"returnOutcome\": \"" << OutcomeLabel(nt.return_outcome)
+       << "\",\n";
+    cj << "    \"returnDagId\": "
+       << (nt.return_dag_id == ldprover::kInvalidDagNodeId
+               ? -1
+               : static_cast<int64_t>(nt.return_dag_id))
+       << ",\n";
+    cj << "    \"acquiredActiveRzSource\": "
+       << (nt.acquired_active_rz_source ? "true" : "false") << ",\n";
+    cj << "    \"activeRzSourceMove\": " << nt.active_rz_source_move << ",\n";
+    cj << "    \"activeRzSourceMoveSgf\": \""
+       << EscapeJsonString(nt.active_rz_source_move_sgf) << "\",\n";
+    cj << "    \"activeRzSourceDagId\": "
+       << (nt.active_rz_source_dag_id == ldprover::kInvalidDagNodeId
+               ? -1
+               : static_cast<int64_t>(nt.active_rz_source_dag_id))
+       << ",\n";
+    cj << "    \"activeRzSourceSize\": " << nt.active_rz_source_size << ",\n";
+    cj << "    \"sourceIsNonTerminal\": "
+       << (src_is_non_terminal ? "true" : "false") << ",\n";
+    cj << "    \"sourceIndependentVerified\": "
+       << (src_ind_verified ? "true" : "false") << ",\n";
+    cj << "    \"sourceIndependentVerifyCode\": \""
+       << EscapeJsonString(src_ind_code) << "\",\n";
+    cj << "    \"sourceEdgeBinding\": \""
+       << EscapeJsonString(src_edge_binding) << "\",\n";
+    cj << "    \"sourceEdgeBound\": "
+       << (src_edge_bound ? "true" : "false") << ",\n";
+    cj << "    \"sourceSemanticPassed\": "
+       << (src_semantic_passed ? "true" : "false") << ",\n";
+    cj << "    \"sourceVerifiedReplayMovesSgf\": [";
+    for (size_t ri = 0; ri < verified_replay_moves_sgf.size(); ++ri) {
+      if (ri > 0U) cj << ", ";
+      cj << "\"" << EscapeJsonString(verified_replay_moves_sgf[ri]) << "\"";
+    }
+    cj << "]\n";
+    cj << "  },\n";
+    cj << "  \"rootChildCalls\": [\n";
+    for (size_t rci = 0; rci < tr.root_child_calls.size(); ++rci) {
+      const auto& rc = tr.root_child_calls[rci];
+      cj << "    {\"moveSgf\": \"" << EscapeJsonString(rc.move_sgf)
+         << "\", \"move\": " << rc.move
+         << ", \"selectCount\": " << rc.select_count
+         << ", \"callsSpent\": " << rc.calls_spent
+         << ", \"finalPn\": " << rc.final_pn
+         << ", \"finalDn\": " << rc.final_dn << ", \"finalOutcome\": \""
+         << OutcomeLabel(rc.final_outcome) << "\"}"
+         << (rci + 1U < tr.root_child_calls.size() ? "," : "") << "\n";
+    }
+    cj << "  ],\n";
     cj << "  \"watchedPaths\": [\n";
     for (size_t wi = 0; wi < tr.watched_paths.size(); ++wi) {
       const auto& wt = tr.watched_paths[wi];
+      uint32_t verified_closed_cnt = 0;
+      uint32_t edge_bound_closed_cnt = 0;
+      uint32_t unverified_closed_cnt = 0;
+      std::vector<int16_t> parent_rel_moves;
+      const bool parent_ok =
+          wt.path.empty() || ParseSgfTracePath(wt.path, 19, &parent_rel_moves);
+      for (const auto& cc : wt.closed_children) {
+        bool v_ok = false;
+        bool eb_ok = false;
+        if (parent_ok && cc.dag_node_id != ldprover::kInvalidDagNodeId) {
+          std::vector<int16_t> child_rel = parent_rel_moves;
+          child_rel.push_back(cc.move);
+          const auto cv = artifacts.VerifySubproofAtPath(
+              parsed.initial_position, parsed.proof_context, report, child_rel,
+              cc.dag_node_id);
+          v_ok = cv.passed;
+          eb_ok = cv.edge_bound_to_root_dag;
+        }
+        if (v_ok) ++verified_closed_cnt;
+        else ++unverified_closed_cnt;
+        if (eb_ok) ++edge_bound_closed_cnt;
+      }
+      const uint32_t unresolved_unknown_cnt =
+          wt.expanded_unknown_count + wt.unexpanded_unknown_count;
       cj << "    {\n";
       cj << "      \"path\": \"" << EscapeJsonString(wt.path) << "\",\n";
       cj << "      \"firstEnterNode\": " << wt.first_enter_node << ",\n";
@@ -1587,6 +1847,11 @@ int RunSolveCommand(int argc, char* argv[]) {
       cj << "      \"representativeMoveSgf\": \""
          << EscapeJsonString(wt.representative_move_sgf) << "\",\n";
       cj << "      \"activeRzSize\": " << wt.active_rz_size << ",\n";
+      cj << "      \"verifiedClosedCount\": " << verified_closed_cnt << ",\n";
+      cj << "      \"edgeBoundClosedCount\": " << edge_bound_closed_cnt
+         << ",\n";
+      cj << "      \"unverifiedClosedCount\": " << unverified_closed_cnt
+         << ",\n";
       cj << "      \"closedProvenWinDirect\": " << wt.closed_proven_win_direct
          << ",\n";
       cj << "      \"closedProvenWinOutsideRz\": "
@@ -1602,6 +1867,11 @@ int RunSolveCommand(int argc, char* argv[]) {
          << ",\n";
       cj << "      \"unexpandedUnknownCount\": "
          << wt.unexpanded_unknown_count << ",\n";
+      cj << "      \"unresolvedUnknownCount\": " << unresolved_unknown_cnt
+         << ",\n";
+      cj << "      \"closedChildren\": ";
+      emit_child_array(cj, wt.closed_children, "      ");
+      cj << ",\n";
       cj << "      \"topUnclosedChildren\": ";
       emit_child_array(cj, wt.top_unclosed_children, "      ");
       cj << ",\n";
