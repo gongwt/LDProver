@@ -11,6 +11,7 @@
 #define LDPROVER_SEARCH_DFPN_SOLVER_H_
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -34,6 +35,8 @@ struct SolverConfig {
   uint32_t max_nodes = 10000;
   uint32_t max_depth = 64;
   uint64_t memory_budget_bytes = 512ULL * 1024ULL * 1024ULL;
+  // Cooperative wall-clock budget for Solve() in ms (0 = disabled).
+  uint64_t time_limit_ms = 0ULL;
   bool enable_rz_pruning = true;
   bool enable_pattern_tt = true;
   bool enable_fast_capture_ordering = true;
@@ -266,6 +269,7 @@ struct SolveReport {
   uint64_t cycle_detections = 0;
   int rz_size_at_root = 0;
   bool resource_exhausted = false;
+  uint64_t estimated_memory_bytes = 0;
   ProofCertificateRZ<N> root_proof_rz{};
   ProofCertificateRZ<N> root_disproof_rz{};
   std::vector<int16_t> principal_variation;
@@ -352,7 +356,9 @@ class DfpnSolver {
     Color target_color = Color::kBlack;
   };
 
+  uint64_t EstimateMemoryBytes(uint32_t active_depth) const noexcept;
   bool IsMemoryBudgetExceeded(uint32_t active_depth) const noexcept;
+  bool IsTimeLimitExceeded() const noexcept;
 
   NodeTacticalContext BuildNodeTacticalContext(
       const Position<N>& pos, const ProofContext& context) const;
@@ -412,9 +418,16 @@ class DfpnSolver {
   std::unordered_map<uint64_t, CachedNodeFrontier> node_frontier_cache_;
   mutable std::unordered_map<std::string, bool> reval_cache_;
   uint64_t next_path_id_ = 1ULL;
+  uint64_t live_frontier_children_cap_ = 0ULL;
+  uint64_t live_dag_child_edges_ = 0ULL;
   size_t base_trace_len_ = 0;
   bool near_pn_continuation_claimed_ = false;
   uint64_t active_continuation_cap_nodes_ = 0ULL;
+  bool has_time_limit_ = false;
+  std::chrono::steady_clock::time_point solve_deadline_{};
+  mutable bool time_limit_hit_ = false;
+  mutable bool memory_budget_hit_ = false;
+  mutable uint64_t reval_deadline_check_counter_ = 0ULL;
   mutable SolverStageProfile stage_profile_{};
   mutable ConvergenceTraceReport convergence_trace_{};
 };

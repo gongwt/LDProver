@@ -153,6 +153,16 @@ ParsedProblem<19> BuildP031() {
                                        TurnConflictPolicy::kRejectStrict);
 }
 
+ParsedProblem<19> BuildP060() {
+  ProblemContractParser<19> parser;
+  const std::string p060_json =
+      std::string(
+          R"json({"masked_sgf_str":"(;FF[4]CA[UTF-8]SZ[19]KM[30]AB[pr][qr][rq][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[or][oq][pq][qq][ap][bp][cp][dp][ep][fp][gp][hp][ip][qp][io][in][qn][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[pr][rq]MA[as][bs][cs][ds][es][fs][gs][hs][is][js][ks][ls][ms][ns][os][ps][qs][rs][ss][ar][br][cr][dr][er][fr][gr][hr][ir][jr][kr][lr][mr][nr][or][pr][qr][rr][sr][aq][bq][cq][dq][eq][fq][gq][hq][iq][jq][kq][lq][mq][nq][oq][pq][qq][rq][sq][jp][kp][lp][mp][np][op][pp][qp][rp][sp][jo][ko][lo][mo][no][oo][po][qo][ro][so][jn][kn][ln][mn][nn][on][pn][qn][rn][sn][jm][km][lm][mm][nm][om][pm][qm][rm][sm][jl][kl][ll][ml][nl][ol][pl][ql][rl][sl][jk][kk][lk][mk][nk][ok][pk][qk][rk][sk][kj][lj][mj][nj][oj][pj][qj][rj][sj][qi][ri][si][qh][rh][sh][qg][rg][sg][qf][rf][sf][qe][re][se][qd][rd][sd][qc][rc][sc][qb][rb][sb][qa][ra][sa])","winning_color":"b","turn_color":"b","black_crucial_stone":"pr,rq","white_crucial_stone":"","black_search_goal":"TOLIVE","white_search_goal":"TOKILL","black_ko_rule":"disallow_ko","white_ko_rule":"allow_ko","region":")json") +
+      CommonChaoRegion19() + "\"}";
+  return parser.ParseTsumegoJsonObject("chao_vol1_p060", p060_json,
+                                       TurnConflictPolicy::kRejectStrict);
+}
+
 void VerifyTracedScenario(const std::string& label,
                           const ParsedProblem<19>& prob,
                           const std::vector<int16_t>& trace_moves,
@@ -1543,14 +1553,7 @@ void TestSection11ConvergenceObserverParity() {
 
 void TestSection12R27ObserverAndNearPnContinuation() {
   std::cout << "\n=== 12. R27 Observer Path-Basis, Subproof Binding & Near-PN Continuation ===\n";
-  ProblemContractParser<19> parser;
-  const std::string& region_p060 = CommonChaoRegion19();
-  const std::string p060_json =
-      std::string(
-          R"json({"masked_sgf_str":"(;FF[4]CA[UTF-8]SZ[19]KM[30]AB[pr][qr][rq][ao][bo][co][do][eo][fo][go][ho][hn][hm][al][bl][cl][dl][el][fl][gl][hl][hk][hj][ai][bi][ci][di][ei][fi][gi][hi][ii][hh][ih][jh][kh][lh][mh][nh][oh][gg][ig][lg][og][af][bf][cf][df][ef][ff][if][lf][of][ee][fe][ie][le][oe][dd][fd][id][ld][od][ac][bc][cc][fc][ic][lc][oc][cb][fb][ib][lb][ob][ca][fa][ia][la][oa]AW[or][oq][pq][qq][ap][bp][cp][dp][ep][fp][gp][hp][ip][qp][io][in][qn][im][il][ik][ij][jj][ji][ki][li][mi][ni][oi][pi][ph][pg][pf][pe][pd][pc][pb][pa]PL[B]TR[pr][rq]MA[as][bs][cs][ds][es][fs][gs][hs][is][js][ks][ls][ms][ns][os][ps][qs][rs][ss][ar][br][cr][dr][er][fr][gr][hr][ir][jr][kr][lr][mr][nr][or][pr][qr][rr][sr][aq][bq][cq][dq][eq][fq][gq][hq][iq][jq][kq][lq][mq][nq][oq][pq][qq][rq][sq][jp][kp][lp][mp][np][op][pp][qp][rp][sp][jo][ko][lo][mo][no][oo][po][qo][ro][so][jn][kn][ln][mn][nn][on][pn][qn][rn][sn][jm][km][lm][mm][nm][om][pm][qm][rm][sm][jl][kl][ll][ml][nl][ol][pl][ql][rl][sl][jk][kk][lk][mk][nk][ok][pk][qk][rk][sk][kj][lj][mj][nj][oj][pj][qj][rj][sj][qi][ri][si][qh][rh][sh][qg][rg][sg][qf][rf][sf][qe][re][se][qd][rd][sd][qc][rc][sc][qb][rb][sb][qa][ra][sa])","winning_color":"b","turn_color":"b","black_crucial_stone":"pr,rq","white_crucial_stone":"","black_search_goal":"TOLIVE","white_search_goal":"TOKILL","black_ko_rule":"disallow_ko","white_ko_rule":"allow_ko","region":")json") +
-      region_p060 + "\"}";
-  const ParsedProblem<19> p060 = parser.ParseTsumegoJsonObject(
-      "chao_vol1_p060", p060_json, TurnConflictPolicy::kRejectStrict);
+  const ParsedProblem<19> p060 = BuildP060();
   Check(p060.valid, "Inline p060 parses cleanly for R27 checks");
 
   // 1. Subposition start path alignment (R26 §3 P2 #1).
@@ -2015,6 +2018,78 @@ void TestSection12R27ObserverAndNearPnContinuation() {
   }
 }
 
+void TestSection13ResourceBoundaryAndMemoryAccounting() {
+  std::cout << "\n=== 13. Task Card 1 Resource Deadline & Live-Capacity Memory Accounting ===\n";
+  const ParsedProblem<19> p060 = BuildP060();
+  const ParsedProblem<19> p031 = BuildP031();
+  ProofArtifactManager<19> mgr;
+
+  // 1. Cooperative deadline terminates large node budget cleanly with kTimeout.
+  {
+    SolverConfig cfg = DefaultConfig(1000000U);
+    cfg.time_limit_ms = 25ULL;
+    cfg.memory_budget_bytes = 1024ULL * 1024ULL * 1024ULL;
+    const auto rep = DfpnSolver<19>(cfg).Solve(
+        p060.initial_position, p060.proof_context, p060.region_search_mask,
+        "p060_timeout");
+    Check(rep.root_status == ProofOutcome::kUnknown && rep.resource_exhausted &&
+              rep.unknown_reason == UnknownReason::kTimeout &&
+              rep.num_nodes < 1000000U,
+          "time_limit_ms=25 cleanly halts p060 with UnknownReason::kTimeout",
+          "nodes=" + std::to_string(rep.num_nodes) +
+              " reason=" + std::to_string(static_cast<int>(rep.unknown_reason)));
+  }
+
+  // 2. Live SearchChild capacity accounting avoids old 4 KiB underestimate and triggers kMemoryBudget.
+  {
+    SolverConfig cfg_1k = DefaultConfig(1000U);
+    const auto rep_1k = DfpnSolver<19>(cfg_1k).Solve(
+        p060.initial_position, p060.proof_context, p060.region_search_mask,
+        "p060_1k");
+    Check(rep_1k.estimated_memory_bytes > 8ULL * 1024ULL * 1024ULL,
+          "p060@1000 live-capacity memory estimate accurately exceeds 8 MiB",
+          "estBytes=" + std::to_string(rep_1k.estimated_memory_bytes));
+
+    SolverConfig cfg_2m = DefaultConfig(10000U);
+    cfg_2m.memory_budget_bytes = 2ULL * 1024ULL * 1024ULL;
+    const auto rep_2m = DfpnSolver<19>(cfg_2m).Solve(
+        p060.initial_position, p060.proof_context, p060.region_search_mask,
+        "p060_2m");
+    Check(rep_2m.root_status == ProofOutcome::kUnknown &&
+              rep_2m.resource_exhausted &&
+              rep_2m.unknown_reason == UnknownReason::kMemoryBudget &&
+              rep_2m.num_nodes < 10000U,
+          "memory_budget_bytes=2MiB cleanly halts p060 with UnknownReason::kMemoryBudget",
+          "nodes=" + std::to_string(rep_2m.num_nodes) +
+              " estBytes=" + std::to_string(rep_2m.estimated_memory_bytes));
+  }
+
+  // 3. Default time_limit_ms=0 vs generous time_limit_ms=30000 preserves exact p031 proof.
+  {
+    SolverConfig cfg_d = DefaultConfig(3500U);
+    cfg_d.max_depth = 48U;
+    cfg_d.memory_budget_bytes = 512ULL * 1024ULL * 1024ULL;
+    SolverConfig cfg_t = cfg_d;
+    cfg_t.time_limit_ms = 30000ULL;
+    const auto r_d = DfpnSolver<19>(cfg_d).Solve(
+        p031.initial_position, p031.proof_context, p031.region_search_mask,
+        "p031_d");
+    const auto r_t = DfpnSolver<19>(cfg_t).Solve(
+        p031.initial_position, p031.proof_context, p031.region_search_mask,
+        "p031_d");
+    const std::string j_d = mgr.SerializeLProofJson(
+        p031.initial_position, p031.proof_context, r_d);
+    const std::string j_t = mgr.SerializeLProofJson(
+        p031.initial_position, p031.proof_context, r_t);
+    const auto chk = mgr.VerifyLProofJsonString(
+        j_t, &p031, VerificationScope::kOriginalRoot);
+    Check(r_d.root_status == ProofOutcome::kProvenWin &&
+              r_t.root_status == ProofOutcome::kProvenWin && j_d == j_t &&
+              chk.passed && chk.error_code == "PASS",
+          "Generous time_limit_ms preserves byte-identical p031 original_root PASS proof");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -2030,6 +2105,7 @@ int main() {
   TestSection10OrthoNeighborTableParity();
   TestSection11ConvergenceObserverParity();
   TestSection12R27ObserverAndNearPnContinuation();
+  TestSection13ResourceBoundaryAndMemoryAccounting();
 
   const int failed = g_total - g_passed;
   std::cout << "\n========================================\n"

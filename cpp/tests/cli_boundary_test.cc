@@ -984,6 +984,67 @@ int main(int argc, char* argv[]) {
               " oneRc=" + std::to_string(r_one.exit_code));
   }
 
+  // 19. Task Card 1: CLI resource bounds (--time-limit-ms, --memory-budget-bytes, --original-root)
+  {
+    const std::filesystem::path dir = ws.root / "resource_bounds";
+    std::filesystem::create_directories(dir, ec);
+    const std::filesystem::path bad_tl_out = dir / "bad_tl.json";
+    const std::filesystem::path bad_mb_out = dir / "bad_mb.json";
+    const auto r_tl0 = RunCliRaw(
+        tprover_bin,
+        {"solve", "--problem", p042_src.string(), "--out-proof",
+         bad_tl_out.string(), "--time-limit-ms", "0"});
+    const auto r_mb0 = RunCliRaw(
+        tprover_bin,
+        {"solve", "--problem", p042_src.string(), "--out-proof",
+         bad_mb_out.string(), "--memory-budget-bytes", "0"});
+
+    const std::filesystem::path p42_out = dir / "p42.proof.json";
+    const std::filesystem::path p42_prof = dir / "p42.prof.json";
+    const auto r_p42 = RunCliRaw(
+        tprover_bin,
+        {"solve", "--problem", p042_src.string(), "--out-proof",
+         p42_out.string(), "--profile-json", p42_prof.string(),
+         "--node-limit", "3500", "--max-depth", "48", "--time-limit-ms",
+         "30000", "--memory-budget-bytes", "1073741824"});
+    const auto chk_orig = RunCliRaw(
+        tprover_bin,
+        {"check", "--proof", p42_out.string(), "--problem", p042_src.string(),
+         "--original-root"});
+    const auto chk_mutex = RunCliRaw(
+        tprover_bin,
+        {"check", "--proof", p42_out.string(), "--original-root",
+         "--allow-subposition"});
+
+    const std::filesystem::path p060_src = tsumego_dir / "chao_vol1_p060.json";
+    const std::filesystem::path p60_out = dir / "p60_to.proof.json";
+    const auto r_to = RunCliRaw(
+        tprover_bin,
+        {"solve", "--problem", p060_src.string(), "--out-proof",
+         p60_out.string(), "--node-limit", "1000000", "--max-depth", "64",
+         "--time-limit-ms", "25", "--memory-budget-bytes", "1073741824"});
+
+    std::string p42_prof_bytes;
+    const bool has_prof = ReadBytes(p42_prof, &p42_prof_bytes);
+    Check(r_tl0.exit_code == 2 && !std::filesystem::exists(bad_tl_out, ec) &&
+              r_mb0.exit_code == 2 && !std::filesystem::exists(bad_mb_out, ec) &&
+              r_p42.exit_code == 0 && has_prof &&
+              p42_prof_bytes.find("\"timeLimitMs\": 30000") !=
+                  std::string::npos &&
+              p42_prof_bytes.find("\"memoryBudgetBytes\": 1073741824") !=
+                  std::string::npos &&
+              chk_orig.exit_code == 0 &&
+              chk_orig.stdout_str.find("\"passed\":true") != std::string::npos &&
+              chk_mutex.exit_code == 2 && r_to.exit_code == 0 &&
+              r_to.stdout_str.find("\"unknownReason\":\"timeout\"") !=
+                  std::string::npos,
+          "19. CLI enforces --time-limit-ms / --memory-budget-bytes > 0, --original-root check, and cooperative timeout",
+          "tl0=" + std::to_string(r_tl0.exit_code) +
+              " mb0=" + std::to_string(r_mb0.exit_code) +
+              " chk=" + std::to_string(chk_orig.exit_code) +
+              " to=" + std::to_string(r_to.exit_code));
+  }
+
   std::cout << "\n========================================\n"
             << "R26 CLI Boundary Summary: " << g_passed << "/" << g_total
             << " passed, " << g_failed << " failed.\n"

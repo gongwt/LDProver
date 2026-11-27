@@ -105,16 +105,42 @@ std::vector<std::string> SplitPathSegments(const std::string& path) {
 }  // namespace
 
 template <int N>
+uint64_t DfpnSolver<N>::EstimateMemoryBytes(
+    uint32_t active_depth) const noexcept {
+  return live_frontier_children_cap_ *
+             static_cast<uint64_t>(sizeof(SearchChild)) +
+         static_cast<uint64_t>(node_frontier_cache_.size()) *
+             static_cast<uint64_t>(sizeof(CachedNodeFrontier) + 64ULL) +
+         static_cast<uint64_t>(report_.proof_dag_nodes.capacity()) *
+             static_cast<uint64_t>(sizeof(ProofDagNode<N>)) +
+         live_dag_child_edges_ *
+             static_cast<uint64_t>(sizeof(int16_t) + sizeof(uint32_t)) +
+         static_cast<uint64_t>(tt_store_.EstimatedEntryCount()) * 1024ULL +
+         static_cast<uint64_t>(reval_cache_.size()) * 160ULL +
+         static_cast<uint64_t>(active_depth + 1U) * 2048ULL;
+}
+
+template <int N>
 bool DfpnSolver<N>::IsMemoryBudgetExceeded(
     uint32_t active_depth) const noexcept {
   if (config_.memory_budget_bytes == 0ULL) return false;
-  const uint64_t approx_bytes =
-      static_cast<uint64_t>(report_.proof_dag_nodes.size()) * 768ULL +
-      static_cast<uint64_t>(tt_store_.EstimatedEntryCount()) * 1024ULL +
-      static_cast<uint64_t>(node_frontier_cache_.size()) * 4096ULL +
-      static_cast<uint64_t>(reval_cache_.size()) * 128ULL +
-      static_cast<uint64_t>(active_depth + 1U) * 2048ULL;
-  return approx_bytes > config_.memory_budget_bytes;
+  if (memory_budget_hit_) return true;
+  if (EstimateMemoryBytes(active_depth) > config_.memory_budget_bytes) {
+    memory_budget_hit_ = true;
+    return true;
+  }
+  return false;
+}
+
+template <int N>
+bool DfpnSolver<N>::IsTimeLimitExceeded() const noexcept {
+  if (!has_time_limit_) return false;
+  if (time_limit_hit_) return true;
+  if (SteadyClock::now() >= solve_deadline_) {
+    time_limit_hit_ = true;
+    return true;
+  }
+  return false;
 }
 
 template <int N>
@@ -162,13 +188,24 @@ SolveReport<N> DfpnSolver<N>::Solve(
       convergence_trace_.watched_paths.push_back(std::move(wt));
     }
   }
-  const SteadyClock::time_point solve_t0 = config_.enable_stage_profiling
-                                               ? SteadyClock::now()
-                                               : SteadyClock::time_point{};
+  const SteadyClock::time_point solve_t0 =
+      (config_.enable_stage_profiling || config_.time_limit_ms > 0ULL)
+          ? SteadyClock::now()
+          : SteadyClock::time_point{};
   node_frontier_cache_.clear();
   reval_cache_.clear();
   dag_has_capture_.clear();
   next_path_id_ = 1ULL;
+  live_frontier_children_cap_ = 0ULL;
+  live_dag_child_edges_ = 0ULL;
+  time_limit_hit_ = false;
+  memory_budget_hit_ = false;
+  reval_deadline_check_counter_ = 0ULL;
+  has_time_limit_ = (config_.time_limit_ms > 0ULL);
+  if (has_time_limit_) {
+    solve_deadline_ =
+        solve_t0 + std::chrono::milliseconds(config_.time_limit_ms);
+  }
   report_ = SolveReport<N>{};
   report_.problem_id = problem_id;
   report_.input_hash = initial_pos.ZobristHash();
@@ -266,9 +303,17 @@ SolveReport<N> DfpnSolver<N>::Solve(
             &report_.root_proof_rz, &report_.root_disproof_rz,
             &report_.root_dag_node_id, kPassMove);
 
-  if (ko_dep && report_.root_status == ProofOutcome::kUnknown &&
-      report_.unknown_reason == UnknownReason::kNone) {
-    report_.unknown_reason = UnknownReason::kKoDependent;
+  report_.estimated_memory_bytes = EstimateMemoryBytes(0U);
+  if (report_.root_status == ProofOutcome::kUnknown) {
+    if (time_limit_hit_) {
+      report_.resource_exhausted = true;
+      report_.unknown_reason = UnknownReason::kTimeout;
+    } else if (memory_budget_hit_) {
+      report_.resource_exhausted = true;
+      report_.unknown_reason = UnknownReason::kMemoryBudget;
+    } else if (ko_dep && report_.unknown_reason == UnknownReason::kNone) {
+      report_.unknown_reason = UnknownReason::kKoDependent;
+    }
   }
 
   // Extract principal variation when proven.
@@ -337,11 +382,7 @@ SolveReport<N> DfpnSolver<N>::Solve(
     stage_profile_.double_pass_leaves = dp_leaves;
     stage_profile_.pruned_outside_rz_dag_nodes = pruned_nodes;
     stage_profile_.tt_hit_dag_nodes = tt_nodes;
-    stage_profile_.estimated_memory_bytes =
-        static_cast<uint64_t>(report_.proof_dag_nodes.size()) * 768ULL +
-        static_cast<uint64_t>(tt_store_.EstimatedEntryCount()) * 1024ULL +
-        static_cast<uint64_t>(node_frontier_cache_.size()) * 4096ULL +
-        static_cast<uint64_t>(reval_cache_.size()) * 128ULL;
+    stage_profile_.estimated_memory_bytes = report_.estimated_memory_bytes;
   }
 
   if (config_.enable_convergence_trace) {
@@ -1228,6 +1269,11 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryStateImpl(
   const bool prof = config_.enable_stage_profiling;
   if (prof) ++stage_profile_.reval_recursive_visits;
 
+  if (has_time_limit_ && (++reval_deadline_check_counter_ & 31ULL) == 0ULL &&
+      IsTimeLimitExceeded()) {
+    return false;
+  }
+
   if (guard_depth > 48 || source_dag_node_id >= report_.proof_dag_nodes.size()) {
     return false;
   }
@@ -1282,6 +1328,7 @@ bool DfpnSolver<N>::RevalidateSourceProofOnQueryStateImpl(
   if (prof) ++stage_profile_.reval_cache_misses;
 
   auto finish = [&](bool result) -> bool {
+    if (time_limit_hit_) return false;
     if (prof) {
       const auto emp_t0 = SteadyClock::now();
       if (reval_cache_.size() < 200000U) {
@@ -1540,6 +1587,14 @@ void DfpnSolver<N>::MidSearch(
     *out_outcome = ProofOutcome::kUnknown;
     return;
   }
+  if (IsTimeLimitExceeded()) {
+    report_.resource_exhausted = true;
+    report_.unknown_reason = UnknownReason::kTimeout;
+    *out_pn = 1;
+    *out_dn = 1;
+    *out_outcome = ProofOutcome::kUnknown;
+    return;
+  }
   if (IsMemoryBudgetExceeded(depth)) {
     report_.resource_exhausted = true;
     report_.unknown_reason = UnknownReason::kMemoryBudget;
@@ -1663,7 +1718,16 @@ void DfpnSolver<N>::MidSearch(
 
     std::vector<std::pair<int16_t, MoveEvalMeta>> scored;
     scored.reserve(legal_moves.size());
-    for (int16_t mv : legal_moves) {
+    for (size_t li = 0; li < legal_moves.size(); ++li) {
+      if (has_time_limit_ && (li & 15U) == 15U && IsTimeLimitExceeded()) {
+        report_.resource_exhausted = true;
+        report_.unknown_reason = UnknownReason::kTimeout;
+        *out_pn = 1;
+        *out_dn = 1;
+        *out_outcome = ProofOutcome::kUnknown;
+        return;
+      }
+      const int16_t mv = legal_moves[li];
       MoveEvalMeta meta;
       if (config_.enable_fast_capture_ordering) {
         meta = EvaluateCandidateMove(pos, context, tctx, mv, is_or_node,
@@ -1703,6 +1767,8 @@ void DfpnSolver<N>::MidSearch(
       ch.dn = init_bounds.second;
       fresh.children.push_back(ch);
     }
+    live_frontier_children_cap_ +=
+        static_cast<uint64_t>(fresh.children.capacity());
     node_frontier_cache_.emplace(node_path_id, std::move(fresh));
     if (prof) {
       stage_profile_.frontier_sort_init_ns += ElapsedNs(fs0, SteadyClock::now());
@@ -2143,6 +2209,8 @@ void DfpnSolver<N>::MidSearch(
       dag_node.disproof_rz = *out_disproof_rz;
       dag_node.child_node_ids = std::move(proven_child_ids);
       dag_node.child_moves = std::move(proven_child_moves);
+      live_dag_child_edges_ +=
+          static_cast<uint64_t>(dag_node.child_moves.size());
       report_.proof_dag_nodes.push_back(dag_node);
       dag_has_capture_.push_back(node_has_capture);
       *out_dag_node_id = dag_node.node_id;
@@ -2201,11 +2269,25 @@ void DfpnSolver<N>::MidSearch(
             frontier, is_or_node, depth, region_hint, true,
             &convergence_trace_.watched_paths[static_cast<size_t>(watched_idx)]);
       }
+      const uint64_t erased_cap =
+          static_cast<uint64_t>(frontier.children.capacity());
+      live_frontier_children_cap_ =
+          (live_frontier_children_cap_ >= erased_cap)
+              ? (live_frontier_children_cap_ - erased_cap)
+              : 0ULL;
       node_frontier_cache_.erase(node_path_id);
       break;
     }
 
     // Threshold cutoff & resource checks (FR-4.3: OR condition).
+    if (IsTimeLimitExceeded()) {
+      report_.resource_exhausted = true;
+      report_.unknown_reason = UnknownReason::kTimeout;
+      *out_pn = cur_pn;
+      *out_dn = cur_dn;
+      *out_outcome = ProofOutcome::kUnknown;
+      break;
+    }
     if (IsMemoryBudgetExceeded(depth)) {
       report_.resource_exhausted = true;
       report_.unknown_reason = UnknownReason::kMemoryBudget;

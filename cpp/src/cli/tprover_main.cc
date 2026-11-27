@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -1147,6 +1148,18 @@ bool ParseStrictPositiveU32(const char* raw, uint32_t* out_val) {
   return true;
 }
 
+bool ParseStrictPositiveU64(const char* raw, uint64_t* out_val) {
+  if (raw == nullptr || *raw == '\0' || raw[0] == '-') return false;
+  char* endptr = nullptr;
+  errno = 0;
+  const unsigned long long v = std::strtoull(raw, &endptr, 10);
+  if (errno != 0 || endptr == raw || *endptr != '\0' || v == 0ULL) {
+    return false;
+  }
+  *out_val = static_cast<uint64_t>(v);
+  return true;
+}
+
 int RunSolveCommand(int argc, char* argv[]) {
   using SteadyClock = std::chrono::steady_clock;
   const auto cli_t0 = SteadyClock::now();
@@ -1219,6 +1232,18 @@ int RunSolveCommand(int argc, char* argv[]) {
       const double bytes_d = std::floor(mb * 1024.0 * 1024.0);
       config.memory_budget_bytes =
           (bytes_d < 1.0) ? 1ULL : static_cast<uint64_t>(bytes_d);
+    } else if (arg == "--memory-budget-bytes" && i + 1 < argc) {
+      if (!ParseStrictPositiveU64(argv[++i], &config.memory_budget_bytes)) {
+        std::cerr
+            << "[LDProver] Invalid positive integer for --memory-budget-bytes\n";
+        return 2;
+      }
+    } else if (arg == "--time-limit-ms" && i + 1 < argc) {
+      if (!ParseStrictPositiveU64(argv[++i], &config.time_limit_ms)) {
+        std::cerr
+            << "[LDProver] Invalid positive integer for --time-limit-ms\n";
+        return 2;
+      }
     } else {
       std::cerr << "[LDProver] Unknown or incomplete solve option: " << arg
                 << "\n";
@@ -1390,6 +1415,8 @@ int RunSolveCommand(int argc, char* argv[]) {
     pj << "{\n";
     pj << "  \"problemId\": \"" << EscapeJsonString(prob_id) << "\",\n";
     pj << "  \"maxNodes\": " << config.max_nodes << ",\n";
+    pj << "  \"timeLimitMs\": " << config.time_limit_ms << ",\n";
+    pj << "  \"memoryBudgetBytes\": " << config.memory_budget_bytes << ",\n";
     pj << "  \"mode\": \"" << (config.enable_pattern_tt ? "pattern-tt" : "board-tt") << "\",\n";
     pj << "  \"rootStatus\": \"" << OutcomeLabel(report.root_status) << "\",\n";
     pj << "  \"unknownReason\": \"" << UnknownReasonLabel(report.unknown_reason) << "\",\n";
@@ -1943,6 +1970,7 @@ int ExecuteCheckForBoardSize(
 int RunCheckCommand(int argc, char* argv[]) {
   std::string proof_path;
   std::string problem_path;
+  bool force_original_root = false;
   bool allow_subposition = false;
   bool free_exploration = false;
   for (int i = 2; i < argc; ++i) {
@@ -1951,6 +1979,8 @@ int RunCheckCommand(int argc, char* argv[]) {
       proof_path = argv[++i];
     } else if (arg == "--problem" && i + 1 < argc) {
       problem_path = argv[++i];
+    } else if (arg == "--original-root") {
+      force_original_root = true;
     } else if (arg == "--allow-subposition") {
       allow_subposition = true;
     } else if (arg == "--free-exploration") {
@@ -1962,13 +1992,18 @@ int RunCheckCommand(int argc, char* argv[]) {
     }
   }
 
-  if (allow_subposition && free_exploration) {
-    std::cerr << "[LDProver] --allow-subposition and --free-exploration are "
-                 "mutually exclusive.\n";
+  const int scope_flags = (force_original_root ? 1 : 0) +
+                          (allow_subposition ? 1 : 0) +
+                          (free_exploration ? 1 : 0);
+  if (scope_flags > 1) {
+    std::cerr << "[LDProver] --original-root, --allow-subposition, and "
+                 "--free-exploration are mutually exclusive.\n";
     return 2;
   }
   std::optional<ldprover::VerificationScope> scope_override;
-  if (allow_subposition) {
+  if (force_original_root) {
+    scope_override = ldprover::VerificationScope::kOriginalRoot;
+  } else if (allow_subposition) {
     scope_override = ldprover::VerificationScope::kTracedWithinRules;
   } else if (free_exploration) {
     scope_override = ldprover::VerificationScope::kFreeExploration;
